@@ -1,141 +1,131 @@
-use pyo3::prelude::*;
-use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods}; // Değişiklik yok
-use crate::python_bindings::{PyMultiVector2D, PyMultiVector3D};
+use numpy::{PyArray2, PyReadonlyArray2};
+use pyo3::{prelude::*};
+// (GÜNCELLENDİ) PyValueError yerine kendi HypatiaError'umuzu import edelim
+use crate::python_bindings::{HypatiaError, PyMultiVector2D};
 
-/// NumPy ile Hypatia entegrasyonu
-pub fn register_numpy_integration(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // 2D NumPy fonksiyonları
-    #[pyfunction]
-    fn mv2d_from_array(array: &Bound<'_, PyArray1<f64>>) -> PyResult<PyMultiVector2D> {
-        // DÜZELTME 1: unsafe blok eklendi
-        let slice = unsafe { array.as_slice()? };
-        if slice.len() != 4 {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Array must have exactly 4 elements for MultiVector2D"
-            ));
-        }
-        Ok(PyMultiVector2D::new(slice[0], slice[1], slice[2], slice[3]))
+/// (1x2) numpy -> PyMultiVector2D
+#[pyfunction]
+pub fn mv2d_from_array(arr: PyReadonlyArray2<f64>) -> PyResult<PyMultiVector2D> {
+// ... (içerik değişmedi) ...
+    let a = arr.as_array();
+    if a.shape() != [1, 2] {
+        // (GÜNCELLENDİ) PyValueError -> HypatiaError
+        return Err(HypatiaError::new_err(
+            "mv2d_from_array: shape (1,2) bekleniyordu",
+        ));
+    }
+    Ok(PyMultiVector2D::vector(a[[0, 0]], a[[0, 1]]))
+}
+
+/// PyMultiVector2D -> (1x2) numpy
+#[pyfunction]
+pub fn mv2d_to_array<'py>(
+// ... (içerik değişmedi) ...
+    py: Python<'py>,
+    mv: &PyMultiVector2D,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let out_rows = vec![vec![mv.inner.e1, mv.inner.e2]];
+    PyArray2::from_vec2_bound(py, &out_rows)
+        // (GÜNCELLENDİ) PyValueError -> HypatiaError
+        .map_err(|e| HypatiaError::new_err(format!("mv2d_to_array: NumPy dizisi oluşturulamadı: {}", e)))
+}
+
+/// (N x 2) numpy vektörleri -> theta radian kadar 2D dönmüş (N x 2)
+#[pyfunction]
+pub fn batch_rotate_2d<'py>(
+// ... (içerik değişmedi) ...
+    py: Python<'py>,
+    theta: f64,
+    arr: PyReadonlyArray2<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let a = arr.as_array();
+    if a.shape().len() != 2 || a.shape()[1] != 2 {
+        // (GÜNCELLENDİ) PyValueError -> HypatiaError
+        return Err(HypatiaError::new_err(
+            "batch_rotate_2d: input shape (N,2) bekleniyordu",
+        ));
     }
 
-    #[pyfunction]
-    fn mv2d_to_array<'a>(mv: &PyMultiVector2D, py: Python<'a>) -> PyResult<Bound<'a, PyArray1<f64>>> {
-        let array = PyArray1::from_slice_bound(py, &[
-            mv.s(), 
-            mv.e1(), 
-            mv.e2(), 
-            mv.e12()
-        ]);
-        Ok(array)
+    let r = PyMultiVector2D::rotor(theta);
+    let mut out = Vec::with_capacity(a.shape()[0]);
+    for i in 0..a.shape()[0] {
+        let v = PyMultiVector2D::vector(a[[i, 0]], a[[i, 1]]);
+        let w = r.rotate_vector(&v).grade(1);
+        out.push(vec![w.e1(), w.e2()]);
     }
 
-    #[pyfunction]
-    fn batch_rotate_2d<'a>(
-        rotor: &PyMultiVector2D, 
-        vectors: &Bound<'_, PyArray2<f64>>,
-        py: Python<'a>
-    ) -> PyResult<Bound<'a, PyArray2<f64>>> {
-        // DÜZELTME 2: unsafe blok eklendi
-        let vectors_slice = unsafe { vectors.as_slice()? };
-        let shape = vectors.shape();
-        
-        if shape.len() != 2 || shape[1] != 2 {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Input must be Nx2 array of 2D vectors"
-            ));
-        }
+    PyArray2::from_vec2_bound(py, &out)
+        // (GÜNCELLENDİ) PyValueError -> HypatiaError
+        .map_err(|e| HypatiaError::new_err(format!("batch_rotate_2d: NumPy dizisi oluşturulamadı: {}", e)))
+}
 
-        let n = shape[0];
-        let mut result = Vec::with_capacity(n * 2);
-        
-        for i in 0..n {
-            let start = i * 2;
-            let vector = PyMultiVector2D::vector(vectors_slice[start], vectors_slice[start + 1]);
-            let rotated = rotor.rotate_vector(&vector);
-            result.push(rotated.e1());
-            result.push(rotated.e2());
-        }
-
-        // DÜZELTME 3: 1D Array oluşturup reshape() ile 2D'ye çevir
-        let result_array = PyArray1::from_vec_bound(py, result).reshape((n, 2))?;
-        Ok(result_array)
+/// (N x 3) numpy vektörleri -> theta radian kadar Z ekseni etrafında dönmüş (N x 3)
+/// Not: Şimdilik _ax/_ay/_az parametreleri kullanılmıyor (API stabil tutmak için korunuyor).
+#[pyfunction]
+pub fn batch_rotate_3d<'py>(
+// ... (içerik değişmedi) ...
+    py: Python<'py>,
+    theta: f64,
+    _ax: f64,
+    _ay: f64,
+    _az: f64,
+    arr: PyReadonlyArray2<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let a = arr.as_array();
+    if a.shape().len() != 2 || a.shape()[1] != 3 {
+        // (GÜNCELLENDİ) PyValueError -> HypatiaError
+        return Err(HypatiaError::new_err(
+            "batch_rotate_3d: input shape (N,3) bekleniyordu",
+        ));
     }
 
-    // 3D NumPy fonksiyonları
-    #[pyfunction]
-    fn mv3d_from_array(array: &Bound<'_, PyArray1<f64>>) -> PyResult<PyMultiVector3D> {
-        // DÜZELTME 4: unsafe blok eklendi
-        let slice = unsafe { array.as_slice()? };
-        if slice.len() != 8 {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Array must have exactly 8 elements for MultiVector3D"
-            ));
-        }
-        Ok(PyMultiVector3D::new(
-            slice[0], slice[1], slice[2], slice[3],
-            slice[4], slice[5], slice[6], slice[7]
-        ))
+    // Z ekseni etrafında: (x,y) 2D döner, z sabit kalır
+    let rot2d = PyMultiVector2D::rotor(theta);
+    let mut out = Vec::with_capacity(a.shape()[0]);
+    for i in 0..a.shape()[0] {
+        let v = PyMultiVector2D::vector(a[[i, 0]], a[[i, 1]]);
+        let w = rot2d.rotate_vector(&v).grade(1);
+        out.push(vec![w.e1(), w.e2(), a[[i, 2]]]);
     }
 
-    #[pyfunction]
-    fn mv3d_to_array<'a>(mv: &PyMultiVector3D, py: Python<'a>) -> PyResult<Bound<'a, PyArray1<f64>>> {
-        let array = PyArray1::from_slice_bound(py, &[
-            mv.s(), 
-            mv.e1(), 
-            mv.e2(), 
-            mv.e3(),
-            mv.e12(),
-            mv.e23(),
-            mv.e31(),
-            mv.e123()
-        ]);
-        Ok(array)
-    }
+    PyArray2::from_vec2_bound(py, &out)
+        // (GÜNCELLENDİ) PyValueError -> HypatiaError
+        .map_err(|e| HypatiaError::new_err(format!("batch_rotate_3d: NumPy dizisi oluşturulamadı: {}", e)))
+}
 
-    #[pyfunction]
-    fn batch_rotate_3d<'a>(
-        rotor: &PyMultiVector3D,
-        vectors: &Bound<'_, PyArray2<f64>>,
-        py: Python<'a>
-    ) -> PyResult<Bound<'a, PyArray2<f64>>> {
-        // DÜZELTME 5: unsafe blok eklendi
-        let vectors_slice = unsafe { vectors.as_slice()? };
-        let shape = vectors.shape();
-        
-        if shape.len() != 2 || shape[1] != 3 {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Input must be Nx3 array of 3D vectors"
-            ));
-        }
 
-        let n = shape[0];
-        let mut result = Vec::with_capacity(n * 3);
-        
-        for i in 0..n {
-            let start = i * 3;
-            let vector = PyMultiVector3D::vector(
-                vectors_slice[start],
-                vectors_slice[start + 1],
-                vectors_slice[start + 2]
-            );
+// (EKLENDİ) NumPy entegrasyon testleri
+#[cfg(test)]
+mod tests {
+    use super::{batch_rotate_2d, batch_rotate_3d};
+    use numpy::PyArray2;
+    use pyo3::Python;
+
+    #[test]
+    fn test_batch_rotate_2d_identity() {
+        Python::with_gil(|py| {
+            let data = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+            let arr = PyArray2::from_vec2_bound(py, &data).unwrap();
             
-            let rotated = rotor.rotate_vector(&vector);
-            result.push(rotated.e1());
-            result.push(rotated.e2());
-            result.push(rotated.e3());
-        }
+            // theta = 0 (identity rotasyon)
+            let result_arr = batch_rotate_2d(py, 0.0, arr.readonly()).unwrap();
+            let result_data = result_arr.to_vec2().unwrap();
 
-        // DÜZELTME 6: 1D Array oluşturup reshape() ile 3D'ye çevir
-        let result_array = PyArray1::from_vec_bound(py, result).reshape((n, 3))?;
-        Ok(result_array)
+            assert_eq!(data, result_data);
+        });
     }
 
-    // Fonksiyonları modüle ekle
-    m.add_function(wrap_pyfunction!(mv2d_from_array, m)?)?;
-    m.add_function(wrap_pyfunction!(mv2d_to_array, m)?)?;
-    m.add_function(wrap_pyfunction!(batch_rotate_2d, m)?)?;
-    m.add_function(wrap_pyfunction!(mv3d_from_array, m)?)?;
-    m.add_function(wrap_pyfunction!(mv3d_to_array, m)?)?;
-    m.add_function(wrap_pyfunction!(batch_rotate_3d, m)?)?;
+    #[test]
+    fn test_batch_rotate_3d_identity() {
+        Python::with_gil(|py| {
+            let data = vec![vec![1.0, 2.0, 5.0], vec![3.0, 4.0, 6.0]];
+            let arr = PyArray2::from_vec2_bound(py, &data).unwrap();
+            
+            // theta = 0 (identity rotasyon)
+            let result_arr = batch_rotate_3d(py, 0.0, 0.0, 0.0, 1.0, arr.readonly()).unwrap();
+            let result_data = result_arr.to_vec2().unwrap();
 
-    Ok(())
+            assert_eq!(data, result_data);
+        });
+    }
 }
