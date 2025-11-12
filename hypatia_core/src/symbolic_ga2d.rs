@@ -3,8 +3,6 @@
 use crate::multivector2d::MultiVector2D;
 use crate::symbolic::Symbol;
 
-// (DÜZELTME) Bu 'impl' bloğu, 'simplify' metodunu da içerecek şekilde
-// test modülünün dışına, dosyanın üst seviyesine taşındı.
 impl MultiVector2D<Symbol> {
     #[inline]
     pub fn scalar(s: Symbol) -> Self {
@@ -22,8 +20,6 @@ impl MultiVector2D<Symbol> {
     }
 
     /// MultiVector için simplify metodu (3D'deki gibi)
-    /// Artık test modülü DIŞINDA olduğu için sürüm derlemesi (maturin)
-    /// tarafından görülebilir.
     pub fn simplify(&self) -> Self {
         Self {
             s: self.s.clone().simplify(),
@@ -34,8 +30,7 @@ impl MultiVector2D<Symbol> {
     }
 }
 
-
-// Kanonik sıra: [s, e1, e2, e12]
+// ... (to_coeffs, from_coeffs, zero, add, mul değişmedi) ...
 #[inline]
 fn to_coeffs(m: &MultiVector2D<Symbol>) -> [Symbol; 4] {
     [m.s.clone(), m.e1.clone(), m.e2.clone(), m.e12.clone()]
@@ -61,14 +56,14 @@ fn mul(a: Symbol, b: Symbol) -> Symbol {
     (a * b).simplify()
 }
 
-/// 2D’de blade çarpımı için işaret ve sonuç maskesi.
+// ... (gp_sign_and_mask_2d, gp_blades_symbolic, Mul impl değişmedi) ...
 #[inline]
 fn gp_sign_and_mask_2d(a_mask: u8, b_mask: u8) -> (i32, u8) {
     let k_mask = a_mask ^ b_mask;
     let mut sign = 1;
 
     let mut swaps: i32 = 0;
-    for i in 0..2 { // 0..2 (e1, e2)
+    for i in 0..2 {
         if (a_mask & (1 << i)) != 0 {
             let lower = b_mask & ((1 << i) - 1);
             swaps += lower.count_ones() as i32;
@@ -82,7 +77,6 @@ fn gp_sign_and_mask_2d(a_mask: u8, b_mask: u8) -> (i32, u8) {
 }
 
 
-/// Sembolik katsayı vektörleri için geometrik çarpım (2D)
 fn gp_blades_symbolic(a: &[Symbol; 4], b: &[Symbol; 4]) -> [Symbol; 4] {
     let mut out_fixed = [zero(), zero(), zero(), zero()];
     for i in 0..4 {
@@ -98,7 +92,6 @@ fn gp_blades_symbolic(a: &[Symbol; 4], b: &[Symbol; 4]) -> [Symbol; 4] {
     out_fixed
 }
 
-/// MultiVector2D<Symbol> için geometrik çarpım
 impl std::ops::Mul for MultiVector2D<Symbol> {
     type Output = Self;
 
@@ -126,8 +119,12 @@ mod tests {
 
         let result = (v1 * v2).simplify();
         
-        assert_eq!(format!("{}", result.s), "((2 * x) + (3 * y))");
-        assert_eq!(format!("{}", result.e12), "((3 * x) + (-2 * y))");
+        // s   = (2*x) + (3*y)
+        // e12 = (3*x) - (2*y) = (3*x) + (-2*y)
+        
+        // (DÜZELTME) S-expression formatı
+        assert_eq!(format!("{}", result.s), "(add (mul 2 x) (mul 3 y))");
+        assert_eq!(format!("{}", result.e12), "(add (mul 3 x) (mul -2 y))");
     }
     
     /// İşaret mantığını doğrulamak için temel test
@@ -140,17 +137,10 @@ mod tests {
         let _one = MultiVector2D::<Symbol>::scalar(Symbol::c(1.0));
         let _neg_one = MultiVector2D::<Symbol>::scalar(Symbol::c(-1.0));
 
-        // e1*e1 = 1
         assert_eq!(format!("{}", (e1.clone() * e1.clone()).simplify().s), "1");
-        // e2*e2 = 1
         assert_eq!(format!("{}", (e2.clone() * e2.clone()).simplify().s), "1");
-        // e1*e2 = e12
         assert_eq!(format!("{}", (e1.clone() * e2.clone()).simplify().e12), "1");
-        // e2*e1 = -e12
         assert_eq!(format!("{}", (e2.clone() * e1.clone()).simplify().e12), "-1");
-        // e12*e12 = -1
         assert_eq!(format!("{}", (e12.clone() * e12.clone()).simplify().s), "-1");
     }
-
-    // (NOT) 'simplify' metodu artık test modülünün dışında.
 }

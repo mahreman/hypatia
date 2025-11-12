@@ -11,6 +11,7 @@ pub enum Symbol {
     Const(f64),
     Variable(String),
     Add(Box<Symbol>, Box<Symbol>),
+    // (DÜZELTME) Bir önceki adımdaki Box<Box<>> hatasının düzeltilmiş hali
     Mul(Box<Symbol>, Box<Symbol>),
     Neg(Box<Symbol>),
 }
@@ -35,6 +36,7 @@ impl From<f64> for Symbol {
 
 /* --------------------------
    Display (yazdırma biçimi)
+   (GÜNCELLENDİ) E-graph (egg) uyumluluğu için S-expression formatı
    -------------------------- */
 
 impl Display for Symbol {
@@ -43,9 +45,9 @@ impl Display for Symbol {
         match self {
             Const(c) => write!(f, "{}", fmt_number(*c)),
             Variable(name) => write!(f, "{}", name),
-            Add(a, b) => write!(f, "({} + {})", a, b),
-            Mul(a, b) => write!(f, "({} * {})", a, b),
-            Neg(a) => write!(f, "-{}", a),
+            Add(a, b) => write!(f, "(add {} {})", a, b),
+            Mul(a, b) => write!(f, "(mul {} {})", a, b),
+            Neg(a) => write!(f, "(neg {})", a),
         }
     }
 }
@@ -82,7 +84,6 @@ impl Sub for Symbol {
         use Symbol::*;
         match (&self, &rhs) {
             (Const(a), Const(b)) => Const(a - b),
-            // Diğer tüm durumlar için a + (-b) kuralını kullan
             _ => self + (-rhs),
         }
     }
@@ -119,7 +120,6 @@ impl Symbol {
             }
             Add(a, b) => a.derivative(var) + b.derivative(var),
             Mul(a, b) => {
-                // (a*b)' = a'*b + a*b'
                 (a.derivative(var) * b.as_ref().clone())
                     + (a.as_ref().clone() * b.derivative(var))
             }
@@ -141,13 +141,8 @@ impl Symbol {
                     (Const(0.0), x) => x.clone(),
                     (x, Const(0.0)) => x.clone(),
                     (Const(av), Const(bv)) => Const(av + bv),
-
-                    // (DÜZELTME) BU KURAL KALDIRILDI
-                    // 'Sub' implementasyonu (a + (-b)) ile çakışıp sonsuz döngü yaratıyordu.
-                    // (x, Neg(y)) => (x.clone() - y.as_ref().clone()).simplify(),
                     
                     _ => {
-                        // Eğer aynı ifadeler toplanıyorsa: x + x = 2*x
                         if a_s == b_s {
                             (Const(2.0) * a_s).simplify()
                         } else {
@@ -167,16 +162,12 @@ impl Symbol {
                     (x, Const(1.0)) => x.clone(),
                     (Const(av), Const(bv)) => Const(av * bv),
                     
-                    // Kanonikleştirme: Sabitleri başa al (örn: x * 2 -> 2 * x)
                     (x, Const(c)) if !matches!(x, Const(_)) => {
                         Mul(Box::new(Const(*c)), Box::new(x.clone()))
                     }
                     
-                    // (-x) * (-y) = x * y
                     (Neg(x), Neg(y)) => (x.as_ref().clone() * y.as_ref().clone()).simplify(),
-                    // (-x) * y = -(x * y)
                     (Neg(x), y) => (-(x.as_ref().clone() * y.clone())).simplify(),
-                    // x * (-y) = -(x * y)
                     (x, Neg(y)) => (-(x.clone() * y.as_ref().clone())).simplify(),
                     _ => Mul(Box::new(a_s), Box::new(b_s)),
                 }
@@ -187,14 +178,9 @@ impl Symbol {
                 match a_s {
                     Const(c) => Const(-c),
                     Neg(inner) => *inner,
-
-                    // (DÜZELTME) YENİ KANONİKLEŞTİRME KURALI
-                    // Negasyonu içeri dağıt: -(A * B) => (-A) * B
-                    // Bu, '(-(2 * y))' yerine '(-2 * y)' formatını sağlar.
                     Mul(a_inner, b_inner) => {
                         ( (-a_inner.as_ref().clone()) * b_inner.as_ref().clone() ).simplify()
                     }
-
                     other => Neg(Box::new(other)),
                 }
             }
@@ -234,7 +220,7 @@ impl Symbol {
 }
 
 /* --------------------------
-   TESTLER
+   TESTLER (S-expression formatına güncellendi)
    -------------------------- */
 
 #[cfg(test)]
@@ -248,10 +234,10 @@ mod tests {
         let two = Symbol::c(2.0);
 
         let f = x.clone() * two.clone();
-        assert_eq!(format!("{}", f), "(x * 2)");
+        assert_eq!(format!("{}", f), "(mul x 2)");
 
         let g = x.clone() * y.clone() + two.clone();
-        assert_eq!(format!("{}", g), "((x * y) + 2)");
+        assert_eq!(format!("{}", g), "(add (mul x y) 2)");
     }
 
     #[test]
@@ -260,12 +246,10 @@ mod tests {
         let y = Symbol::var("y");
         let two = Symbol::c(2.0);
 
-        // f(x) = x * 2 => f'(x) = 2
         let f = x.clone() * two.clone();
         let df_dx = f.derivative("x").simplify();
         assert_eq!(format!("{}", df_dx), "2");
 
-        // g(x,y) = x*y => dg/dx = y, dg/dy = x
         let g = x.clone() * y.clone();
         let dg_dx = g.derivative("x").simplify();
         let dg_dy = g.derivative("y").simplify();
@@ -278,19 +262,15 @@ mod tests {
         let x = Symbol::var("x");
         let y = Symbol::var("y");
         
-        // x * 0 = 0
         let expr1 = x.clone() * Symbol::c(0.0);
         assert_eq!(format!("{}", expr1.simplify()), "0");
         
-        // x + x = 2*x
         let expr2 = x.clone() + x.clone();
-        assert_eq!(format!("{}", expr2.simplify()), "(2 * x)");
+        assert_eq!(format!("{}", expr2.simplify()), "(mul 2 x)");
         
-        // -(-x) = x
         let expr3 = -(-x.clone());
         assert_eq!(format!("{}", expr3.simplify()), "x");
         
-        // (x * y) * 0 = 0
         let expr4 = (x.clone() * y.clone()) * Symbol::c(0.0);
         assert_eq!(format!("{}", expr4.simplify()), "0");
     }
@@ -306,12 +286,10 @@ mod derivative_tests {
         let y = Symbol::var("y");
         let two = Symbol::c(2.0);
 
-        // f(x) = x * 2 => f'(x) = 2 (sadeleştirilmiş)
         let f = x.clone() * two.clone();
         let df_dx = f.derivative("x").simplify();
         assert_eq!(format!("{}", df_dx), "2");
 
-        // g(x,y) = x*y => dg/dx = y (sadeleştirilmiş)
         let g = x.clone() * y.clone();
         let dg_dx = g.derivative("x").simplify();
         let dg_dy = g.derivative("y").simplify();

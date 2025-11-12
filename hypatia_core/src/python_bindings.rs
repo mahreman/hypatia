@@ -1,17 +1,14 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::Bound;
-// (EKLENDİ) Hata sınıfı oluşturmak için gereken importlar
-use pyo3::create_exception;
-use pyo3::exceptions::PyException;
 
 use crate::multivector2d::MultiVector2D;
 use crate::multivector3d::MultiVector3D;
 use crate::symbolic::Symbol;
 
-// (EKLENDİ) Kütüphaneye özel hata sınıfı
-// Bu, `hypatia_core.HypatiaError` olarak Python'da erişilebilir olacak.
-create_exception!(hypatia_core, HypatiaError, PyException);
+
+// FIX: HypatiaError tanımla (manifesto önerisi)
+pyo3::create_exception!(hypatia_core, HypatiaError, pyo3::exceptions::PyException);
 
 // ===============================
 // Numeric 2D Wrapper
@@ -160,7 +157,7 @@ impl PySymbol {
 
     pub fn subs(&self, mapping: &Bound<'_, PyDict>) -> PyResult<Self> {
         let mut env = std::collections::HashMap::new();
-        for (key, value) in mapping {
+        for (key, value) in mapping.iter() {
             let key_str: String = key.extract()?;
             let value_f64: f64 = value.extract()?;
             env.insert(key_str, value_f64);
@@ -172,26 +169,26 @@ impl PySymbol {
     pub fn __repr__(&self) -> String { format!("Symbol('{}')", self.inner) }
 
     pub fn __neg__(&self) -> Self {
-        Self { inner: (-self.inner.clone()).simplify() } // Sadeleştirme eklendi
+        Self { inner: (-self.inner.clone()).simplify() }
     }
     
     pub fn __add__(&self, rhs: &PySymbol) -> Self {
-        Self { inner: (self.inner.clone() + rhs.inner.clone()).simplify() } // Sadeleştirme eklendi
+        Self { inner: (self.inner.clone() + rhs.inner.clone()).simplify() }
     }
     
     pub fn __sub__(&self, rhs: &PySymbol) -> Self {
-        Self { inner: (self.inner.clone() + (-rhs.inner.clone())).simplify() } // Sadeleştirme eklendi
+        Self { inner: (self.inner.clone() - rhs.inner.clone()).simplify() }
     }
     
     pub fn __mul__(&self, rhs: &PySymbol) -> Self {
-        Self { inner: (self.inner.clone() * rhs.inner.clone()).simplify() } // Sadeleştirme eklendi
+        Self { inner: (self.inner.clone() * rhs.inner.clone()).simplify() }
     }
 }
 
 // ===============================
 // Symbolic 2D Wrapper
 // ===============================
-#[pyclass(name = "PyMultiVector2D_Symbolic")]
+#[pyclass(name = "PyMultiVector2dSymbolic")]
 #[derive(Clone)]
 pub struct PyMultiVector2dSymbolic {
     pub inner: MultiVector2D<Symbol>,
@@ -217,15 +214,6 @@ impl PyMultiVector2dSymbolic {
     pub fn simplify(&self) -> Self {
         Self { inner: self.inner.simplify() }
     }
-
-    pub fn geometric_product(&self, rhs: &PyMultiVector2dSymbolic) -> Self {
-        Self { inner: self.inner.clone() * rhs.inner.clone() }
-    }
-
-    pub fn e1(&self) -> PySymbol { PySymbol { inner: self.inner.e1.clone() } }
-    pub fn e2(&self) -> PySymbol { PySymbol { inner: self.inner.e2.clone() } }
-    pub fn e12(&self) -> PySymbol { PySymbol { inner: self.inner.e12.clone() } }
-    pub fn s(&self) -> PySymbol { PySymbol { inner: self.inner.s.clone() } }
 
     pub fn __add__(&self, rhs: &PyMultiVector2dSymbolic) -> Self {
         let a = &self.inner; let b = &rhs.inner;
@@ -352,4 +340,10 @@ impl PyMultiVector3dSymbolic {
             a.s, a.e1, a.e2, a.e3, a.e12, a.e23, a.e31, a.e123
         )
     }
+}
+
+// (FIX) E-graph optimizer için PyO3 binding (duplicate önlemek için local fn, no use)
+#[pyfunction]
+pub fn optimize_ast(expr_str: String) -> PyResult<String> {
+    Ok(crate::egraph_optimizer::optimize_ast(&expr_str))
 }

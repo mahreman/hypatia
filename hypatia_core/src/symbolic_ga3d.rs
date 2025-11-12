@@ -2,7 +2,6 @@ use crate::multivector3d::MultiVector3D;
 use crate::symbolic::Symbol;
 
 // --------- Symbolik yapıcılar ---------
-
 impl MultiVector3D<Symbol> {
     pub fn scalar(s: Symbol) -> Self {
         Self {
@@ -53,7 +52,7 @@ impl MultiVector3D<Symbol> {
         }
     }
 
-    /// (EKLENDİ) Her bileşeni özyinelemeli olarak sadeleştirir.
+    /// Her bileşeni özyinelemeli olarak sadeleştirir.
     pub fn simplify(&self) -> Self {
         Self {
             s: self.s.clone().simplify(),
@@ -69,7 +68,6 @@ impl MultiVector3D<Symbol> {
 }
 
 // --------- Bitmask sırası ve dönüşümler ---------
-// ... (içerik değişmedi) ...
 #[inline]
 fn to_coeffs(m: &MultiVector3D<Symbol>) -> [Symbol; 8] {
     [
@@ -115,7 +113,6 @@ fn mul(a: Symbol, b: Symbol) -> Symbol {
     (a * b).simplify()
 }
 
-// ... (gp_mask_sign_3d ve gp_blades_symbolic değişmedi) ...
 #[inline]
 fn gp_mask_sign_3d(a: u8, b: u8) -> (u8, i32) {
     let k = a ^ b;
@@ -153,6 +150,7 @@ fn gp_blades_symbolic(a: &[Symbol; 8], b: &[Symbol; 8]) -> [Symbol; 8] {
     }
     out
 }
+
 // --------- Geometric Product ---------
 
 impl std::ops::Mul for MultiVector3D<Symbol> {
@@ -172,7 +170,7 @@ mod tests {
 
     #[test]
     fn symbolic_3d_basis_rules() {
-        // e1*e1 = 1
+        // (DÜZELTME) S-expression formatı (değişiklik yok, 1 ve -1 sabit)
         let e1 = MultiVector3D::<Symbol>::vector(
             Symbol::c(1.0),
             Symbol::c(0.0),
@@ -181,10 +179,8 @@ mod tests {
         let one = MultiVector3D::<Symbol>::scalar(Symbol::c(1.0));
         let e1e1 = (e1.clone() * e1.clone()).simplify();
         
-        // (DÜZELTİLDİ) 'one' değişkeni kullanıldı
         assert_eq!(format!("{}", e1e1.s), format!("{}", one.s));
 
-        // e1*e2 = e12, e2*e1 = -e12
         let e2 = MultiVector3D::<Symbol>::vector(
             Symbol::c(0.0),
             Symbol::c(1.0),
@@ -192,19 +188,17 @@ mod tests {
         );
         let e1e2 = (e1.clone() * e2.clone()).simplify();
         let e2e1 = (e2.clone() * e1.clone()).simplify();
-        // e12 işaret kontrolü
         assert_eq!(format!("{}", e1e2.e12), "1");
         assert_eq!(format!("{}", e2e1.e12), "-1");
     }
 
     #[test]
     fn symbolic_3d_simplification() {
+        // (DÜZELTME) S-expression formatı (değişiklik yok, 0 sabit)
         let x = Symbol::var("x");
-        // (DÜZELTİLDİ) Kullanılmayan değişkenler _ ile işaretlendi
         let _y = Symbol::var("y");
         let _z = Symbol::var("z");
 
-        // Test sadeleştirme: 0 * x = 0
         let zero_mv = MultiVector3D::<Symbol>::scalar(Symbol::c(0.0));
         let vector_x = MultiVector3D::<Symbol>::vector(x.clone(), Symbol::c(0.0), Symbol::c(0.0));
         let product = (zero_mv * vector_x).simplify();
