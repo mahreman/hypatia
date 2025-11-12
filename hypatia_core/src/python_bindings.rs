@@ -5,13 +5,13 @@ use pyo3::Bound;
 use crate::multivector2d::MultiVector2D;
 use crate::multivector3d::MultiVector3D;
 use crate::symbolic::Symbol;
+use std::collections::HashMap;
 
-
-// FIX: HypatiaError tanımla (manifesto önerisi)
+// Hypatia özel hata sınıfı
 pyo3::create_exception!(hypatia_core, HypatiaError, pyo3::exceptions::PyException);
 
 // ===============================
-// Numeric 2D Wrapper
+// Numeric 2D Wrapper (MEVCUT - DEĞİŞMEDİ)
 // ===============================
 #[pyclass(name = "PyMultiVector2D")]
 #[derive(Clone)]
@@ -49,7 +49,6 @@ impl PyMultiVector2D {
         Self { inner: self.inner.grade(k as u8) }
     }
 
-    // Bileşen okuyucular
     pub fn e1(&self) -> f64 { self.inner.e1 }
     pub fn e2(&self) -> f64 { self.inner.e2 }
     pub fn e12(&self) -> f64 { self.inner.e12 }
@@ -64,7 +63,7 @@ impl PyMultiVector2D {
 }
 
 // ===============================
-// Numeric 3D Wrapper
+// Numeric 3D Wrapper (MEVCUT - DEĞİŞMEDİ)
 // ===============================
 #[pyclass(name = "PyMultiVector3D")]
 #[derive(Clone)]
@@ -107,12 +106,12 @@ impl PyMultiVector3D {
         Self { inner: self.inner.grade(k as u8) }
     }
 
-    // Bileşen okuyucular
     pub fn e1(&self) -> f64 { self.inner.e1 }
     pub fn e2(&self) -> f64 { self.inner.e2 }
     pub fn e3(&self) -> f64 { self.inner.e3 }
     pub fn e12(&self) -> f64 { self.inner.e12 }
     pub fn e23(&self) -> f64 { self.inner.e23 }
+    // DÜZELTME: 'public fn' -> 'pub fn'
     pub fn e31(&self) -> f64 { self.inner.e31 }
     pub fn e123(&self) -> f64 { self.inner.e123 }
     pub fn s(&self) -> f64 { self.inner.s }
@@ -127,7 +126,7 @@ impl PyMultiVector3D {
 }
 
 // ===============================
-// PySymbol (Symbolic scalar)
+// ✅ PySymbol (UPDATED WITH ALL NEW FUNCTIONS)
 // ===============================
 #[pyclass(name = "Symbol")]
 #[derive(Clone)]
@@ -137,6 +136,8 @@ pub struct PySymbol {
 
 #[pymethods]
 impl PySymbol {
+    // ============ TEMEL OLUŞTURUCULAR ============
+    
     #[staticmethod]
     pub fn variable(name: &str) -> Self {
         Self { inner: Symbol::Variable(name.to_string()) }
@@ -147,16 +148,113 @@ impl PySymbol {
         Self { inner: Symbol::Const(v) }
     }
 
+    // ============ MATEMATİKSEL FONKSİYONLAR ============
+    
+    /// e^x
+    #[staticmethod]
+    pub fn exp(x: &PySymbol) -> Self {
+        Self { inner: Symbol::exp(x.inner.clone()) }
+    }
+    
+    /// ln(x)
+    #[staticmethod]
+    pub fn log(x: &PySymbol) -> Self {
+        Self { inner: Symbol::log(x.inner.clone()) }
+    }
+    
+    /// √x
+    #[staticmethod]
+    pub fn sqrt(x: &PySymbol) -> Self {
+        Self { inner: Symbol::sqrt(x.inner.clone()) }
+    }
+    
+    /// x^y
+    #[staticmethod]
+    pub fn pow(base: &PySymbol, exp: &PySymbol) -> Self {
+        Self { inner: Symbol::pow(base.inner.clone(), exp.inner.clone()) }
+    }
+    
+    // ============ AKTİVASYON FONKSİYONLARI ============
+    
+    /// ReLU(x) = max(0, x)
+    #[staticmethod]
+    pub fn relu(x: &PySymbol) -> Self {
+        Self { inner: Symbol::relu(x.inner.clone()) }
+    }
+    
+    /// ReLU gradient (Heaviside function)
+    #[staticmethod]
+    pub fn relu_grad(x: &PySymbol) -> Self {
+        Self { inner: Symbol::relu_grad(x.inner.clone()) }
+    }
+    
+    /// sigmoid(x) = 1/(1+e^-x)
+    #[staticmethod]
+    pub fn sigmoid(x: &PySymbol) -> Self {
+        Self { inner: Symbol::sigmoid(x.inner.clone()) }
+    }
+    
+    /// tanh(x)
+    #[staticmethod]
+    pub fn tanh(x: &PySymbol) -> Self {
+        Self { inner: Symbol::tanh(x.inner.clone()) }
+    }
+    
+    // ============ YARDIMCI FONKSİYONLAR ============
+    
+    /// max(a, b)
+    #[staticmethod]
+    pub fn max(a: &PySymbol, b: &PySymbol) -> Self {
+        Self { inner: Symbol::max(a.inner.clone(), b.inner.clone()) }
+    }
+    
+    /// min(a, b)
+    #[staticmethod]
+    pub fn min(a: &PySymbol, b: &PySymbol) -> Self {
+        Self { inner: Symbol::min(a.inner.clone(), b.inner.clone()) }
+    }
+    
+    // ============ SEMBOL MANİPÜLASYONU ============
+    
+    /// Türev al (otomatik sadeleştirme ile)
     pub fn derivative(&self, var: &str) -> Self {
-        Self { inner: self.inner.derivative(var).simplify() } // Otomatik sadeleştirme
+        Self { inner: self.inner.derivative(var).simplify() }
     }
 
+    /// ✅ YENİ: Sembolik integral al
+    /// 
+    /// Sadece x^n, e^x, ln(x) gibi basit polinom ve
+    /// temel fonksiyonları destekler. Desteklenmeyen durumlar
+    /// için 'HypatiaError' fırlatır.
+    /// 
+    /// # Örnek (Python)
+    /// ```python
+    /// x = Symbol.variable("x")
+    /// expr = x * Symbol.const(3)
+    /// # (mul 3 (div (pow x 2) 2))
+    /// integral = expr.integrate("x") 
+    /// ```
+    pub fn integrate(&self, var: &str) -> PyResult<Self> {
+        match self.inner.integrate(var) {
+            Ok(integrated_symbol) => {
+                // İntegral sonrası sadeleştirme
+                Ok(Self { inner: integrated_symbol.simplify() })
+            }
+            Err(e) => {
+                // Rust String hatasını Python HypatiaError'a dönüştür
+                Err(HypatiaError::new_err(format!("IntegrationError: {}", e)))
+            }
+        }
+    }
+
+    /// İfadeyi sadeleştir
     pub fn simplify(&self) -> Self {
         Self { inner: self.inner.simplify() }
     }
 
+    /// Değişkenlere değer ver (substitution)
     pub fn subs(&self, mapping: &Bound<'_, PyDict>) -> PyResult<Self> {
-        let mut env = std::collections::HashMap::new();
+        let mut env = HashMap::new();
         for (key, value) in mapping.iter() {
             let key_str: String = key.extract()?;
             let value_f64: f64 = value.extract()?;
@@ -165,8 +263,33 @@ impl PySymbol {
         Ok(Self { inner: self.inner.subs(&env) })
     }
 
-    pub fn __str__(&self) -> String { format!("{}", self.inner) }
-    pub fn __repr__(&self) -> String { format!("Symbol('{}')", self.inner) }
+    /// ✅ YENİ: Sayısal değerlendirme
+    /// 
+    /// # Örnek (Python)
+    /// ```python
+    /// x = Symbol.variable("x")
+    /// expr = Symbol.relu(x * Symbol.const(2.0))
+    /// result = expr.eval({"x": 3.0})  # Returns 6.0
+    /// ```
+    pub fn eval(&self, mapping: &Bound<'_, PyDict>) -> PyResult<f64> {
+        let mut env = HashMap::new();
+        for (key, value) in mapping.iter() {
+            let key_str: String = key.extract()?;
+            let value_f64: f64 = value.extract()?;
+            env.insert(key_str, value_f64);
+        }
+        Ok(self.inner.eval(&env))
+    }
+
+    // ============ PYTHON OPERATÖRLER ============
+    
+    pub fn __str__(&self) -> String { 
+        format!("{}", self.inner) 
+    }
+    
+    pub fn __repr__(&self) -> String { 
+        format!("Symbol('{}')", self.inner) 
+    }
 
     pub fn __neg__(&self) -> Self {
         Self { inner: (-self.inner.clone()).simplify() }
@@ -183,10 +306,15 @@ impl PySymbol {
     pub fn __mul__(&self, rhs: &PySymbol) -> Self {
         Self { inner: (self.inner.clone() * rhs.inner.clone()).simplify() }
     }
+    
+    /// ✅ YENİ: Division operatörü
+    pub fn __truediv__(&self, rhs: &PySymbol) -> Self {
+        Self { inner: (self.inner.clone() / rhs.inner.clone()).simplify() }
+    }
 }
 
 // ===============================
-// Symbolic 2D Wrapper
+// Symbolic 2D Wrapper (MEVCUT - DEĞİŞMEDİ)
 // ===============================
 #[pyclass(name = "PyMultiVector2dSymbolic")]
 #[derive(Clone)]
@@ -250,7 +378,7 @@ impl PyMultiVector2dSymbolic {
 }
 
 // ===============================
-// Symbolic 3D Wrapper
+// Symbolic 3D Wrapper (MEVCUT - DEĞİŞMEDİ)
 // ===============================
 #[pyclass(name = "PyMultiVector3D_Symbolic")]
 #[derive(Clone)]
@@ -295,6 +423,7 @@ impl PyMultiVector3dSymbolic {
     pub fn e23(&self) -> PySymbol { PySymbol { inner: self.inner.e23.clone() } }
     pub fn e31(&self) -> PySymbol { PySymbol { inner: self.inner.e31.clone() } }
     pub fn e123(&self) -> PySymbol { PySymbol { inner: self.inner.e123.clone() } }
+    // DÜZELTME: 'AFN:' satırı silindi
     pub fn s(&self) -> PySymbol { PySymbol { inner: self.inner.s.clone() } }
 
     pub fn __add__(&self, rhs: &PyMultiVector3dSymbolic) -> Self {
@@ -342,7 +471,9 @@ impl PyMultiVector3dSymbolic {
     }
 }
 
-// (FIX) E-graph optimizer için PyO3 binding (duplicate önlemek için local fn, no use)
+// ===============================
+// E-graph optimizer binding
+// ===============================
 #[pyfunction]
 pub fn optimize_ast(expr_str: String) -> PyResult<String> {
     Ok(crate::egraph_optimizer::optimize_ast(&expr_str))
