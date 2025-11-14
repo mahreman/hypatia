@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyAny}; // PyAny eklendi
 use pyo3::Bound;
 
 use crate::multivector2d::MultiVector2D;
@@ -9,6 +9,49 @@ use std::collections::HashMap;
 
 // Hypatia özel hata sınıfı
 pyo3::create_exception!(hypatia_core, HypatiaError, pyo3::exceptions::PyException);
+
+// ====================================================================
+// ✅ GÜNCEL: Manuel FromPyObject implementasyonu
+// ====================================================================
+
+// #[derive(FromPyObject, Debug, Clone)] // Otomatik türetmeyi kaldır
+#[derive(Debug, Clone)]
+pub struct ModuleInfo {
+    pub module_type: String,
+    pub has_bias: bool,
+    pub is_inference: bool, // Tekrar bool oldu, çünkü varsayılan değer atayacağız
+}
+
+// KeyError'ı önlemek için manuel olarak FromPyObject uygulayın
+impl<'source> FromPyObject<'source> for ModuleInfo {
+    fn extract(ob: &'source PyAny) -> PyResult<Self> {
+        let dict = ob.downcast::<PyDict>()?;
+
+        // 'type' zorunludur, eksikse hata verir
+        let module_type: String = dict
+            .get_item("type")?
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyKeyError, _>("'type' key missing in ModuleInfo"))?
+            .extract()?;
+
+        // 'has_bias' opsiyoneldir, eksikse 'true' varsayılır
+        let has_bias: bool = dict
+            .get_item("has_bias")?
+            .map_or(Ok(true), |item| item.extract())?; // Eksikse true
+
+        // 'is_inference' opsiyoneldir, eksikse 'true' (çıkarım modu) varsayılır
+        let is_inference: bool = dict
+            .get_item("is_inference")?
+            .map_or(Ok(true), |item| item.extract())?; // Eksikse true
+
+        Ok(ModuleInfo {
+            module_type,
+            has_bias,
+            is_inference,
+        })
+    }
+}
+// ====================================================================
+
 
 // ===============================
 // Numeric 2D Wrapper (Değişiklik yok)
@@ -243,7 +286,16 @@ impl PyMultiVector3dSymbolic {
 /// Optimizasyon motorunu (v3.0) çalıştırır. (String -> String)
 #[pyfunction]
 pub fn optimize_ast(expr_str: String) -> PyResult<String> {
-    Ok(crate::egraph_optimizer::optimize_ast(&expr_str))
+    // optimize_to_ast_internal'ın varsayılan is_inference=true değerini kullanır
+    let info = ModuleInfo {
+        module_type: "Unknown".to_string(),
+        has_bias: false,
+        is_inference: true // Manuel olarak ayarlandı
+    };
+    match crate::egraph_optimizer::optimize_to_ast_with_info(&expr_str, &info) {
+        Ok(ast) => Ok(crate::egraph_optimizer::rec_to_string(&ast)),
+        Err(e) => Err(HypatiaError::new_err(format!("OptimizationError: {}", e))),
+    }
 }
 
 /// S-expression string'ini PySymbol nesnesine ayrıştırır (FEZ 7)
@@ -269,26 +321,30 @@ pub fn is_equivalent(expr1_str: String, expr2_str: String) -> PyResult<bool> {
 pub fn compile_fx_graph(
     py_graph_module: PyObject, 
     _example_inputs: PyObject,
-    module_type_map: &Bound<'_, PyDict>
+    module_info_map: &Bound<'_, PyDict>
 ) -> PyResult<PyObject> {
     Python::with_gil(|py| {
         let gm = py_graph_module.bind(py);
         
         eprintln!("[DEBUG] compile_fx_graph called successfully");
 
-        // ====================================================================
-        // ✅ CRITICAL FIX (E0277): .map() bloğu düzeltildi.
-        // ====================================================================
-        let types_map: HashMap<String, String> = module_type_map
+        // Manuel FromPyObject implementasyonu sayesinde bu çağrı artık
+        // eksik 'is_inference' anahtarı için hata vermeyecektir.
+        let info_map: HashMap<String, ModuleInfo> = module_info_map
             .iter()
             .map(|(k, v)| {
-                // Her (key, value) çiftini tek bir Result'a dönüştür
-                Ok((k.extract::<String>()?, v.extract::<String>()?))
+                Ok((k.extract::<String>()?, v.extract::<ModuleInfo>()?))
             })
-            .collect::<PyResult<HashMap<String, String>>>()?;
-        // ====================================================================
+            .collect::<PyResult<HashMap<String, ModuleInfo>>>()?;
 
-        let sexpr = match crate::fx_bridge::fx_graph_to_sexpr(py, &gm, &types_map) {
+        // Modelin genel çıkarım modunda olup olmadığını belirle
+        let general_info = info_map.values().next().cloned().unwrap_or(ModuleInfo {
+            module_type: "Unknown".to_string(),
+            has_bias: true,
+            is_inference: true // Varsayılan
+        });
+        
+        let sexpr = match crate::fx_bridge::fx_graph_to_sexpr(py, &gm, &info_map) {
             Ok(s) => {
                 eprintln!("[DEBUG] S-expression (ilk 500 karakter): {:.500}...", s);
                 s
@@ -299,7 +355,8 @@ pub fn compile_fx_graph(
             }
         };
         
-        let optimized_ast = match crate::egraph_optimizer::optimize_to_ast(&sexpr) {
+        // optimize_to_ast_with_info'yu kullanarak genel is_inference bayrağını iletin
+        let optimized_ast = match crate::egraph_optimizer::optimize_to_ast_with_info(&sexpr, &general_info) {
             Ok(ast) => ast,
             Err(e) => {
                 eprintln!("[compile_fx_graph] Optimization failed: {}", e);
@@ -307,7 +364,7 @@ pub fn compile_fx_graph(
             }
         };
         
-        eprintln!("[DEBUG] Optimized AST: {}", optimized_ast);
+        eprintln!("[DEBUG] Optimized AST: {}", crate::egraph_optimizer::rec_to_string(&optimized_ast));
 
         match crate::fx_bridge::sexpr_to_fx_graph(py, &gm, optimized_ast) {
             Ok(optimized_gm) => {
@@ -322,7 +379,6 @@ pub fn compile_fx_graph(
                 Ok(optimized_gm)
             }
             Err(err) => {
-                // ✅ DÜZELTME: Hatayı logla
                 eprintln!("[compile_fx_graph] Reconstruction FAILED: {err:?}");
                 eprintln!("[compile_fx_graph] Falling back to original GraphModule");
                 Ok(gm.to_object(py))

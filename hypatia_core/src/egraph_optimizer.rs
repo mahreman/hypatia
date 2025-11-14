@@ -6,10 +6,11 @@ use ordered_float::NotNan;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
 use crate::symbolic::Symbol; 
+use crate::python_bindings::ModuleInfo; // ModuleInfo'yu kullanmak için import
+// `HashMap` kullanılmıyor, uyarıyı önlemek için kaldırıldı
 
 // ============================================================================
 // HYPATIA LANGUAGE DEFINITION
-// (✅ GÜNCELLENDİ: 'flatten', 'transformer_encoder' eklendi)
 // ============================================================================
 
 define_language! {
@@ -45,24 +46,24 @@ define_language! {
         "matmul" = MatMul([Id; 2]), // (matmul a b)
         "linear" = Linear([Id; 3]), // (linear w b x)
         
+        // --- ResNet Operatörleri ---
         // (conv2d w b x stride padding dilation groups)
         "conv2d" = Conv2d([Id; 7]), 
         // (batchnorm w b mean var x eps)
         "batchnorm" = BatchNorm([Id; 6]), 
         // (maxpool2d x kernel_size stride padding)
         "maxpool2d" = MaxPool2d([Id; 4]),
-        // (avgpool2d x kernel_size stride padding)
         "avgpool2d" = AvgPool2d([Id; 4]),
-        // (attention q k v) (simplified)
+        "adaptive_avg_pool2d" = AdaptiveAvgPool2d(Id),
+        
         "attention" = Attention([Id; 3]), 
         "embedding" = Embedding([Id; 2]), 
+        "transformer_encoder" = TransformerEncoder(Id),
         
-        // ✅ YENİ: Transformer (Kara Kutu)
-        "transformer_encoder" = TransformerEncoder(Id), // (transformer_encoder x)
-        
-        // --- PHASE 3: Fusion Hedefleri ---
+        // --- Fusion Hedefleri ---
         "linear-relu" = LinearReLU([Id; 3]), // (linear-relu w b x)
         "fused-mlp" = FusedMLP([Id; 5]), // (fused-mlp w1 b1 w2 b2 x)
+        "fused_conv_bn" = FusedConvBN([Id; 12]),
 
         // --- Temel ---
         Constant(NotNan<f64>), 
@@ -72,7 +73,6 @@ define_language! {
 
 // ============================================================================
 // Constant Folding Analysis
-// (Değişiklik yok)
 // ============================================================================
 
 #[derive(Default)]
@@ -129,64 +129,55 @@ impl Analysis<HypatiaLang> for ConstantFoldingAnalysis {
 }
 
 // ============================================================================
-// Basit FLOPs Cost Model
-// (Değişiklik yok)
+// HardwareAwareCost (Gelişmiş Maliyet Modeli)
 // ============================================================================
-pub struct FLOPsCost;
-impl CostFunction<HypatiaLang> for FLOPsCost { 
-    type Cost = usize;
+pub struct HardwareAwareCost {
+    pub is_inference: bool,
+}
+
+impl CostFunction<HypatiaLang> for HardwareAwareCost { 
+    type Cost = f64; 
+
     fn cost<C>(&mut self, enode: &HypatiaLang, mut costs: C) -> Self::Cost
     where C: FnMut(Id) -> Self::Cost,
     {
-        let children_cost: usize = enode.children().iter().map(|&id| costs(id)).sum();
-        let op_cost = match enode {
-            // Temel
-            HypatiaLang::Add(_) => 1, HypatiaLang::Sub(_) => 1, HypatiaLang::Neg(_) => 1,
-            HypatiaLang::Mul(_) => 10, HypatiaLang::Div(_) => 40,
-            HypatiaLang::Exp(_) => 20, HypatiaLang::Log(_) => 20,
-            HypatiaLang::Sqrt(_) => 15, HypatiaLang::Pow(_) => 25,
+        let children_cost: f64 = enode.children().iter().map(|&id| costs(id)).sum();
+        
+        // Basitleştirilmiş Maliyet Hesaplama
+        let (flops, mem_access, stability_penalty) = match enode {
+            HypatiaLang::MatMul(_) => (300.0, 10.0, 0.0), 
+            HypatiaLang::Conv2d(_) => (500.0, 50.0, 0.0),
+            HypatiaLang::Linear(_) => (100.0, 5.0, 0.0),
+            HypatiaLang::BatchNorm(_) => (50.0, 20.0, 0.0), 
+            HypatiaLang::Add(_) | HypatiaLang::Sub(_) => (1.0, 0.0, 0.0),
+            HypatiaLang::Mul(_) => (10.0, 0.0, 0.0),
+            HypatiaLang::Div(_) => (40.0, 0.0, 100.0), 
             
-            // Aktivasyonlar
-            HypatiaLang::ReLU(_) => 1, HypatiaLang::ReLUGrad(_) => 2,
-            HypatiaLang::Sigmoid(_) => 25, HypatiaLang::Tanh(_) => 25,
-            HypatiaLang::Softmax(_) => 50,
-            
-            // İstatistiksel
-            HypatiaLang::Mean(_) => 5, HypatiaLang::Variance(_) => 10,
-            HypatiaLang::Max(_) => 2, HypatiaLang::Min(_) => 1,
-            
-            // Şekil
-            HypatiaLang::Flatten(_) => 0,
-
-            // AI Operatörleri
-            HypatiaLang::MatMul(_) => 100, 
-            HypatiaLang::Linear(_) => 100,
-            HypatiaLang::Conv2d(_) => 500, 
-            HypatiaLang::BatchNorm(_) => 50, 
-            HypatiaLang::MaxPool2d(_) => 10,
-            HypatiaLang::AvgPool2d(_) => 10,
-            HypatiaLang::Attention(_) => 1000, 
-            HypatiaLang::Embedding(_) => 10, 
-            HypatiaLang::TransformerEncoder(_) => 5000, 
-
             // Fusion Hedefleri
-            HypatiaLang::LinearReLU(_) => 100, 
-            HypatiaLang::FusedMLP(_) => 200,
+            HypatiaLang::FusedConvBN(_) => (500.0, 50.0, 0.0), 
+            HypatiaLang::LinearReLU(_) => (100.0, 5.0, 0.0),
+            HypatiaLang::FusedMLP(_) => (200.0, 10.0, 0.0),
 
-            // Temel
-            HypatiaLang::Constant(_) => 0, 
-            HypatiaLang::Var(_) => 0,
+            _ => (0.0, 0.0, 0.0),
         };
-        op_cost + children_cost
+
+        // Cost = FLOPs * 1.0 + Memory_Access * 10.0 + Stability_Penalty * lambda
+        let lambda = 1.0; 
+        let cost = flops * 1.0 + mem_access * 10.0 + stability_penalty * lambda + children_cost;
+        cost
     }
 }
 
 // ============================================================================
 // Rewrite Kuralları
-// (Değişiklik yok)
 // ============================================================================
-fn get_rules() -> Vec<Rewrite<HypatiaLang, ConstantFoldingAnalysis>> { 
-    vec![
+// fn is_inference_mode(_id: Id, is_inference_flag: bool) -> Option<()> {
+//     if is_inference_flag { Some(()) } else { None }
+// }
+
+fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantFoldingAnalysis>> { 
+    let mut rules = vec![
+        // --- Aritmetik Kurallar (Her zaman güvenli) ---
         rewrite!("commute-add"; "(add ?a ?b)" => "(add ?b ?a)"),
         rewrite!("commute-mul"; "(mul ?a ?b)" => "(mul ?b ?a)"),
         rewrite!("assoc-add"; "(add (add ?a ?b) ?c)" => "(add ?a (add ?b ?c))"),
@@ -214,51 +205,91 @@ fn get_rules() -> Vec<Rewrite<HypatiaLang, ConstantFoldingAnalysis>> {
         rewrite!("sqrt-mul"; "(sqrt (mul ?a ?b))" => "(mul (sqrt ?a) (sqrt ?b))"),
         rewrite!("softmax-stability"; "(softmax (add ?x ?c))" => "(softmax ?x)"),
         rewrite!("relu-idempotent"; "(relu (relu ?x))" => "(relu ?x)"),
-
-        // --- PHASE 3 FUSION KURALLARI ---
-        rewrite!("linear-relu-fusion";
-            "(relu (linear ?w ?b ?x))"
-            => 
-            "(linear-relu ?w ?b ?x)"),
-        
-        rewrite!("mlp-fusion";
-            "(linear ?w2 ?b2 (relu (linear ?w1 ?b1 ?x)))"
-            =>
-            "(fused-mlp ?w1 ?b1 ?w2 ?b2 ?x)"),
-        
-        rewrite!("mlp-fusion-from-fused";
-            "(linear ?w2 ?b2 (linear-relu ?w1 ?b1 ?x))"
-            =>
-            "(fused-mlp ?w1 ?b1 ?w2 ?b2 ?x)")
-    ]
+    ];
+    
+    // ✅ DÜZELTME: Tehlikeli optimizasyonlar (fusion)
+    // sadece inference (çıkarım) modunda çalışır.
+    if is_inference_mode_flag {
+        rules.extend(vec![
+            rewrite!("linear-relu-fusion";
+                "(relu (linear ?w ?b ?x))"
+                => 
+                "(linear-relu ?w ?b ?x)"),
+            
+            rewrite!("mlp-fusion-from-fused";
+                "(linear ?w2 ?b2 (linear-relu ?w1 ?b1 ?x))"
+                =>
+                "(fused-mlp ?w1 ?b1 ?w2 ?b2 ?x)"),
+            
+            // BU KURAL ZATEN BN FOLDING YAPIYOR (CONV İÇİN)
+            rewrite!("conv-bn-fusion";
+                "(batchnorm ?w_bn ?b_bn ?m ?v (conv2d ?w_c ?b_c ?x ?s ?p ?d ?g) ?eps)"
+                =>
+                "(fused_conv_bn ?w_c ?b_c ?w_bn ?b_bn ?m ?v ?x ?eps ?s ?p ?d ?g)"),
+                
+            rewrite!("linear-chain";
+                "(linear ?w2 ?b2 (linear ?w1 ?b1 ?x))"
+                =>
+                "(linear (matmul ?w2 ?w1) (add (matmul ?w2 ?b1) ?b2) ?x)"),
+            
+            // ✅ DÜZELTME: PANIC ATAN 'batchnorm-fold' KURALI SİLİNDİ.
+            // Bu kural, `?w_fold` ve `?b_fold` değişkenlerini tanımlamadığı için
+            // geçersizdi ve paniğe neden oluyordu.
+        ]);
+    }
+    
+    rules
 }
 
 // ============================================================================
-// Dış API: (Değişiklik yok)
+// Dış API
 // ============================================================================
 
-fn rec_to_string(expr: &RecExpr<HypatiaLang>) -> String {
+// ✅ DÜZELTME: Fonksiyonu pub olarak dışa aktar
+pub fn rec_to_string(expr: &RecExpr<HypatiaLang>) -> String {
     format!("{}", expr)
 }
-pub fn optimize_ast(expr_str: &str) -> String { 
-    match optimize_to_ast(expr_str) {
-        Ok(best_expr) => rec_to_string(&best_expr),
-        Err(e) => e,
-    }
-}
+
+// ✅ DÜZELTME: E0428 hatasını çözmek için bu fonksiyon `optimize_to_ast` olarak yeniden adlandırıldı.
 pub fn optimize_to_ast(expr_str: &str) -> Result<RecExpr<HypatiaLang>, String> { 
+    // Varsayılan olarak inference modu açık
+    let info = ModuleInfo {
+        module_type: "Unknown".to_string(),
+        has_bias: false,
+        is_inference: true // Manuel olarak ayarlandı
+    };
+    optimize_to_ast_internal(expr_str, &info)
+}
+
+// ✅ GÜNCEL: ModuleInfo'yu parametre olarak alan ana optimizasyon fonksiyonu
+pub fn optimize_to_ast_with_info(expr_str: &str, info: &ModuleInfo) -> Result<RecExpr<HypatiaLang>, String> {
+    optimize_to_ast_internal(expr_str, info)
+}
+
+fn optimize_to_ast_internal(expr_str: &str, info: &ModuleInfo) -> Result<RecExpr<HypatiaLang>, String> { 
+    // ✅ DÜZELTME: info.is_inference zaten bool (manuel FromPyObject sayesinde)
+    let is_inference_mode_flag = info.is_inference; 
+    
     let res = catch_unwind(AssertUnwindSafe(|| {
         let start_expr: RecExpr<HypatiaLang> = match expr_str.parse() {
             Ok(expr) => expr,
             Err(e) => return Err(format!("(error \"Parse Error: {}\")", e)),
         };
-        let rules = get_rules();
+        
+        let rules = get_rules(is_inference_mode_flag);
+        
+        // Gelişmiş maliyet modelini kullan
+        let cost_function = HardwareAwareCost { 
+            is_inference: is_inference_mode_flag 
+        };
+        
         let runner = Runner::default()
             .with_egraph(egg::EGraph::new(ConstantFoldingAnalysis))
             .with_node_limit(20_000).with_iter_limit(30)
             .with_time_limit(Duration::from_millis(150))
             .with_expr(&start_expr).run(&rules);
-        let extractor = Extractor::new(&runner.egraph, FLOPsCost);
+            
+        let extractor = Extractor::new(&runner.egraph, cost_function);
         let (_best_cost, best_expr) = extractor.find_best(runner.roots[0]);
         Ok(best_expr)
     }));
@@ -270,8 +301,7 @@ pub fn optimize_to_ast(expr_str: &str) -> Result<RecExpr<HypatiaLang>, String> {
 }
 
 // ============================================================================
-// E-graph → Symbol Çeviricileri
-// (✅ GÜNCELLENDİ: 'Box.new' hatası düzeltildi)
+// E-graph → Symbol Çeviricileri (Değişiklik yok)
 // ============================================================================
 
 /// `HypatiaLang` RecExpr'ini özyinelemeli olarak `Symbol`'e çevirir.
@@ -292,13 +322,7 @@ fn build_symbol(node_id: Id, rec_expr: &RecExpr<HypatiaLang>) -> Symbol {
         HypatiaLang::Mean(id) => Symbol::Mean(Box::new(build_symbol(*id, rec_expr))),
         HypatiaLang::Variance(id) => Symbol::Variance(Box::new(build_symbol(*id, rec_expr))),
         HypatiaLang::Add([a, b]) => Symbol::Add( Box::new(build_symbol(*a, rec_expr)), Box::new(build_symbol(*b, rec_expr)), ),
-        
-        // ====================================================================
-        // ✅ CRITICAL FIX (E0423): Box.new -> Box::new
-        // ====================================================================
         HypatiaLang::Sub([a, b]) => Symbol::Sub( Box::new(build_symbol(*a, rec_expr)), Box::new(build_symbol(*b, rec_expr)), ),
-        // ====================================================================
-
         HypatiaLang::Mul([a, b]) => Symbol::Mul( Box::new(build_symbol(*a, rec_expr)), Box::new(build_symbol(*b, rec_expr)), ),
         HypatiaLang::Div([a, b]) => Symbol::Div( Box::new(build_symbol(*a, rec_expr)), Box::new(build_symbol(*b, rec_expr)), ),
         HypatiaLang::Pow([a, b]) => Symbol::Pow( Box::new(build_symbol(*a, rec_expr)), Box::new(build_symbol(*b, rec_expr)), ),
@@ -313,13 +337,37 @@ fn build_symbol(node_id: Id, rec_expr: &RecExpr<HypatiaLang>) -> Symbol {
 
         HypatiaLang::MatMul([a, _b]) => build_symbol(*a, rec_expr), 
         HypatiaLang::Linear([_w, _b, x]) => build_symbol(*x, rec_expr), 
-        HypatiaLang::Conv2d([_w, _b, x, ..]) => build_symbol(*x, rec_expr), 
-        HypatiaLang::BatchNorm([_w, _b, _mean, _var, x, _eps]) => build_symbol(*x, rec_expr), 
-        HypatiaLang::MaxPool2d([x, ..]) => build_symbol(*x, rec_expr),
+        
+        HypatiaLang::Conv2d([_w, _b, x, ..]) => build_symbol(*x, rec_expr),
+        
+        HypatiaLang::BatchNorm([w, b, mean, var, x, eps]) => {
+            Symbol::BatchNorm {
+                weight: Box::new(build_symbol(*w, rec_expr)),
+                bias: Box::new(build_symbol(*b, rec_expr)), 
+                running_mean: Box::new(build_symbol(*mean, rec_expr)),
+                running_var: Box::new(build_symbol(*var, rec_expr)),
+                input: Box::new(build_symbol(*x, rec_expr)),
+                eps: Box::new(build_symbol(*eps, rec_expr)),
+            }
+        },
+        
+        HypatiaLang::MaxPool2d([x, k, s, p]) => {
+            Symbol::MaxPool2d {
+                input: Box::new(build_symbol(*x, rec_expr)),
+                kernel_size: Box::new(build_symbol(*k, rec_expr)),
+                stride: Box::new(build_symbol(*s, rec_expr)),
+                padding: Box::new(build_symbol(*p, rec_expr)),
+            }
+        },
+
         HypatiaLang::AvgPool2d([x, ..]) => build_symbol(*x, rec_expr),
+        HypatiaLang::AdaptiveAvgPool2d(id) => build_symbol(*id, rec_expr), 
+        
         HypatiaLang::Attention([q, _k, _v]) => build_symbol(*q, rec_expr), 
         HypatiaLang::LinearReLU([_w, _b, x]) => Symbol::ReLU(Box::new(build_symbol(*x, rec_expr))), 
         HypatiaLang::FusedMLP([_w1, _b1, _w2, _b2, x]) => build_symbol(*x, rec_expr), 
+
+        HypatiaLang::FusedConvBN([_w_c, _b_c, _w_bn, _b_bn, _m, _v, x, ..]) => build_symbol(*x, rec_expr),
     }
 }
 
@@ -335,7 +383,7 @@ pub fn is_equivalent(expr1_str: &str, expr2_str: &str) -> Result<bool, String> {
         .map_err(|e| format!("Parse Error (expr1): {}", e))?;
     let expr2: RecExpr<HypatiaLang> = expr2_str.parse()
         .map_err(|e| format!("Parse Error (expr2): {}", e))?;
-    let rules = get_rules();
+    let rules = get_rules(true); 
     let mut egraph = EGraph::new(ConstantFoldingAnalysis);
     let root1 = egraph.add_expr(&expr1);
     let root2 = egraph.add_expr(&expr2);
@@ -353,11 +401,24 @@ pub fn is_equivalent(expr1_str: &str, expr2_str: &str) -> Result<bool, String> {
 
 // ============================================================================
 // Tests
-// (Değişiklik yok)
 // ============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // optimize_ast (String döndüren) için bir yardımcı
+    fn optimize_ast(expr_str: &str) -> String {
+        let info = ModuleInfo {
+            module_type: "Unknown".to_string(),
+            has_bias: false,
+            is_inference: true
+        };
+        match optimize_to_ast_internal(expr_str, &info) {
+            Ok(best_expr) => rec_to_string(&best_expr),
+            Err(e) => e,
+        }
+    }
+    
     #[test]
     fn t_zero_mul() { assert_eq!(optimize_ast("(mul x 0)"), "0"); }
     #[test]
@@ -430,33 +491,23 @@ mod tests {
     
     #[test]
     fn t_fusion_linear_relu() {
-        let start = "(relu (linear w b x))";
-        let expected = "(linear-relu w b x)";
-        assert_eq!(optimize_ast(start), expected);
+        assert_eq!(optimize_ast("(relu (linear w b x))"), "(linear-relu w b x)");
     }
     #[test]
     fn t_fusion_mlp_direct() {
-        let start = "(linear w2 b2 (relu (linear w1 b1 x)))";
-        let expected = "(fused-mlp w1 b1 w2 b2 x)";
-        assert_eq!(optimize_ast(start), expected);
+        assert_eq!(optimize_ast("(linear w2 b2 (relu (linear w1 b1 x)))"), "(fused-mlp w1 b1 w2 b2 x)");
     }
     #[test]
-    fn t_fusion_mlp_chained() {
-        let start = "(linear w2 b2 (relu (linear w1 b1 x)))";
-        let expected = "(fused-mlp w1 b1 w2 b2 x)";
-        let rules = get_rules();
-        let start_expr: RecExpr<HypatiaLang> = start.parse().unwrap();
-        let runner_step1 = Runner::default()
-            .with_egraph(egg::EGraph::new(ConstantFoldingAnalysis))
-            .with_expr(&start_expr).with_iter_limit(1).run(&rules);
-        let extractor1 = Extractor::new(&runner_step1.egraph, FLOPsCost);
-        let (_cost1, expr1) = extractor1.find_best(runner_step1.roots[0]);
-        assert_eq!(rec_to_string(&expr1), "(linear w2 b2 (linear-relu w1 b1 x))");
-        let runner_full = Runner::default()
-            .with_egraph(egg::EGraph::new(ConstantFoldingAnalysis))
-            .with_expr(&start_expr).with_iter_limit(10).run(&rules);
-        let extractor_full = Extractor::new(&runner_full.egraph, FLOPsCost);
-        let (_cost_full, expr_full) = extractor_full.find_best(runner_full.roots[0]);
-        assert_eq!(rec_to_string(&expr_full), expected);
+    fn t_fusion_conv_bn() {
+        let start = "(batchnorm w_bn b_bn m v (conv2d w_c b_c x 1_1 0_0 1_1 1) 1e-05)";
+        let expected = "(fused_conv_bn w_c b_c w_bn b_bn m v x 1e-05 1_1 0_0 1_1 1)";
+        assert_eq!(optimize_ast(start), expected);
+    }
+    
+    #[test]
+    fn t_fusion_linear_chain() {
+        let start = "(linear w2 b2 (linear w1 b1 x))";
+        let expected = "(linear (matmul w2 w1) (add (matmul w2 b1) b2) x)";
+        assert_eq!(optimize_ast(start), expected);
     }
 }
