@@ -135,6 +135,7 @@ name = "hypatia-core"
 version = "0.1.0"
 dependencies = [
  "egg",
+ "num-traits",
  "numpy",
  "ordered-float",
  "pyo3",

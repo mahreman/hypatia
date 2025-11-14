@@ -28,13 +28,9 @@ egg = "0.9.5"
 # FIX: f64 Eq/Ord/Hash için NotNan wrapper'ı
 ordered-float = "3.4.0"
 
-[dev-dependencies]
+# ✅ YENİ: Jenerik GA (FEZ 11.5) için eklendi
+num-traits = "0.2"
 
-[[example]]
-name = "rotation_demo"
-
-[[example]]
-name = "rotation3d_demo"
 
 [package.metadata.maturin]
 bindings = "pyo3"

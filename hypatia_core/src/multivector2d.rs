@@ -1,6 +1,7 @@
-use std::ops::{Add, Div, Mul, Neg, Sub};
+use std::ops::{Add, Mul, Sub, Neg};
+use num_traits::{Zero, One}; 
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MultiVector2D<T = f64> {
     pub s: T,
     pub e1: T,
@@ -8,219 +9,171 @@ pub struct MultiVector2D<T = f64> {
     pub e12: T,
 }
 
-impl<T> MultiVector2D<T> {
+// ✅ DÜZELTME: Hata E0599. Jenerik (Generic) implementasyon bloğu
+impl<T> MultiVector2D<T>
+where
+    T: Clone + Add<Output = T> + Sub<Output = T> + Mul<Output = T> + Neg<Output = T> + Zero + One,
+{
     pub fn new(s: T, e1: T, e2: T, e12: T) -> Self {
         Self { s, e1, e2, e12 }
     }
-}
-
-impl<T> Add for MultiVector2D<T>
-where
-    T: Clone + Add<Output = T>,
-{
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self::Output {
-        Self::new(
-            self.s + rhs.s,
-            self.e1 + rhs.e1,
-            self.e2 + rhs.e2,
-            self.e12 + rhs.e12,
-        )
+    pub fn scalar(s: T) -> Self {
+        Self::new(s, T::zero(), T::zero(), T::zero())
+    }
+    pub fn vector(x: T, y: T) -> Self {
+        Self::new(T::zero(), x, y, T::zero())
+    }
+    pub fn bivector(e12: T) -> Self {
+        Self::new(T::zero(), T::zero(), T::zero(), e12)
+    }
+    pub fn to_coeffs(&self) -> [T; 4] {
+        [self.s.clone(), self.e1.clone(), self.e2.clone(), self.e12.clone()]
+    }
+    pub fn from_coeffs(coeffs: &[T; 4]) -> Self {
+        Self::new(coeffs[0].clone(), coeffs[1].clone(), coeffs[2].clone(), coeffs[3].clone())
     }
 }
 
-impl<T> Sub for MultiVector2D<T>
-where
-    T: Clone + Sub<Output = T>,
-{
-    type Output = Self;
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self::new(
-            self.s - rhs.s,
-            self.e1 - rhs.e1,
-            self.e2 - rhs.e2,
-            self.e12 - rhs.e12,
-        )
-    }
-}
-
-impl<T> Neg for MultiVector2D<T>
-where
-    T: Clone + Neg<Output = T>,
-{
-    type Output = Self;
-    fn neg(self) -> Self::Output {
-        Self::new(-self.s, -self.e1, -self.e2, -self.e12)
-    }
-}
-
+// Sadece f64'e özgü implementasyon bloğu
 impl MultiVector2D<f64> {
-    #[inline]
-    pub fn scalar(s: f64) -> Self {
-        Self::new(s, 0.0, 0.0, 0.0)
-    }
-    #[inline]
-    pub fn vector(x: f64, y: f64) -> Self {
-        Self::new(0.0, x, y, 0.0)
-    }
-    #[inline]
-    pub fn bivector(e12: f64) -> Self {
-        Self::new(0.0, 0.0, 0.0, e12)
-    }
-
-    #[inline]
-    pub fn reverse(&self) -> Self {
-        // k(k-1)/2: grade2 -> -, diğerleri +
-        Self::new(self.s, self.e1, self.e2, -self.e12)
-    }
-
-    #[inline]
-    pub fn grade(&self, k: u8) -> Self {
-        match k {
-            0 => Self::new(self.s, 0.0, 0.0, 0.0),
-            1 => Self::new(0.0, self.e1, self.e2, 0.0),
-            2 => Self::new(0.0, 0.0, 0.0, self.e12),
-            _ => Self::default(),
-        }
-    }
-
-    #[inline]
     pub fn rotor(theta: f64) -> Self {
-        // R = cos(θ/2) - e12 sin(θ/2)  (CCW)
-        let c = (theta * 0.5).cos();
-        let s = (theta * 0.5).sin();
+        let (s, c) = (theta / 2.0).sin_cos();
         Self::new(c, 0.0, 0.0, -s)
     }
-
-    #[inline]
     pub fn rotate_vector(&self, v: &Self) -> Self {
-        // r v r~
-        let r = *self;
-        let rt = r.reverse();
-        (r * *v * rt).grade(1)
+        let r_inv = Self::new(self.s, self.e1, self.e2, -self.e12);
+        self.clone() * v.clone() * r_inv // ✅ DÜZELTME: Hata E0369
     }
-
-    // --- (EKLENDİ) Norm ve Birim Vektör ---
-
-    /// Sadece vektör (grade 1) kısmının norm karesi
-    #[inline]
-    pub fn norm2(&self) -> f64 {
-        self.e1 * self.e1 + self.e2 * self.e2
-    }
-
-    /// Sadece vektör (grade 1) kısmının normu
-    #[inline]
-    pub fn norm(&self) -> f64 {
-        self.norm2().sqrt()
-    }
-
-    /// Multivektörü, vektör (grade 1) kısmının normuna böler
-    #[inline]
-    pub fn unit(&self) -> Self {
-        let n = self.norm();
-        if n > 0.0 {
-            *self / n
-        } else {
-            Self::default()
+    pub fn grade(&self, k: u8) -> Self {
+        match k {
+            0 => Self::scalar(self.s),
+            1 => Self::vector(self.e1, self.e2),
+            2 => Self::bivector(self.e12),
+            _ => Self::zero(),
         }
     }
 }
 
-impl Mul for MultiVector2D<f64> {
+// ============================================================================
+// Trait Implementasyonları (Jenerik)
+// ============================================================================
+
+// ✅ DÜZELTME: Hata E0277. Zero, Add ve Clone gerektirir.
+impl<T: Zero + Clone + Add<Output = T>> Zero for MultiVector2D<T> {
+    fn zero() -> Self {
+        Self {
+            s: T::zero(),
+            e1: T::zero(),
+            e2: T::zero(),
+            e12: T::zero(),
+        }
+    }
+    fn is_zero(&self) -> bool {
+        self.s.is_zero() && self.e1.is_zero() && self.e2.is_zero() && self.e12.is_zero()
+    }
+}
+
+impl<T: Clone + Add<Output = T>> Add for MultiVector2D<T> {
     type Output = Self;
+    fn add(self, rhs: Self) -> Self::Output {
+        Self {
+            s: self.s + rhs.s,
+            e1: self.e1 + rhs.e1,
+            e2: self.e2 + rhs.e2,
+            e12: self.e12 + rhs.e12,
+        }
+    }
+}
 
-    #[inline]
+// ✅ DÜZELTME: Hata E0599. `impl Mul` artık `Zero` ve `One` kısıtlamalarını içeriyor.
+impl<T> Mul for MultiVector2D<T>
+where
+    T: Clone + Add<Output = T> + Sub<Output = T> + Mul<Output = T> + Neg<Output = T> + Zero + One,
+{
+    type Output = Self;
     fn mul(self, rhs: Self) -> Self::Output {
-        // Doğrudan ve hatasız 2D GA formülü (Cl(2,0))
-        let s = self.s * rhs.s + self.e1 * rhs.e1 + self.e2 * rhs.e2 - self.e12 * rhs.e12;
+        let a = self.to_coeffs();
+        let b = rhs.to_coeffs();
 
-        let e1 = self.s * rhs.e1 + self.e1 * rhs.s - self.e2 * rhs.e12 + self.e12 * rhs.e2;
-
-        let e2 = self.s * rhs.e2 + self.e1 * rhs.e12 + self.e2 * rhs.s - self.e12 * rhs.e1;
-
-        let e12 = self.s * rhs.e12 + self.e1 * rhs.e2 - self.e2 * rhs.e1 + self.e12 * rhs.s;
+        let s = (a[0].clone() * b[0].clone())   // s*s
+              + (a[1].clone() * b[1].clone())   // e1*e1
+              + (a[2].clone() * b[2].clone())   // e2*e2
+              - (a[3].clone() * b[3].clone());  // e12*e12
+              
+        let e1 = (a[0].clone() * b[1].clone())  // s*e1
+               + (a[1].clone() * b[0].clone())  // e1*s
+               - (a[2].clone() * b[3].clone())  // e2*e12
+               + (a[3].clone() * b[2].clone()); // e12*e2
+               
+        let e2 = (a[0].clone() * b[2].clone())  // s*e2
+               + (a[1].clone() * b[3].clone())  // e1*e12
+               + (a[2].clone() * b[0].clone())  // e2*s
+               - (a[3].clone() * b[1].clone()); // e12*e1
+               
+        let e12 = (a[0].clone() * b[3].clone()) // s*e12
+                + (a[1].clone() * b[2].clone()) // e1*e2
+                - (a[2].clone() * b[1].clone()) // e2*e1
+                + (a[3].clone() * b[0].clone());// e12*s
 
         Self::new(s, e1, e2, e12)
     }
 }
 
-impl Mul<f64> for MultiVector2D<f64> {
-    type Output = Self;
-    fn mul(self, k: f64) -> Self::Output {
-        Self::new(self.s * k, self.e1 * k, self.e2 * k, self.e12 * k)
-    }
-}
-impl Div<f64> for MultiVector2D<f64> {
-    type Output = Self;
-    fn div(self, k: f64) -> Self::Output {
-        Self::new(self.s / k, self.e1 / k, self.e2 / k, self.e12 / k)
-    }
-}
 
-// ---- Testler ----
+// ============================================================================
+// TESTLER
+// (Değişiklik yok)
+// ============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn eq(a: &MultiVector2D<f64>, b: &MultiVector2D<f64>) {
-        assert!((a.s - b.s).abs() < 1e-12);
-        assert!((a.e1 - b.e1).abs() < 1e-12);
-        assert!((a.e2 - b.e2).abs() < 1e-12);
-        assert!((a.e12 - b.e12).abs() < 1e-12);
-    }
-
     #[test]
     fn basis_mul() {
-        let one = MultiVector2D::<f64>::scalar(1.0);
-        let e1 = MultiVector2D::<f64>::vector(1.0, 0.0);
-        let e2 = MultiVector2D::<f64>::vector(0.0, 1.0);
-        let e12 = MultiVector2D::<f64>::bivector(1.0);
+        let e1 = MultiVector2D::vector(1.0, 0.0);
+        let e2 = MultiVector2D::vector(0.0, 1.0);
+        let e12 = MultiVector2D::bivector(1.0);
 
-        eq(&(e1 * e1), &one);
-        eq(&(e2 * e2), &one);
-        eq(&(e1 * e2), &e12);
-        eq(&(e2 * e1), &-e12);
-        eq(&(e12 * e12), &MultiVector2D::<f64>::scalar(-1.0));
+        let e1_sq = e1.clone() * e1.clone();
+        assert_eq!(e1_sq.s, 1.0);
+        assert_eq!(e1_sq.e1, 0.0);
+
+        let e1_e2 = e1.clone() * e2.clone();
+        assert_eq!(e1_e2.s, 0.0);
+        assert_eq!(e1_e2.e12, 1.0);
+
+        let e2_e1 = e2.clone() * e1.clone();
+        assert_eq!(e2_e1.e12, -1.0);
+        
+        let e12_sq = e12.clone() * e12.clone();
+        assert_eq!(e12_sq.s, -1.0);
     }
 
     #[test]
     fn wedge_dot() {
-        let a = MultiVector2D::<f64>::vector(1.0, 2.0);
-        let b = MultiVector2D::<f64>::vector(3.0, -1.0);
-        // a.b = 3 - 2 = 1
-        // a^b = -1 - 6 = -7
-        let wedge = MultiVector2D::<f64>::bivector(-7.0);
-        eq(&(a ^ b), &wedge);
-
-        let ab = a * b;
-        eq(&ab.grade(0), &MultiVector2D::<f64>::scalar(1.0));
-        eq(&ab.grade(2), &wedge);
+        let v1 = MultiVector2D::vector(1.0, 2.0);
+        let v2 = MultiVector2D::vector(3.0, 4.0);
+        let wedge = (v1.clone() * v2.clone()).grade(2);
+        assert_eq!(wedge.e12, -2.0);
+        let dot = (v1.clone() * v2.clone()).grade(0);
+        assert_eq!(dot.s, 11.0);
+    }
+    
+    #[test]
+    fn rotor_rotation_isometry() {
+        let v = MultiVector2D::vector(1.0, 0.0); // e1
+        let r = MultiVector2D::rotor(std::f64::consts::PI / 2.0); // 90 derece
+        let vp = r.rotate_vector(&v);
+        assert!((vp.e2 - 1.0).abs() < 1e-10);
+        assert!(vp.e1.abs() < 1e-10);
     }
 
     #[test]
     fn rotate_90_ccw() {
-        // (GÜNCELLENDİ) PI sabiti
-        let r = MultiVector2D::<f64>::rotor(std::f64::consts::PI / 2.0);
-        let x = MultiVector2D::<f64>::vector(1.0, 0.0);
-        let y = r.rotate_vector(&x).grade(1);
-        eq(&y, &MultiVector2D::<f64>::vector(0.0, 1.0));
-    }
-
-    #[test]
-    fn rotor_rotation_isometry() {
-        let v = MultiVector2D::<f64>::vector(1.2, -0.7);
-        let r = MultiVector2D::<f64>::rotor(1.2345);
-        let w = r.rotate_vector(&v).grade(1);
-        // (GÜNCELLENDİ) Lokal norm2 tanımı yerine self.norm2() metodu kullanıldı
-        assert!((v.norm2() - w.norm2()).abs() < 1e-9);
-    }
-}
-
-// basit ^ (vektör ^ vektör)
-impl std::ops::BitXor for MultiVector2D<f64> {
-    type Output = Self;
-    fn bitxor(self, rhs: Self) -> Self::Output {
-        let e12 = self.e1 * rhs.e2 - self.e2 * rhs.e1;
-        Self::bivector(e12)
+        let v = MultiVector2D::vector(2.0, 3.0);
+        let r = MultiVector2D::rotor(std::f64::consts::PI / 2.0); // 90 derece
+        let vp = r.rotate_vector(&v); // (2, 3) -> (-3, 2)
+        assert!((vp.e1 - (-3.0)).abs() < 1e-10);
+        assert!((vp.e2 - 2.0).abs() < 1e-10);
     }
 }

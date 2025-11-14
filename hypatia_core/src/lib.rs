@@ -14,13 +14,15 @@ mod numpy_integration;
 mod python_bindings;
 #[cfg(feature = "python")]
 mod egraph_optimizer;  // E-graph mod declare
+#[cfg(feature = "python")]
+mod fx_bridge;  // ✅ YENİ: FX Graph bridge module
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 #[cfg(feature = "python")]
 #[pymodule]
-fn hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // --- Sayısal sınıflar ---
     m.add_class::<python_bindings::PyMultiVector2D>()?;
     m.add_class::<python_bindings::PyMultiVector3D>()?;
@@ -31,7 +33,7 @@ fn hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type_bound::<python_bindings::HypatiaError>(),
     )?;
     
-    // --- NumPy entegrasyon fonksiyonları (FIX: Full crate:: path)
+    // --- NumPy entegrasyon fonksiyonları ---
     m.add_function(wrap_pyfunction!(crate::numpy_integration::mv2d_from_array, m)?)?;
     m.add_function(wrap_pyfunction!(crate::numpy_integration::mv2d_to_array, m)?)?;
     m.add_function(wrap_pyfunction!(crate::numpy_integration::batch_rotate_2d, m)?)?;
@@ -42,8 +44,17 @@ fn hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<python_bindings::PyMultiVector2dSymbolic>()?;
     m.add_class::<python_bindings::PyMultiVector3dSymbolic>()?;
     
-    // FIX: E-graph optimizasyon fonksiyonu (doğru path ile)
+    // --- Modül Fonksiyonları (Optimizasyon ve Ayrıştırma) ---
     m.add_function(wrap_pyfunction!(crate::python_bindings::optimize_ast, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::parse_expr, m)?)?;
+    
+    // ✅ FEZ 11: Sembolik denklik kontrolü
+    m.add_function(wrap_pyfunction!(crate::python_bindings::is_equivalent, m)?)?;
+    
+    // ✅ YENİ: FX GRAPH COMPILATION
+    // Phase 1: Identity pass-through (benchmark harness'i aktive et)
+    // Phase 2+: Gerçek FX → S-expr → optimize → FX pipeline
+    m.add_function(wrap_pyfunction!(crate::python_bindings::compile_fx_graph, m)?)?;
     
     Ok(())
 }

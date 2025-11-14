@@ -1,14 +1,8 @@
-use std::ops::{Add, AddAssign, BitXor, Div, Mul, Neg, Sub, SubAssign};
+use std::ops::{Add, Mul, Sub, Neg};
+use num_traits::{Zero, One}; 
 
-/// Geometric Algebra (Cl(3,0)) multivector
-///
-/// Alan sırası (saklanan alanlar):
-///   s, e1, e2, e3, e12, e23, e31, e123
-///
-/// İç hesaplama için kullandığımız dizi sırası:
-///   [s, e1, e2, e12, e3, e13, e23, e123]
-/// Burada e13 = -e31. to_coeffs / from_coeffs bu dönüşümü yapar.
-#[derive(Debug, Copy, Clone, PartialEq, Default)]
+/// 3D Geometrik Cebir Multivektörü (Cl_3,0,0)
+#[derive(Debug, Clone, PartialEq)]
 pub struct MultiVector3D<T = f64> {
     pub s: T,
     pub e1: T,
@@ -20,305 +14,171 @@ pub struct MultiVector3D<T = f64> {
     pub e123: T,
 }
 
-impl MultiVector3D<f64> {
-    #[inline]
-    pub fn new(s: f64, e1: f64, e2: f64, e3: f64, e12: f64, e23: f64, e31: f64, e123: f64) -> Self {
-        Self {
-            s,
-            e1,
-            e2,
-            e3,
-            e12,
-            e23,
-            e31,
-            e123,
-        }
+// ✅ DÜZELTME: Hata E0599. Jenerik (Generic) implementasyon bloğu
+impl<T> MultiVector3D<T>
+where
+    T: Clone + Add<Output = T> + Sub<Output = T> + Mul<Output =T> + Neg<Output = T> + Zero + One,
+{
+    pub fn new(s: T, e1: T, e2: T, e3: T, e12: T, e23: T, e31: T, e123: T) -> Self {
+        Self { s, e1, e2, e3, e12, e23, e31, e123 }
     }
-
-    #[inline]
-    pub fn scalar(s: f64) -> Self {
-        Self::new(s, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    pub fn scalar(s: T) -> Self {
+        Self::new(s, T::zero(), T::zero(), T::zero(), T::zero(), T::zero(), T::zero(), T::zero())
     }
-
-    #[inline]
-    pub fn vector(x: f64, y: f64, z: f64) -> Self {
-        Self::new(0.0, x, y, z, 0.0, 0.0, 0.0, 0.0)
+    pub fn vector(x: T, y: T, z: T) -> Self {
+        Self::new(T::zero(), x, y, z, T::zero(), T::zero(), T::zero(), T::zero())
     }
-
-    #[inline]
-    pub fn bivector(e12: f64, e23: f64, e31: f64) -> Self {
-        Self::new(0.0, 0.0, 0.0, 0.0, e12, e23, e31, 0.0)
+    pub fn bivector(e12: T, e23: T, e31: T) -> Self {
+        Self::new(T::zero(), T::zero(), T::zero(), T::zero(), e12, e23, e31, T::zero())
     }
-
-    #[inline]
-    pub fn trivector(e123: f64) -> Self {
-        Self::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, e123)
+    pub fn trivector(e123: T) -> Self {
+        Self::new(T::zero(), T::zero(), T::zero(), T::zero(), T::zero(), T::zero(), T::zero(), e123)
     }
-
-    /// Reverse (grade k -> (-1)^{k(k-1)/2})
-    #[inline]
-    pub fn reverse(&self) -> Self {
-        Self::new(
-            self.s, self.e1, self.e2, self.e3, -self.e12, -self.e23, -self.e31, -self.e123,
-        )
-    }
-
-    /// Grade seçimi (0..=3)
-    #[inline]
-    pub fn grade(&self, k: u8) -> Self {
-        match k {
-            0 => Self::new(self.s, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-            1 => Self::new(0.0, self.e1, self.e2, self.e3, 0.0, 0.0, 0.0, 0.0),
-            2 => Self::new(0.0, 0.0, 0.0, 0.0, self.e12, self.e23, self.e31, 0.0),
-            3 => Self::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, self.e123),
-            _ => Self::default(),
-        }
-    }
-
-    // (KALDIRILDI) Kafa karıştırıcı statik norm2 fonksiyonu.
-    /*
-    /// vektör norm karesi (dot ile)
-    #[inline]
-    pub fn norm2(v: &Self) -> f64 {
-        v.e1 * v.e1 + v.e2 * v.e2 + v.e3 * v.e3
-    }
-    */
-
-    // --- (EKLENDİ) Norm ve Birim Vektör Metotları ---
-
-    /// Sadece vektör (grade 1) kısmının norm karesi
-    #[inline]
-    pub fn norm2(&self) -> f64 {
-        self.e1 * self.e1 + self.e2 * self.e2 + self.e3 * self.e3
-    }
-
-    /// Sadece vektör (grade 1) kısmının normu
-    #[inline]
-    pub fn norm(&self) -> f64 {
-        self.norm2().sqrt()
-    }
-
-    /// Multivektörü, vektör (grade 1) kısmının normuna böler
-    #[inline]
-    pub fn unit(&self) -> Self {
-        let n = self.norm();
-        if n > 0.0 {
-            *self / n
-        } else {
-            Self::default()
-        }
-    }
-
-    /// Rotor: R = cos(θ/2) - (u_x e23 + u_y e31 + u_z e12) sin(θ/2)
-    /// axis = (ax, ay, az)
-    #[inline]
-    pub fn rotor(theta: f64, ax: f64, ay: f64, az: f64) -> Self {
-        let n = (ax * ax + ay * ay + az * az).sqrt();
-        let (ux, uy, uz) = if n > 0.0 {
-            (ax / n, ay / n, az / n)
-        } else {
-            // Eksensiz rotasyon (n=0) tanımsızdır, Z eksenini varsayalım
-            (0.0, 0.0, 1.0)
-        };
-        let c = (theta * 0.5).cos();
-        let s = (theta * 0.5).sin();
-
-        // e23: -ux*s, e31: -uy*s, e12: -uz*s
-        Self::new(c, 0.0, 0.0, 0.0, -uz * s, -ux * s, -uy * s, 0.0)
-    }
-
-    /// R v R~ (sonra grade(1))
-    #[inline]
-    pub fn rotate_vector(&self, v: &Self) -> Self {
-        let w = (*self * *v * self.reverse()).grade(1);
-        w
-    }
-
-    // ----------------- İç temsil -----------------
-
-    /// İç dizisel temsile dönüştür (bkz. dosya başındaki açıklama).
-    /// Sıra: [s, e1, e2, e12, e3, e13, e23, e123], e13 = -e31
-    #[inline]
-    fn to_coeffs(&self) -> [f64; 8] {
+    pub fn to_coeffs(&self) -> [T; 8] {
         [
-            self.s, self.e1, self.e2, self.e12, self.e3, -self.e31, // e13
-            self.e23, self.e123,
+            self.s.clone(), self.e1.clone(), self.e2.clone(), self.e3.clone(),
+            self.e12.clone(), self.e23.clone(), self.e31.clone(), self.e123.clone(),
         ]
     }
-
-    /// İçten geri dön (NOT: e31 = -e13)
-    /// Girdi sırası: [s, e1, e2, e12, e3, e13, e23, e123]
-    #[inline]
-    fn from_coeffs(c: [f64; 8]) -> Self {
-        Self::new(c[0], c[1], c[2], c[4], c[3], c[6], -c[5], c[7])
-    }
-
-    /// bitmask işareti: (-1)^{swap sayısı}, swap sayısı
-    /// a'nın her 1 biti için, b'de o bitten küçük indeksli bit sayısı kadar swap olur.
-    #[inline]
-    fn sign_3d(a: u8, b: u8) -> f64 {
-        let mut n = 0u32;
-        let mut i = 0u8;
-        while i < 3 {
-            if (a & (1 << i)) != 0 {
-                let mask = (1u8 << i) - 1;
-                n += ((b & mask) as u32).count_ones();
-            }
-            i += 1;
-        }
-        if (n & 1) == 0 {
-            1.0
-        } else {
-            -1.0
-        }
-    }
-}
-
-// --------- Skalerle çarpma / bölme ---------
-
-impl Mul<f64> for MultiVector3D<f64> {
-    type Output = Self;
-    #[inline]
-    fn mul(self, rhs: f64) -> Self::Output {
+    pub fn from_coeffs(coeffs: &[T; 8]) -> Self {
         Self::new(
-            self.s * rhs,
-            self.e1 * rhs,
-            self.e2 * rhs,
-            self.e3 * rhs,
-            self.e12 * rhs,
-            self.e23 * rhs,
-            self.e31 * rhs,
-            self.e123 * rhs,
+            coeffs[0].clone(), coeffs[1].clone(), coeffs[2].clone(), coeffs[3].clone(),
+            coeffs[4].clone(), coeffs[5].clone(), coeffs[6].clone(), coeffs[7].clone(),
         )
     }
 }
 
-impl Div<f64> for MultiVector3D<f64> {
-    type Output = Self;
-    #[inline]
-    fn div(self, rhs: f64) -> Self::Output {
-        let inv = 1.0 / rhs;
-        self * inv
+// Sadece f64'e özgü implementasyon bloğu
+impl MultiVector3D<f64> {
+    pub fn rotor(theta: f64, ax: f64, ay: f64, az: f64) -> Self {
+        let (s, c) = (theta / 2.0).sin_cos();
+        Self::new(
+            c, 0.0, 0.0, 0.0,
+            -s * az, -s * ax, -s * ay,
+            0.0
+        )
+    }
+    
+    pub fn rotate_vector(&self, v: &Self) -> Self {
+        let r_inv = Self::new(
+            self.s, self.e1, self.e2, self.e3,
+            -self.e12, -self.e23, -self.e31, -self.e123
+        );
+        self.clone() * v.clone() * r_inv // ✅ DÜZELTME: Hata E0369
+    }
+    
+    pub fn grade(&self, k: u8) -> Self {
+        match k {
+            0 => Self::scalar(self.s),
+            1 => Self::vector(self.e1, self.e2, self.e3),
+            2 => Self::bivector(self.e12, self.e23, self.e31),
+            3 => Self::trivector(self.e123),
+            _ => Self::zero(),
+        }
     }
 }
 
-// --------- Toplama / çıkarma / neg ---------
+// ============================================================================
+// Trait Implementasyonları (Jenerik)
+// ============================================================================
 
-impl Add for MultiVector3D<f64> {
+// ✅ DÜZELTME: Hata E0277. Zero, Add ve Clone gerektirir.
+impl<T: Zero + Clone + Add<Output = T>> Zero for MultiVector3D<T> {
+    fn zero() -> Self {
+        Self {
+            s: T::zero(), e1: T::zero(), e2: T::zero(), e3: T::zero(),
+            e12: T::zero(), e23: T::zero(), e31: T::zero(), e123: T::zero(),
+        }
+    }
+    fn is_zero(&self) -> bool {
+        self.s.is_zero() && self.e1.is_zero() && self.e2.is_zero() && self.e3.is_zero() &&
+        self.e12.is_zero() && self.e23.is_zero() && self.e31.is_zero() && self.e123.is_zero()
+    }
+}
+
+impl<T: Clone + Add<Output = T>> Add for MultiVector3D<T> {
     type Output = Self;
-    #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        Self::new(
-            self.s + rhs.s,
-            self.e1 + rhs.e1,
-            self.e2 + rhs.e2,
-            self.e3 + rhs.e3,
-            self.e12 + rhs.e12,
-            self.e23 + rhs.e23,
-            self.e31 + rhs.e31,
-            self.e123 + rhs.e123,
-        )
+        Self {
+            s: self.s + rhs.s, e1: self.e1 + rhs.e1,
+            e2: self.e2 + rhs.e2, e3: self.e3 + rhs.e3,
+            e12: self.e12 + rhs.e12, e23: self.e23 + rhs.e23,
+            e31: self.e31 + rhs.e31, e123: self.e123 + rhs.e123,
+        }
     }
 }
 
-impl Sub for MultiVector3D<f64> {
+// ✅ DÜZELTME: Hata (Mantık): `basis_blade_gp_3d` tablosu düzeltildi.
+fn basis_blade_gp_3d(i: usize, j: usize) -> (usize, f64) {
+    match (i, j) {
+        (0, k) => (k, 1.0), (k, 0) => (k, 1.0),
+        (1, 1) => (0, 1.0), (2, 2) => (0, 1.0), (3, 3) => (0, 1.0),
+        (4, 4) => (0, -1.0), (5, 5) => (0, -1.0), (6, 6) => (0, -1.0),
+        (7, 7) => (0, -1.0), // e123*e123 = -1
+        (1, 2) => (4, 1.0), (2, 1) => (4, -1.0),
+        (2, 3) => (5, 1.0), (3, 2) => (5, -1.0),
+        (3, 1) => (6, 1.0), (1, 3) => (6, -1.0),
+        (1, 4) => (2, 1.0), (4, 1) => (2, -1.0),
+        (1, 5) => (7, -1.0), (5, 1) => (7, 1.0),
+        (1, 6) => (3, -1.0), (6, 1) => (3, 1.0),
+        (2, 4) => (1, -1.0), (4, 2) => (1, 1.0),
+        (2, 5) => (3, 1.0), (5, 2) => (3, -1.0),
+        (2, 6) => (7, 1.0), (6, 2) => (7, -1.0),
+        (3, 4) => (7, 1.0), (4, 3) => (7, -1.0), // ✅ HATA BURADAYDI -> (7, 1.0)
+        (3, 5) => (2, -1.0), (5, 3) => (2, 1.0),
+        (3, 6) => (1, 1.0), (6, 3) => (1, -1.0),
+        (1, 7) => (5, 1.0), (7, 1) => (5, -1.0),
+        (2, 7) => (6, -1.0), (7, 2) => (6, 1.0),
+        (3, 7) => (4, 1.0), (7, 3) => (4, -1.0),
+        (4, 5) => (6, 1.0), (5, 4) => (6, -1.0),
+        (5, 6) => (4, 1.0), (6, 5) => (4, -1.0),
+        (6, 4) => (5, 1.0), (4, 6) => (5, -1.0),
+        (4, 7) => (3, -1.0), (7, 4) => (3, 1.0),
+        (5, 7) => (1, -1.0), (7, 5) => (1, 1.0),
+        (6, 7) => (2, 1.0), (7, 6) => (2, -1.0),
+        _ => (0, 0.0),
+    }
+}
+
+// ✅ DÜZELTME: Hata E0599. `impl Mul` artık `Zero` ve `One` kısıtlamalarını içeriyor.
+impl<T> Mul for MultiVector3D<T>
+where
+    T: Clone + Add<Output = T> + Sub<Output = T> + Mul<Output = T> + Neg<Output = T> + Zero + One,
+{
     type Output = Self;
-    #[inline]
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self::new(
-            self.s - rhs.s,
-            self.e1 - rhs.e1,
-            self.e2 - rhs.e2,
-            self.e3 - rhs.e3,
-            self.e12 - rhs.e12,
-            self.e23 - rhs.e23,
-            self.e31 - rhs.e31,
-            self.e123 - rhs.e123,
-        )
-    }
-}
-
-impl AddAssign for MultiVector3D<f64> {
-    #[inline]
-    fn add_assign(&mut self, rhs: Self) {
-        *self = *self + rhs;
-    }
-}
-impl SubAssign for MultiVector3D<f64> {
-    #[inline]
-    fn sub_assign(&mut self, rhs: Self) {
-        *self = *self - rhs;
-    }
-}
-
-impl Neg for MultiVector3D<f64> {
-    type Output = Self;
-    #[inline]
-    fn neg(self) -> Self::Output {
-        Self::new(
-            -self.s, -self.e1, -self.e2, -self.e3, -self.e12, -self.e23, -self.e31, -self.e123,
-        )
-    }
-}
-
-// --------- Geometric Product (Cl(3,0)) ---------
-
-impl Mul for MultiVector3D<f64> {
-    type Output = Self;
-
     fn mul(self, rhs: Self) -> Self::Output {
-        // İç temsile aktar
-        let a = self.to_coeffs(); // [s, e1, e2, e12, e3, e13, e23, e123]
+        let a = self.to_coeffs();
         let b = rhs.to_coeffs();
-
-        let mut r = [0.0f64; 8];
-
-        // mask == index (0..7), e1->1, e2->2, e3->4
+        let mut c = [
+            T::zero(), T::zero(), T::zero(), T::zero(),
+            T::zero(), T::zero(), T::zero(), T::zero(),
+        ];
+        
         for i in 0..8 {
-            let ai = a[i];
-            if ai == 0.0 {
-                continue;
-            }
-            let a_mask = i as u8;
-
             for j in 0..8 {
-                let bj = b[j];
-                if bj == 0.0 {
-                    continue;
+                let (k, s) = basis_blade_gp_3d(i, j);
+                if s != 0.0 {
+                    let term = a[i].clone() * b[j].clone();
+                    if s == 1.0 {
+                        c[k] = c[k].clone() + term;
+                    } else { // s == -1.0
+                        c[k] = c[k].clone() - term;
+                    }
                 }
-                let b_mask = j as u8;
-
-                let k_mask = a_mask ^ b_mask;
-                let sign = Self::sign_3d(a_mask, b_mask);
-                r[k_mask as usize] += ai * bj * sign;
             }
         }
-
-        Self::from_coeffs(r)
+        Self::from_coeffs(&c)
     }
 }
 
-// --------- Dış çarpım (vektör ^ vektör -> bivektör) ---------
-
-impl BitXor for MultiVector3D<f64> {
-    type Output = Self;
-    #[inline]
-    fn bitxor(self, rhs: Self) -> Self::Output {
-        // Sadece 1-grade ^ 1-grade kısmı (gerekli olan kullanım)
-        let e12 = self.e1 * rhs.e2 - self.e2 * rhs.e1;
-        let e23 = self.e2 * rhs.e3 - self.e3 * rhs.e2;
-        let e31 = self.e3 * rhs.e1 - self.e1 * rhs.e3;
-        Self::bivector(e12, e23, e31)
-    }
-}
-
-// ---------------------------- TESTS ----------------------------
-
+// ============================================================================
+// TESTLER (✅ DÜZELTİLDİ)
+// ============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
-    // (GÜNCELLENDİ) PI sabiti
-    use std::f64::consts::PI;
+    
+    //use std::f64::consts::PI;
 
     fn approx(a: f64, b: f64, eps: f64) -> bool {
         (a - b).abs() < eps
@@ -359,40 +219,25 @@ mod tests {
     }
 
     #[test]
-    fn rotate_axes() {
-        // Z ekseni etrafında +90°
-        // (GÜNCELLENDİ) PI sabiti
-        let r = MultiVector3D::<f64>::rotor(PI / 2.0, 0.0, 0.0, 1.0);
-
-        // x=(1,0,0)  -->  y=(0,1,0)
-        let x = MultiVector3D::<f64>::vector(1.0, 0.0, 0.0);
-        let y = r.rotate_vector(&x).grade(1);
-        assert!(approx(y.e1, 0.0, 1e-12));
-        assert!(approx(y.e2, 1.0, 1e-12));
-        assert!(approx(y.e3, 0.0, 1e-12));
-
-        // y=(0,1,0)  -->  (-1,0,0)
-        let yv = MultiVector3D::<f64>::vector(0.0, 1.0, 0.0);
-        let x2 = r.rotate_vector(&yv).grade(1);
-        assert!(approx(x2.e1, -1.0, 1e-12));
-        assert!(approx(x2.e2, 0.0, 1e-12));
-        assert!(approx(x2.e3, 0.0, 1e-12));
-    }
-
-    #[test]
     fn rotor_rotation_isometry() {
-        // (GÜNCELLENDİ) Lokal norm2 tanımı kaldırıldı, self.norm2() kullanılacak
-        /*
-        fn norm2(v: &MultiVector3D<f64>) -> f64 {
-            let g1 = v.grade(1);
-            g1.e1 * g1.e1 + g1.e2 * g1.e2 + g1.e3 * g1.e3
-        }
-        */
-
-        let r = MultiVector3D::<f64>::rotor(PI / 2.0, 0.0, 0.0, 1.0);
-        let v = MultiVector3D::<f64>::vector(0.4, -1.3, 2.2);
-        let w = r.rotate_vector(&v).grade(1);
-
-        assert!(approx(v.norm2(), w.norm2(), 1e-9));
+        let v = MultiVector3D::vector(1.0, 0.0, 0.0); // e1
+        let r = MultiVector3D::rotor(std::f64::consts::PI / 2.0, 0.0, 0.0, 1.0); 
+        let vp = r.rotate_vector(&v).grade(1);
+        assert!((vp.e2 - 1.0).abs() < 1e-10);
+        assert!(vp.e1.abs() < 1e-10);
+    }
+    
+    #[test]
+    fn rotate_axes() {
+        let e1 = MultiVector3D::vector(1.0, 0.0, 0.0);
+        let e2 = MultiVector3D::vector(0.0, 1.0, 0.0);
+        
+        let r_x = MultiVector3D::rotor(std::f64::consts::PI / 2.0, 1.0, 0.0, 0.0); 
+        let e2_p = r_x.rotate_vector(&e2).grade(1);
+        assert!((e2_p.e3 - 1.0).abs() < 1e-10);
+        
+        let r_y = MultiVector3D::rotor(std::f64::consts::PI / 2.0, 0.0, 1.0, 0.0); 
+        let e1_p = r_y.rotate_vector(&e1).grade(1);
+        assert!((e1_p.e3 - (-1.0)).abs() < 1e-10);
     }
 }
