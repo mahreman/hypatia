@@ -446,3 +446,36 @@ pub fn compile_fx_graph(
         }
     })
 }
+
+// ============================================================================
+// ✅ Task 2.5: Python Logging Control
+// ============================================================================
+
+/// Set the Rust logging level from Python
+///
+/// # Arguments
+/// * `level` - Log level: "debug", "info", "warn", or "error"
+///
+/// # Example
+/// ```python
+/// import hypatia_core
+/// hypatia_core.set_log_level("debug")  # Enable debug logging
+/// ```
+#[pyfunction]
+pub fn set_log_level(level: &str) -> PyResult<()> {
+    use log::LevelFilter;
+    let filter = match level.to_lowercase().as_str() {
+        "debug" => LevelFilter::Debug,
+        "info" => LevelFilter::Info,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        _ => return Err(HypatiaError::new_err(format!("Invalid log level: {}", level))),
+    };
+
+    env_logger::Builder::new()
+        .filter_level(filter)
+        .try_init()
+        .ok();
+
+    Ok(())
+}

@@ -62,6 +62,9 @@ pub fn hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Phase 1: Identity pass-through (benchmark harness'i aktive et)
     // Phase 2+: Gerçek FX → S-expr → optimize → FX pipeline
     m.add_function(wrap_pyfunction!(crate::python_bindings::compile_fx_graph, m)?)?;
-    
+
+    // ✅ Task 2.5: Python Logging Control
+    m.add_function(wrap_pyfunction!(crate::python_bindings::set_log_level, m)?)?;
+
     Ok(())
 }
