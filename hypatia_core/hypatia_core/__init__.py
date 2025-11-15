@@ -75,14 +75,17 @@ def hypatia_backend(gm, example_inputs):
 def register_backend():
     """Register Hypatia backend with PyTorch"""
     try:
+        # Check if already registered to avoid duplicate warnings
+        backends = torch._dynamo.list_backends()
+        if "hypatia" in backends:
+            # Already registered, skip
+            return
+
         torch._dynamo.register_backend(name="hypatia", compiler_fn=hypatia_backend)
         print("✅ Hypatia backend registered successfully")
         print("   Usage: torch.compile(model, backend='hypatia')")
-        
-        backends = torch._dynamo.list_backends()
-        if "hypatia" in backends:
-            print(f"   ✓ Backend confirmed in: {backends}")
-            
+        print(f"   ✓ Backend confirmed in: {backends}")
+
     except Exception as e:
         warnings.warn(f"Failed to register Hypatia backend: {e}")
 
