@@ -905,53 +905,67 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         }
     }
 
-    /// ✅ YENİ: Parameter tensor'unu al (model.get_submodule + getattr kullanarak)
-    /// canonical_name: "fc1.weight" veya "l_x_" (placeholder)
-    fn get_param_tensor(&self, canonical_name: &str) -> PyResult<Bound<'py, PyAny>> {
-        // Eğer '.' yoksa, bu büyük ihtimalle girdi/placeholder'dır
-        if !canonical_name.contains('.') {
-            if let Some(t) = self.placeholder_map.get(canonical_name) {
-                return Ok(t.bind(self.py).clone());
-            } else {
-                // Hata: ne param ne placeholder
-                log::error!("Unknown tensor name '{}': not found in placeholder_map", canonical_name);
-                return Err(pyo3::exceptions::PyKeyError::new_err(
-                    format!("Unknown tensor name: {}", canonical_name)
-                ));
+    /// ✅ Get parameter/buffer tensor from GraphModule
+    /// Handles both sanitized names ("l_self_modules_conv_parameters_weight_")
+    /// and canonical names ("conv.weight")
+    fn get_param_tensor(&self, name: &str) -> PyResult<Bound<'py, PyAny>> {
+        let state_dict = self.model.call_method0("state_dict")?;
+
+        // If name doesn't contain '.', it's sanitized (from AST)
+        if !name.contains('.') {
+            // Try to get canonical name from param_var_map (for parameters)
+            if let Some(canonical) = self.param_var_map.get(name) {
+                return state_dict.get_item(canonical)
+                    .map_err(|e| {
+                        log::error!("Parameter '{}' (canonical: '{}') not found in state_dict", name, canonical);
+                        e
+                    });
             }
+
+            // Try to desanitize buffers: "l_self_modules_bn_buffers_running_mean_" → "bn.running_mean"
+            if name.starts_with("l_self_modules_") && name.contains("_buffers_") {
+                let after_prefix = name.strip_prefix("l_self_modules_").unwrap();
+
+                if let Some(buffers_idx) = after_prefix.find("_buffers_") {
+                    // Split at "_buffers_": "bn_buffers_running_mean_" → ["bn", "running_mean_"]
+                    let module_part = &after_prefix[..buffers_idx];
+                    let buffer_part = &after_prefix[buffers_idx + 9..]; // Skip "_buffers_"
+
+                    // Convert module path: "bn" or "layer1_0" → "bn" or "layer1.0"
+                    let module_canonical = module_part.replace("_", ".");
+
+                    // Convert buffer name: "running_mean_" → "running_mean"
+                    let buffer_canonical = buffer_part.strip_suffix("_").unwrap_or(buffer_part);
+
+                    let desanitized = format!("{}.{}", module_canonical, buffer_canonical);
+
+                    if let Ok(tensor) = state_dict.get_item(&desanitized) {
+                        return Ok(tensor);
+                    }
+
+                    log::warn!("Buffer '{}' desanitized to '{}' but not found in state_dict", name, desanitized);
+                }
+            }
+
+            // Fallback: check placeholder_map (for input tensors like "l_x_")
+            if let Some(placeholder_node) = self.placeholder_map.get(name) {
+                // This is an input placeholder (FX Node)
+                return Ok(placeholder_node.bind(self.py).clone());
+            }
+
+            // Not found
+            log::error!("Unknown tensor name '{}': not in param_var_map, buffers, or placeholder_map", name);
+            return Err(pyo3::exceptions::PyKeyError::new_err(
+                format!("Unknown tensor name: {}", name)
+            ));
         }
 
-        // Parametre ismi: "fc1.weight" veya "layer1.0.conv1.weight"
-        let mut parts: Vec<&str> = canonical_name.split('.').collect();
-        let field = parts.pop().unwrap(); // "weight" veya "bias"
-
-        let module_path = parts.join("."); // "fc1" veya "layer1.0.conv1"
-
-        // model: Orijinal model (pre-compile)
-        let submodule = self
-            .model
-            .call_method1("get_submodule", (module_path.clone(),))
+        // Name contains '.': it's already canonical, get directly from state_dict
+        state_dict.get_item(name)
             .map_err(|e| {
-                e.print(self.py);
-                log::error!("Failed to get_submodule('{}') for parameter '{}': {}",
-                            module_path, canonical_name, e);
-                pyo3::exceptions::PyAttributeError::new_err(format!(
-                    "get_submodule('{}') failed", module_path
-                ))
-            })?;
-
-        let tensor = submodule
-            .getattr(field)
-            .map_err(|e| {
-                e.print(self.py);
-                log::error!("Submodule '{}' has no attribute '{}' for parameter '{}'",
-                            module_path, field, canonical_name);
-                pyo3::exceptions::PyAttributeError::new_err(format!(
-                    "submodule '{}' has no attr '{}'", module_path, field
-                ))
-            })?;
-
-        Ok(tensor)
+                log::error!("Parameter '{}' not found in state_dict", name);
+                e
+            })
     }
 
     fn reconstruct_node(
@@ -1597,27 +1611,28 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
 
         eprintln!("[DEBUG] Building Fused Conv-BN module...");
 
-        // Get canonical param names
-        let b_c_name = self.get_var_name(b_c_id, expr)?;
-        let b_c_exists = b_c_name != "none";
+        // ✅ Use var_name (sanitized) instead of canonical_param_name
+        // because GraphModule doesn't have submodules, only parameters/buffers in placeholder_map
+        let w_c_var = self.get_var_name(w_c_id, expr)?;
+        let b_c_var = self.get_var_name(b_c_id, expr)?;
+        let w_bn_var = self.get_var_name(w_bn_id, expr)?;
+        let b_bn_var = self.get_var_name(b_bn_id, expr)?;
+        let m_var = self.get_var_name(m_id, expr)?;
+        let v_var = self.get_var_name(v_id, expr)?;
 
-        let w_c_real_name = self.get_canonical_param_name(w_c_id, expr)?;
-        let w_bn_real_name = self.get_canonical_param_name(w_bn_id, expr)?;
-        let b_bn_real_name = self.get_canonical_param_name(b_bn_id, expr)?;
-        let m_real_name = self.get_canonical_param_name(m_id, expr)?;
-        let v_real_name = self.get_canonical_param_name(v_id, expr)?;
+        let b_c_exists = b_c_var != "none";
 
-        eprintln!("[DEBUG] FusedConvBN resolved keys: conv_w={}, bn_w={}, bn_m={}, bn_v={}",
-            w_c_real_name, w_bn_real_name, m_real_name, v_real_name);
+        eprintln!("[DEBUG] FusedConvBN var names: conv_w={}, bn_w={}, bn_m={}, bn_v={}",
+            w_c_var, w_bn_var, m_var, v_var);
 
-        // Get tensors
+        // Get tensors from placeholder_map (all are placeholders in GraphModule)
         let torch = PyModule::import_bound(self.py, "torch")?;
 
-        let w_c = self.get_param_tensor(&w_c_real_name)?;
-        let w_bn = self.get_param_tensor(&w_bn_real_name)?;
-        let b_bn = self.get_param_tensor(&b_bn_real_name)?;
-        let m = self.get_param_tensor(&m_real_name)?;
-        let v = self.get_param_tensor(&v_real_name)?;
+        let w_c = self.get_param_tensor(&w_c_var)?;
+        let w_bn = self.get_param_tensor(&w_bn_var)?;
+        let b_bn = self.get_param_tensor(&b_bn_var)?;
+        let m = self.get_param_tensor(&m_var)?;
+        let v = self.get_param_tensor(&v_var)?;
 
         let eps_str = self.get_var_name(eps_id, expr)?;
         let eps = self.unsanitize_value(&eps_str)?.extract::<f64>(self.py)?;
@@ -1632,8 +1647,8 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let w_fused = w_c.call_method1("mul", (scale_broadcast,))?;
 
         let b_c_val = if b_c_exists {
-            let b_c_real_name = self.get_canonical_param_name(b_c_id, expr)?;
-            self.get_param_tensor(&b_c_real_name)?
+            // ✅ Use var_name (already extracted above as b_c_var)
+            self.get_param_tensor(&b_c_var)?
         } else {
             torch.call_method1("zeros_like", (m.clone(),))?
         };
