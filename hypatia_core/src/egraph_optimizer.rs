@@ -255,37 +255,9 @@ fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantF
     ];
     
     // ✅ DÜZELTME: Tehlikeli optimizasyonlar (fusion)
-    // sadece inference (çıkarım) modunda çalışır.
-    if is_inference_mode_flag {
-        rules.extend(vec![
-            // 🟢 KURAL 1 (Zaten mevcuttu)
-            rewrite!("linear-relu-fusion";
-                "(relu (linear ?w ?b ?x))"
-                => 
-                "(linear-relu ?w ?b ?x)"),
-            
-            rewrite!("mlp-fusion-from-fused";
-                "(linear ?w2 ?b2 (linear-relu ?w1 ?b1 ?x))"
-                =>
-                "(fused-mlp ?w1 ?b1 ?w2 ?b2 ?x)"),
-            
-            // BU KURAL ZATEN BN FOLDING YAPIYOR (CONV İÇİN)
-            rewrite!("conv-bn-fusion";
-                "(batchnorm ?w_bn ?b_bn ?m ?v (conv2d ?w_c ?b_c ?x ?s ?p ?d ?g) ?eps)"
-                =>
-                "(fused_conv_bn ?w_c ?b_c ?w_bn ?b_bn ?m ?v ?x ?eps ?s ?p ?d ?g)"),
-            
-            // 🟢 KURAL 2 (Güncellendi: 'x' -> '?x')
-            rewrite!("linear-chain";
-                "(linear ?w2 ?b2 (linear ?w1 ?b1 ?x))"
-                =>
-                "(linear (matmul ?w2 ?w1) (add (matmul ?w2 ?b1) ?b2) ?x)"),
-            
-            // ✅ DÜZELTME: PANIC ATAN 'batchnorm-fold' KURALI SİLİNDİ.
-            // Bu kural, `?w_fold` ve `?b_fold` değişkenlerini tanımlamadığı için
-            // geçersizdi ve paniğe neden oluyordu.
-        ]);
-    }
+    // ✅ REMOVED: Duplicate fusion rules (moved to always-active section below)
+    // These 4 rules (linear-relu-fusion, mlp-fusion-from-fused, conv-bn-fusion, linear-chain)
+    // are now defined in the "always active" section at line 293+ to avoid duplicates
 
     // ✅ DÜZELTME: Fusion kuralları artık her zaman aktif (training ve inference modda)
     // Bu kurallar güvenlidir çünkü sadece hesaplama grafiğini optimize eder,
