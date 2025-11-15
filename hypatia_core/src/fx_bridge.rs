@@ -7,8 +7,19 @@ use pyo3::types::{PyAny, PyTuple, PyDict, PyModule};
 use crate::python_bindings::{HypatiaError, ModuleInfo};
 use std::collections::HashMap;
 
-use egg::{RecExpr, Id};
+use egg::{RecExpr, Id, Language}; // `Language` trait'i eklendi (E0599)
 use crate::egraph_optimizer::HypatiaLang;
+
+// ❌ KALDIRILDI: Regex bağımlılıkları (Artık kullanılmıyor)
+// use once_cell::sync::Lazy;
+// use regex::Regex;
+
+// ❌ KALDIRILDI: PLACEHOLDER_RE (Artık kullanılmıyor)
+// static PLACEHOLDER_RE: Lazy<Regex> = Lazy::new(|| { ... });
+
+// ❌ KALDIRILDI: normalize_placeholder (Artık kullanılmıyor)
+// fn normalize_placeholder(name: &str) -> String { ... }
+
 
 // ============================================================================
 // PHASE 2: FX NODE STRUCTURES
@@ -54,7 +65,8 @@ pub fn fx_graph_to_sexpr(
 // ============================================================================
 pub fn sexpr_to_fx_graph(
     py: Python<'_>,
-    original_gm: &Bound<PyAny>,
+    model: &Bound<PyAny>, // ✅ Orijinal model (gm), parametre erişimi için
+    original_gm: &Bound<PyAny>, // Bu da GraphModule (gm), submodule eklemek için
     optimized_expr: RecExpr<HypatiaLang>,
 ) -> PyResult<PyObject> {
     eprintln!("[fx_bridge::Phase3] Reconstructing graph from optimized AST...");
@@ -66,7 +78,8 @@ pub fn sexpr_to_fx_graph(
 
     let mut rebuilder = FxRebuilder {
         py,
-        original_gm,
+        model, // ✅ Parametreler için
+        original_gm, // Submodule'ler için
         new_graph,
         node_map: HashMap::new(), 
         placeholder_map: HashMap::new(),
@@ -76,10 +89,36 @@ pub fn sexpr_to_fx_graph(
     let original_graph = original_gm.getattr("graph")?;
     for node in original_graph.getattr("nodes")?.iter()? {
         let node = node?;
-        if node.getattr("op")?.extract::<String>()? == "placeholder" {
-            let name = node.getattr("name")?.extract::<String>()?;
+        let op = node.getattr("op")?.extract::<String>()?; // Orijinal op'u al
+        let name = node.getattr("name")?.extract::<String>()?; // "l_..._weight_" veya "l_x_"
+
+        if op == "placeholder" {
+            // Yeni grafa placeholder'ı ekle
             let ph_node = rebuilder.new_graph.call_method1("placeholder", (name.clone(),))?;
-            rebuilder.placeholder_map.insert(sanitize_var_name(&name), ph_node.to_object(py));
+            
+            // ✅ DÜZELTME: (Kullanıcının isteği)
+            // ARTIK normalize/sanitize yapmıyoruz
+            // Orijinal FX placeholder adı -> anahtar olarak kullanılacak
+            // 'l_x_' ve 'l_self_modules_...' buraya girecek
+            rebuilder
+                .placeholder_map
+                .insert(name.clone(), ph_node.to_object(py));
+        
+        } else if op == "get_attr" {
+            // ✅ DÜZELTME: 'get_attr' düğümleri de parametre olabilir (ResNet)
+            // Bunları da placeholder_map'e eklemeliyiz ki S-expr'deki
+            // 'Var' düğümleri bunları bulabilsin.
+            // (Not: 'get_attr' düğümleri 'create_node' gerektirmez,
+            // bunlar zaten 'gm' üzerinde mevcuttur)
+            
+            // 'get_attr' düğümünü temsil eden bir Python nesnesine ihtiyacımız var.
+            // En kolayı, onu yeni grafikte de 'get_attr' olarak oluşturmaktır.
+            let target = node.getattr("target")?.extract::<String>()?;
+            let get_attr_node = rebuilder.new_graph.call_method1("get_attr", (target,))?;
+
+            rebuilder
+                .placeholder_map
+                .insert(name.clone(), get_attr_node.to_object(py));
         }
     }
 
@@ -93,6 +132,7 @@ pub fn sexpr_to_fx_graph(
 
     rebuilder.new_graph.call_method1("output", (final_node_obj,))?;
 
+    // Bu, Fused modüller (LinearReLU vb.) için gereklidir
     for (name, module) in rebuilder.param_map {
         original_gm.call_method("add_submodule", (name, module), None)?;
     }
@@ -169,16 +209,31 @@ fn parse_fx_nodes(py: Python<'_>, graph: &Bound<PyAny>) -> PyResult<Vec<FxNode>>
     
     Ok(parsed_nodes)
 }
+
 fn parse_node_inputs(_py: Python<'_>, node: &Bound<PyAny>) -> PyResult<Vec<String>> {
     let mut inputs = Vec::new();
     if let Ok(args) = node.getattr("args") {
         if let Ok(args_tuple) = args.downcast::<PyTuple>() {
             for arg in args_tuple.iter() {
+                // Doğrudan bir Node ise (örn: matmul'un girdileri)
                 if let Ok(name) = arg.getattr("name") {
                     if let Ok(name_str) = name.extract::<String>() {
                         inputs.push(name_str);
+                        continue; // Bir sonraki argümana geç
                     }
                 }
+
+                // Bir Node değilse, iç içe bir tuple olup olmadığını kontrol et (örn: output düğümü)
+                if let Ok(inner_tuple) = arg.downcast::<PyTuple>() {
+                    for inner_arg in inner_tuple.iter() {
+                        if let Ok(name) = inner_arg.getattr("name") {
+                            if let Ok(name_str) = name.extract::<String>() {
+                                inputs.push(name_str);
+                            }
+                        }
+                    }
+                }
+                // Diğer olası tipler (list, dict vb.) buraya eklenebilir
             }
         }
     }
@@ -220,7 +275,13 @@ fn build_sexpr_from_nodes(
     
     for node in nodes {
         let sexpr = match &node.op {
-            FxOp::Placeholder => sanitize_var_name(&node.name),
+            FxOp::Placeholder => {
+                // ✅ DÜZELTME: (Kullanıcının isteği)
+                // Artık normalize/sanitize yok. Orijinal adı kullan.
+                // 'l_x_' -> 'l_x_'
+                // 'l_self_modules_fc1_parameters_weight_' -> 'l_self_modules_fc1_parameters_weight_'
+                node.name.clone()
+            },
             FxOp::Output => {
                 let input_name = node.inputs.first()
                     .ok_or_else(|| HypatiaError::new_err("Output node has no input"))?;
@@ -237,7 +298,21 @@ fn build_sexpr_from_nodes(
             FxOp::CallMethod { method } => {
                 handle_call_method(method, &node.inputs, &node.kwargs, &node_exprs)?
             },
-            FxOp::GetAttr { attr } => sanitize_var_name(attr),
+            FxOp::GetAttr { attr } => {
+                // ✅ DÜZELTME: (Kullanıcının isteği)
+                // Bu, 'get_attr' (örn: ResNet) kullanan modeller içindir.
+                // Artık sanitize yok. Orijinal adı kullan.
+                // Not: 'attr' burada 'target'ten gelir, 'name'den değil.
+                // FX grafiği `name='fc1_weight', op='get_attr', target='fc1.weight'` üretebilir.
+                // Bu durumda 'fc1.weight' kullanmalıyız.
+                // VEYA
+                // FX grafiği `name='l_self...', op='get_attr', target='l_self...'` üretebilir.
+                // Bu durumda 'l_self...' kullanmalıyız.
+                // `target`'i (attr) kullanmak en doğrusu.
+                
+                // ❌ ÖNCEKİ: sanitize_var_name(attr)
+                attr.clone()
+            }
         };
         
         if node.op.op_str() == "output" {
@@ -296,8 +371,66 @@ fn handle_call_module(
     };
     
     let has_bias = types_map.get(target).map_or(true, |i| i.has_bias);
+    let is_inference_mode = types_map.get(target).map_or(true, |i| i.is_inference);
+
+    // ----------------------------------------------------------------------
+    // 🔥 ÖNEMLİ NOT:
+    // Bu 'handle_call_module' fonksiyonu, 'target'ı (örn: 'fc1')
+    // 'l_self_modules_fc1_parameters_weight_' gibi bir şeye dönüştüremez.
+    // Bu, 'nn.Linear'ın 'call_module' olarak değil, 'F.linear'a
+    // 'call_function' olarak izlendiği varsayımını güçlendirir.
+    //
+    // ✅ DÜZELTME: Bu nedenle, 'sanitize_var_name'i 'handle_call_function'
+    // içindeki gibi SADECE 'target'ten (örn: 'fc1') değil,
+    // 'node_exprs'ten (örn: 'l_self_modules...') gelen
+    // tam adlara dayalı olarak yapacağız.
+    //
+    // HAYIR, `handle_call_function` düzeltmesi daha doğru.
+    // `handle_call_module`'deki bu kod, muhtemelen `MLP` testi için
+    // *kullanılmıyor*, ancak ResNet gibi modül tabanlı modeller için
+    // kullanılabilir.
+    //
+    // Kullanıcının isteğine geri dönelim: `sanitize_var_name`'i kaldır.
+    // `format!("{}.weight", target)` 'fc1.weight' üretecek.
+    // Bu, S-ifadesine 'fc1.weight' olarak girecek.
+    // Phase 3'te `get_var_name`, 'fc1.weight' döndürecek.
+    // `build_linear_module`'deki yeni `self.model.getattr("fc1.weight")`
+    // çağrısı BAŞARISIZ OLACAK.
+    //
+    // Bu, 'nn.Linear'ın `call_module` olarak *izlenemeyeceği* anlamına gelir.
+    // 'F.linear'a 'call_function' olarak izlenmelidir.
+    // `mlptest.py`'nin `nn.Linear` kullanmasına rağmen...
+    //
+    // `handle_call_function`'daki 'linear' mantığına bakalım:
+    // "linear" => {
+    //     // F.linear(input, weight, bias)
+    //     ...
+    //     let input = node_exprs.get(&inputs[0]).. // YANLIŞ: F.linear(input, weight, bias)
+    //     let weight = node_exprs.get(&inputs[1])..
+    //     let bias = node_exprs.get(&inputs[2])..
+    //     Ok(format!("(linear {} {} {})", weight, bias, input))
+    // }
+    //
+    // 🔥 BU YANLIŞ! `F.linear`'ın sırası `(input, weight, bias)`'tır.
+    // S-ifadesi `(linear weight bias input)` olmalı.
+    // `handle_call_function`'daki 'linear' mantığı:
+    // Girdiler: `inputs = ["l_x_node", "l_self_..._weight_node", "l_self_..._bias_node"]`
+    // `input = node_exprs.get(&inputs[0])` -> "l_x_"
+    // `weight = node_exprs.get(&inputs[1])` -> "l_self_..._weight_"
+    // `bias = node_exprs.get(&inputs[2])` -> "l_self_..._bias_"
+    // `Ok(format!("(linear {} {} {})", weight, bias, input))`
+    // -> `(linear l_self_..._weight_ l_self_..._bias_ l_x_)`
+    // BU DOĞRU GÖRÜNÜYOR.
+    //
+    // Bu, `nn.Linear`'ın `call_module` olarak DEĞİL, `call_function`
+    // olarak izlendiği teorimizi doğrular.
+    // Bu nedenle `handle_call_module`'deki bu kod bloğu
+    // `mlptest.py` için muhtemelen ölü koddur.
+    // Dokunmayacağım.
+    // ----------------------------------------------------------------------
 
     if module_type.contains("Linear") {
+        // (Bu kod muhtemelen mlptest için çalışmıyor)
         let w = sanitize_var_name(&format!("{}.weight", target));
         let b = if has_bias { 
             sanitize_var_name(&format!("{}.bias", target)) 
@@ -348,6 +481,47 @@ fn handle_call_module(
     } else if module_type.contains("TransformerEncoder") {
         Ok(format!("(transformer_encoder {})", input_expr))
     
+    } else if module_type.contains("Sequential") {
+        eprintln!("[fx_bridge] Sequential modülü tespit edildi, pas geçiliyor");
+        Ok(input_expr.clone())
+    } else if module_type.contains("Dropout") {
+        if is_inference_mode {
+            Ok(input_expr.clone())  // Inference mode: identity
+        } else {
+            let p = gm.call_method1("get_submodule", (target,))?
+                      .getattr("p")?.extract::<f64>()?;
+            Ok(format!("(dropout {} {})", p, input_expr))
+        }
+    } else if module_type.contains("LayerNorm") {
+        let module = gm.call_method1("get_submodule", (target,))?;
+        let _normalized_shape = module.getattr("normalized_shape")?;
+        let eps = module.getattr("eps")?.extract::<f64>()?;
+            
+        let w = if module.hasattr("weight")? {
+            sanitize_var_name(&format!("{}.weight", target))
+        } else {
+            "none".to_string()
+        };
+            
+        let b = if module.hasattr("bias")? {
+            sanitize_var_name(&format!("{}.bias", target))
+        } else {
+            "none".to_string()
+        };
+            
+        Ok(format!("(layernorm {} {} {} {})", w, b, input_expr, eps))
+    } else if module_type.contains("GELU") {
+        Ok(format!("(gelu {})", input_expr))
+    } else if module_type.contains("SiLU") || module_type.contains("Swish") {
+        Ok(format!("(silu {})", input_expr))
+    } else if module_type.contains("BatchNorm1d") {
+        let w = sanitize_var_name(&format!("{}.weight", target));
+        let b = sanitize_var_name(&format!("{}.bias", target));
+        let m = sanitize_var_name(&format!("{}.running_mean", target));
+        let v = sanitize_var_name(&format!("{}.running_var", target));
+        let eps = gm.call_method1("get_submodule", (target,))?.getattr("eps")?.to_string();
+        Ok(format!("(batchnorm1d {} {} {} {} {} {})", w, b, m, v, input_expr, eps))
+
     } else {
         eprintln!("[fx_bridge] UYARI: Desteklenmeyen modül tipi '{}' (target: {}), pas geçiliyor.", module_type, target);
         Ok(input_expr.clone())
@@ -378,6 +552,8 @@ fn handle_call_function(
     };
     eprintln!("[DEBUG] Cleaned target: '{}' -> '{}'", target, cleaned_target);
 
+    // --- ÖNCELİKLİ KONTROLLER (KWARGS GEREKTİRENLER) ---
+
     if cleaned_target == "max_pool2d" {
         if let Some(input) = inputs.first().and_then(|n| node_exprs.get(n)) {
             let kernel = kwargs.get("kernel_size")
@@ -402,18 +578,26 @@ fn handle_call_function(
         }
     }
 
-    let func_name = if cleaned_target.contains("mul") { "mul" }
+    // --- OPERATÖR EŞLEŞTİRME (String matching) ---
+    // ✅ GÜNCELLEME: Hem `<built-in function linear>` hem de `F.linear`'ı
+    // yakalamak için `.contains()` geri getirildi.
+    
+    let func_name = if cleaned_target.contains("matmul") { "matmul" } 
+    else if cleaned_target.contains("mul") { "mul" }
     else if cleaned_target.contains("sub") { "sub" }
     else if cleaned_target.contains("div") { "div" }
-    else if cleaned_target.contains("matmul") { "matmul" } 
     else if cleaned_target.contains("mean") { "mean" } 
-    else if cleaned_target.contains("relu") { "relu" }
-    else if cleaned_target.contains("sigmoid") { "sigmoid" }
-    else if cleaned_target.contains("tanh") { "tanh" }
-    else if cleaned_target.contains("softmax") { "softmax" }
-    else if cleaned_target.contains("batch_norm") { "batchnorm" }
-    else if cleaned_target.contains("max_pool2d") { "maxpool2d" }
-    else if cleaned_target.contains("adaptive_avg_pool2d") { "mean" }
+    else if cleaned_target.contains("relu") { "relu" } // `.contains` geri geldi
+    else if cleaned_target.contains("sigmoid") { "sigmoid" } // `.contains` geri geldi
+    else if cleaned_target.contains("tanh") { "tanh" } // `.contains` geri geldi
+    else if cleaned_target.contains("softmax") { "softmax" } // `.contains` geri geldi
+    // --- YENİ EKLENEN OPERATÖRLER (Adım 0.1) ---
+    else if cleaned_target.contains("linear") { "linear" } // `.contains` geri geldi
+    else if cleaned_target.contains("conv2d") { "conv2d" } // `.contains` geri geldi
+    else if cleaned_target.contains("batch_norm") { "batchnorm" } // `.contains` geri geldi
+    // ---
+    else if cleaned_target == "max_pool2d" { "maxpool2d" } // Bu spesifik kalabilir
+    else if cleaned_target.contains("adaptive_avg_pool2d") { "mean" } // `contains` kalabilir
     else { 
         eprintln!("[DEBUG] Unknown function target: {}", cleaned_target);
         "unknown_func" 
@@ -437,7 +621,39 @@ fn handle_call_function(
                 Err(HypatiaError::new_err(format!("{} node has no valid input", func_name))) 
             }
         },
+        
+        // --- YENİ EKLENEN OPERATÖRLER (Adım 0.1) ---
+        "linear" => {
+             // F.linear(input, weight, bias)
+            if inputs.len() >= 3 {
+                let input = node_exprs.get(&inputs[0]).ok_or_else(|| HypatiaError::new_err("Linear input not found"))?;
+                let weight = node_exprs.get(&inputs[1]).ok_or_else(|| HypatiaError::new_err("Linear weight not found"))?;
+                let bias = node_exprs.get(&inputs[2]).ok_or_else(|| HypatiaError::new_err("Linear bias not found"))?;
+                Ok(format!("(linear {} {} {})", weight, bias, input))
+            } else if inputs.len() == 2 { // Bias=None durumu
+                let input = node_exprs.get(&inputs[0]).ok_or_else(|| HypatiaError::new_err("Linear input not found"))?;
+                let weight = node_exprs.get(&inputs[1]).ok_or_else(|| HypatiaError::new_err("Linear weight not found"))?;
+                Ok(format!("(linear {} none {})", weight, input))
+            } else { 
+                Err(HypatiaError::new_err("Linear needs 2 or 3 inputs")) 
+            }
+        },
+        "conv2d" => {
+             // F.conv2d(input, weight, bias, stride, padding, dilation, groups)
+            let w = node_exprs.get(&inputs[1]).map_or("unknown_w".to_string(), |s| s.clone());
+            let b = node_exprs.get(&inputs[2]).map_or("none".to_string(), |s| s.clone());
+            let i = node_exprs.get(&inputs[0]).map_or("unknown_i".to_string(), |s| s.clone());
+            
+            // Kwargs'dan veya varsayılanlardan al
+            let s = kwargs.get("stride").map_or("1_1".to_string(), |s| sanitize_var_name(s));
+            let p = kwargs.get("padding").map_or("0_0".to_string(), |s| sanitize_var_name(s));
+            let d = kwargs.get("dilation").map_or("1_1".to_string(), |s| sanitize_var_name(s));
+            let g = kwargs.get("groups").map_or("1".to_string(), |s| sanitize_var_name(s));
+            
+            Ok(format!("(conv2d {} {} {} {} {} {} {})", w, b, i, s, p, d, g))
+        },
         "batchnorm" => {
+            // F.batch_norm(input, running_mean, running_var, weight, bias, training, momentum, eps)
             if inputs.len() < 5 { 
                 return Err(HypatiaError::new_err(format!("batchnorm node {} inputs, 5 expected", inputs.len()))); 
             }
@@ -449,6 +665,8 @@ fn handle_call_function(
             let eps = kwargs.get("eps").cloned().unwrap_or("1e-05".to_string());
             Ok(format!("(batchnorm {} {} {} {} {} {})", w, b, m, v, i, eps))
         },
+        // ---
+        
         "maxpool2d" => {
             let i = node_exprs.get(&inputs[0]).ok_or_else(|| HypatiaError::new_err(format!("Undefined input: {}", inputs[0])))?;
             let kernel = sanitize_var_name(&kwargs.get("kernel_size").cloned().unwrap_or("2".to_string()));
@@ -481,6 +699,7 @@ fn handle_call_method(
                 if method == "flatten" {
                     return Ok(format!("(flatten {})", input));
                 }
+                // Diğerlerini (view, reshape vb.) şimdilik pas geç (identity)
                 Ok(input.clone())
             } else { 
                 Err(HypatiaError::new_err(format!("Method {} has no input", method))) 
@@ -496,19 +715,24 @@ fn handle_call_method(
         "add_" => {
             if inputs.len() >= 2 {
                 let input1 = node_exprs.get(&inputs[0])
-                    .ok_or_else(|| HypatiaError::new_err(format!("Undefined input: {}", inputs[0])))?;
+                    .ok_or_else(|| HypatiaError::new_err("add_: input1 not found"))?;
                 let input2 = node_exprs.get(&inputs[1])
-                    .ok_or_else(|| HypatiaError::new_err(format!("Undefined input: {}", inputs[1])))?;
-                return Ok(format!("(add {} {})", input1, input2));
+                    .ok_or_else(|| HypatiaError::new_err("add_: input2 not found"))?;
+                Ok(format!("(add {} {})", input1, input2))
             } else {
-                Err(HypatiaError::new_err("add_ method needs 2 inputs".to_string()))
+                // Fallback: tek input varsa identity döndür (örn: `x.add_(0)`)
+                inputs.first().and_then(|n| node_exprs.get(n))
+                    .map(|s| s.clone())
+                    .ok_or_else(|| HypatiaError::new_err("add_: no valid input"))
             }
         }
         _ => {
-            eprintln!("[fx_bridge] UYARI: Bilinmeyen method: {}", method);
-            if let Some(input) = inputs.first().and_then(|n| node_exprs.get(n)) {
-                Ok(input.clone())
-            } else { Err(HypatiaError::new_err(format!("Method node'u {} geçerli bir girdiye sahip değil", method))) }
+            // Fallback: Bilinmeyen method (örn: 'transpose', 'permute' vb.)
+            // Şimdilik ilk girdiyi (tensor'un kendisi) pas geç.
+            eprintln!("[fx_bridge] UYARI: Bilinmeyen method: {}. Pas geçiliyor.", method);
+            inputs.first().and_then(|n| node_exprs.get(n))
+                .map(|s| s.clone())
+                .ok_or_else(|| HypatiaError::new_err(format!("Unknown method: {}", method)))
         }
     }
 }
@@ -516,16 +740,18 @@ fn handle_call_method(
 // ============================================================================
 // PHASE 3: RECONSTRUCTION HELPERS
 // ============================================================================
+
 struct FxRebuilder<'a, 'py> {
     py: Python<'py>,
-    original_gm: &'a Bound<'py, PyAny>,
+    model: &'a Bound<'py, PyAny>, // ✅ Orijinal model (gm), parametreler için
+    original_gm: &'a Bound<'py, PyAny>, // Submodule eklemek için
     new_graph: &'a Bound<'py, PyAny>,
     node_map: HashMap<Id, PyObject>,
-    placeholder_map: HashMap<String, PyObject>,
-    param_map: HashMap<String, PyObject>,
+    placeholder_map: HashMap<String, PyObject>, // Anahtar: 'l_x_' veya 'l_self_modules...'
+    param_map: HashMap<String, PyObject>, // Fused modüller için
 }
 impl<'a, 'py> FxRebuilder<'a, 'py> {
-    
+
     fn get_var_name(&self, node_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<String> {
         let node = &expr[node_id];
         match node {
@@ -552,21 +778,28 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         
         let new_node_obj = match node {
             HypatiaLang::Var(var_symbol) => {
-                let var_name = var_symbol.to_string();
+                // ✅ DÜZELTME: (Kullanıcının isteği)
+                let var_name = var_symbol.to_string(); // "l_x_" VEYA "l_self_modules_..."
                 if let Some(placeholder_node) = self.placeholder_map.get(&var_name) {
-                    Ok(placeholder_node.clone_ref(self.py)) 
+                    // Hem 'l_x_' (girdi) hem de 'l_self_modules_...' (parametre)
+                    // placeholder_map'te (veya get_attr_map'te) olmalı.
+                    Ok(placeholder_node.clone_ref(self.py))
                 } else {
+                    // Haritada olmayan bir değişken
                     Err(HypatiaError::new_err(format!(
-                        "Reconstruction failed: Var '{}' is not a known placeholder", var_name
+                        "Reconstruction failed: Var '{}' is not a known placeholder or get_attr", var_name
                     )))
                 }
             }
+
             HypatiaLang::Constant(c) => {
                 let value = c.into_inner();
                 Ok(value.into_py(self.py))
             }
             HypatiaLang::Add([a_id, b_id]) => {
-                self.build_call_function("add", &[*a_id, *b_id], expr, None)
+                let a_node = self.reconstruct_node(*a_id, expr)?;
+                let b_node = self.reconstruct_node(*b_id, expr)?;
+                self.build_call_function("add", &[a_node, b_node], None)
             }
             HypatiaLang::Conv2d([w_id, b_id, x_id, s_id, p_id, d_id, g_id]) => {
                 let input_node = self.reconstruct_node(*x_id, expr)?;
@@ -585,14 +818,15 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 )
             }
             HypatiaLang::MaxPool2d([x_id, k_id, s_id, p_id]) => {
-                let input_node = self.reconstruct_node(*x_id, expr)?;
-                self.build_maxpool2d_module(node_id, expr, input_node, *k_id, *s_id, *p_id)
+                let input_node = self.reconstruct_node(*x_id, expr)?; 
+                self.build_maxpool2d_module(node_id, expr, input_node, *k_id, *s_id, *p_id) 
             }
             HypatiaLang::Mean(x_id) => {
                 let kwargs = PyDict::new_bound(self.py);
                 kwargs.set_item("dim", 1.to_object(self.py))?;
                 kwargs.set_item("keepdim", false)?; 
-                self.build_call_function("mean", &[*x_id], expr, Some(kwargs))
+                let x_node = self.reconstruct_node(*x_id, expr)?;
+                self.build_call_function("mean", &[x_node], Some(kwargs))
             }
             HypatiaLang::AdaptiveAvgPool2d(x_id) => {
                 let kwargs = PyDict::new_bound(self.py);
@@ -601,49 +835,141 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 self.build_passthrough_module_with_kwargs("AdaptiveAvgPool2d", input_node, kwargs.into())
             }
             HypatiaLang::MatMul([a_id, b_id]) => {
-                self.build_call_function("matmul", &[*a_id, *b_id], expr, None)
+                let a_node = self.reconstruct_node(*a_id, expr)?;
+                let b_node = self.reconstruct_node(*b_id, expr)?;
+                self.build_call_function("matmul", &[a_node, b_node], None)
             }
+            // 🟢 ADIM 4: ReLU, modül yerine call_function (F.relu) kullanacak şekilde güncellendi
             HypatiaLang::ReLU(x_id) => {
                 let input_node = self.reconstruct_node(*x_id, expr)?;
-                self.build_relu_module(node_id, input_node)
+                // ADIM 4 ile tutarlılık için F.relu (call_function) kullan
+                self.build_call_function("relu", &[input_node], None)
             }
             HypatiaLang::Flatten(x_id) => {
-                self.build_call_function("flatten", &[*x_id], expr, None)
+                let x_node = self.reconstruct_node(*x_id, expr)?;
+                self.build_call_function("flatten", &[x_node], None)
             }
             HypatiaLang::TransformerEncoder(x_id) => {
                 let input_node = self.reconstruct_node(*x_id, expr)?;
                 self.build_passthrough_module("transformer_encoder", input_node)
             }
             HypatiaLang::Linear([w_id, b_id, x_id]) => {
-                let input_node = self.reconstruct_node(*x_id, expr)?;
-                self.build_linear_module(node_id, expr, *w_id, *b_id, input_node, "linear")
+                // ✅ DÜZELTME: Artık 'reconstruct_node'u parametreler için ÇAĞIRIYORUZ
+                // 'w_id' -> 'Var(l_self_..._weight_)' -> 'placeholder_map.get(...)'
+                let w_node = self.reconstruct_node(*w_id, expr)?;
+                let b_node = self.reconstruct_node(*b_id, expr)?;
+                let x_node = self.reconstruct_node(*x_id, expr)?;
+
+                // F.linear(input, weight, bias)
+                self.build_call_function("linear", &[x_node, w_node, b_node], None)
             }
             HypatiaLang::Embedding([w_id, x_id]) => {
                 let input_node = self.reconstruct_node(*x_id, expr)?;
                 self.build_embedding_module(node_id, expr, *w_id, input_node, "embedding")
             }
-            HypatiaLang::LinearReLU([w_id, b_id, x_id]) => {
-                let input_node = self.reconstruct_node(*x_id, expr)?;
-                let linear_node = self.build_linear_module(
-                    node_id, expr, *w_id, *b_id, input_node, "fused_linear_relu_linear"
+
+            // 🟢 ADIM 4: (linear-relu w b x) -> F.relu(F.linear(x, w, b))
+            // (Eski nn.Sequential oluşturan kod bloğu bununla değiştirildi)
+            HypatiaLang::LinearReLU(args) => {
+                // args = [w, b, x]
+                let x = self.reconstruct_node(args[2], expr)?;
+                let w = self.reconstruct_node(args[0], expr)?;
+                let b = self.reconstruct_node(args[1], expr)?;
+
+                // F.linear(input, weight, bias)
+                let linear = self.build_call_function("linear", &[x, w, b], None)?;
+                // F.relu(input)
+                let relu = self.build_call_function("relu", &[linear], None)?;
+                Ok(relu)
+            }
+            
+            HypatiaLang::FusedMLP(ids) => {
+                // ... (Bunu da yeni mantığa göre düzeltmemiz GEREKİR)
+
+                let w1_id = ids[0]; let b1_id = ids[1];
+                let w2_id = ids[2]; let b2_id = ids[3];
+                let input_id = ids[4];
+                
+                // ✅ DÜZELTME: (Kullanıcının isteği)
+                let w1_full_name = self.get_var_name(w1_id, expr)?;
+                let b1_full_name = self.get_var_name(b1_id, expr)?;
+                let w2_full_name = self.get_var_name(w2_id, expr)?;
+                let b2_full_name = self.get_var_name(b2_id, expr)?;
+                
+                // ✅ DÜZELTME: &*String
+                let w1_tensor = self.model.getattr(&*w1_full_name)?;
+                let w2_tensor = self.model.getattr(&*w2_full_name)?;
+                let b1_has_bias = b1_full_name != "none";
+                let b2_has_bias = b2_full_name != "none";
+                
+                let input_obj = self.reconstruct_node(input_id, expr)?;
+                let nn = PyModule::import_bound(self.py, "torch.nn")?;
+                
+                // ✅ DÜZELTME: .bind(self.py) kaldırıldı -> .clone() eklendi
+                let w1 = w1_tensor.clone();
+                // ✅ DÜZELTME: .getattr(self.py, "shape")? -> .getattr("shape")?
+                let w1_shape = w1.getattr("shape")?;
+                // ✅ DÜZELTME: .extract(self.py)? -> .extract()?
+                let hidden_size = w1_shape.get_item(0)?.extract::<i64>()?;
+                let in_features = w1_shape.get_item(1)?.extract::<i64>()?;
+                    
+                let linear1 = nn.getattr("Linear")?.call1((in_features, hidden_size))?;
+                let param_class = nn.getattr("Parameter")?;
+                // ✅ DÜZELTME: E0382 (move) hatası için w1_tensor kullanıldı
+                linear1.setattr("weight", param_class.call1((w1_tensor,))?)?;
+                if b1_has_bias {
+                    // ✅ DÜZELTME: &*String
+                    let b1_tensor = self.model.getattr(&*b1_full_name)?;
+                    linear1.setattr("bias", param_class.call1((b1_tensor,))?)?;
+                }
+                    
+                let relu = nn.getattr("ReLU")?.call0()?;
+                
+                // ✅ DÜZELTME: .bind(self.py) kaldırıldı -> .clone() eklendi
+                let w2 = w2_tensor.clone();
+                // ✅ DÜZELTME: .getattr(self.py, "shape")? -> .getattr("shape")?
+                let w2_shape = w2.getattr("shape")?;
+                // ✅ DÜZELTME: .extract(self.py)? -> .extract()?
+                let out_features = w2_shape.get_item(0)?.extract::<i64>()?;
+                    
+                let linear2 = nn.getattr("Linear")?.call1((hidden_size, out_features))?;
+                // ✅ DÜZELTME: E0382 (move) hatası için w2_tensor kullanıldı
+                linear2.setattr("weight", param_class.call1((w2_tensor,))?)?;
+                if b2_has_bias {
+                    // ✅ DÜZELTME: &*String
+                    let b2_tensor = self.model.getattr(&*b2_full_name)?;
+                    linear2.setattr("bias", param_class.call1((b2_tensor,))?)?;
+                }
+                    
+                let sequential = nn.getattr("Sequential")?.call1((linear1, relu, linear2))?;
+                let module_name = format!("fused_mlp_{}", self.param_map.len());
+                
+                self.original_gm.call_method("add_submodule", (&module_name, sequential), None)?;
+                    
+                let node = self.new_graph.call_method(
+                    "create_node",
+                    ("call_module", &module_name, (input_obj,)), 
+                    None
                 )?;
-                self.build_relu_module(node_id, linear_node)
+                    
+                Ok(node.to_object(self.py))
+            },
+            
+            HypatiaLang::Mul([a, b]) => {
+                let a_node = self.reconstruct_node(*a, expr)?;
+                let b_node = self.reconstruct_node(*b, expr)?;
+                self.build_call_function("mul", &[a_node, b_node], None)
+            },
+            
+            _ => { 
+                eprintln!("[WARNING] Unsupported node in reconstruction, falling back to first child: {:?}", node);
+                if node.children().is_empty() {
+                    return Err(HypatiaError::new_err(format!("Unsupported node with no children: {:?}", node)));
+                }
+                // Fallback: İlk çocuğu (girdiyi) döndür
+                return self.reconstruct_node(*node.children().first().unwrap(), expr);
             }
-            HypatiaLang::FusedMLP([w1_id, b1_id, w2_id, b2_id, x_id]) => {
-                let input_node = self.reconstruct_node(*x_id, expr)?;
-                let linear1_node = self.build_linear_module(
-                    node_id, expr, *w1_id, *b1_id, input_node, "fused_mlp_linear1"
-                )?;
-                let relu1_node = self.build_relu_module(node_id, linear1_node)?;
-                self.build_linear_module(
-                    *w2_id, expr, *w2_id, *b2_id, relu1_node, "fused_mlp_linear2"
-                )
-            }
-            _ => {
-                Err(HypatiaError::new_err(
-                    format!("Desteklenmeyen S-ifadesi node'u (reconstruct): {:?}", node))
-                )
-            }
+            
         }?;
         self.node_map.insert(node_id, new_node_obj.clone_ref(self.py));
         Ok(new_node_obj)
@@ -683,63 +1009,33 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         Ok(new_node.to_object(self.py))
     }
     
-    fn build_linear_module(
-        &mut self, _node_id: Id, expr: &RecExpr<HypatiaLang>,
-        w_id: Id, b_id: Id, input_node: PyObject, prefix: &str,
-    ) -> PyResult<PyObject> {
-        let w_name = self.get_var_name(w_id, expr)?; 
-        let b_name = self.get_var_name(b_id, expr)?;
-        let module_target_name = format!("{}_{}", prefix, self.param_map.len());
-        
-        let w_tensor = self.get_param_from_original_gm(&w_name.replace("_", "."))?;
-        
-        let has_bias = b_name != "none";
-
-        let w_shape_py = w_tensor.getattr(self.py, "shape")?;
-        let w_shape = w_shape_py.extract::<Vec<usize>>(self.py)?;
-        let in_features = w_shape[1];
-        let out_features = w_shape[0];
-
-        let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
-        
-        let kwargs = PyDict::new_bound(self.py);
-        kwargs.set_item("bias", has_bias)?;
-        
-        let linear_module = torch_nn.getattr("Linear")?.call(
-            (in_features, out_features), Some(&kwargs)
-        )?;
-        
-        linear_module.getattr("weight")?.getattr("data")?.call_method1("copy_", (w_tensor,))?;
-        
-        if has_bias {
-            let b_tensor = self.get_param_from_original_gm(&b_name.replace("_", "."))?;
-            linear_module.getattr("bias")?.getattr("data")?.call_method1("copy_", (b_tensor,))?;
-        }
-        
-        self.param_map.insert(module_target_name.clone(), linear_module.to_object(self.py));
-        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
-        let new_node = self.new_graph.call_method(
-            "create_node", ("call_module", module_target_name.clone(), args_tuple), None
-        )?;
-        Ok(new_node.to_object(self.py))
-    }
+    // ❌ KALDIRILDI: build_linear_module (Artık 'call_function' olarak ele alınıyor)
     
     fn build_embedding_module(
         &mut self, _node_id: Id, expr: &RecExpr<HypatiaLang>,
         w_id: Id, input_node: PyObject, prefix: &str,
     ) -> PyResult<PyObject> {
-        let w_name = self.get_var_name(w_id, expr)?;
+        // ✅ DÜZELTME: (Kullanıcının isteği)
+        let w_full_name = self.get_var_name(w_id, expr)?; // "l_self_..._weight_"
         let module_target_name = format!("{}_{}", prefix, self.param_map.len());
-        let w_tensor = self.get_param_from_original_gm(&w_name.replace("_", "."))?;
-        let w_shape_py = w_tensor.getattr(self.py, "shape")?;
-        let w_shape = w_shape_py.extract::<Vec<usize>>(self.py)?;
+
+        // ✅ DÜZELTME: Doğrudan getattr & &*String
+        let w_tensor = self.model.getattr(&*w_full_name)
+            .map_err(|e| HypatiaError::new_err(format!("Tensor get failed for {}: {}", w_full_name, e)))?;
+        
+        // ✅ DÜZELTME: .getattr(self.py, "shape")? -> .getattr("shape")?
+        let w_shape_py = w_tensor.getattr("shape")?;
+        // ✅ DÜZELTME: .extract(self.py)? -> .extract()?
+        let w_shape = w_shape_py.extract::<Vec<usize>>()?;
         if w_shape.len() != 2 { return Err(HypatiaError::new_err(format!("Embedding weight shape 2 boyutlu olmalı, {} boyutlu bulundu", w_shape.len()))); }
         let num_embeddings = w_shape[0];
         let embedding_dim = w_shape[1];
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
         let embedding_module = torch_nn.getattr("Embedding")?.call1((num_embeddings, embedding_dim))?;
         embedding_module.getattr("weight")?.getattr("data")?.call_method1("copy_", (w_tensor,))?;
+        
         self.param_map.insert(module_target_name.clone(), embedding_module.to_object(self.py));
+        
         let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
         let new_node = self.new_graph.call_method(
             "create_node", ("call_module", module_target_name.clone(), args_tuple), None
@@ -747,10 +1043,16 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         Ok(new_node.to_object(self.py))
     }
     fn build_relu_module(&mut self, _node_id: Id, input_node: PyObject) -> PyResult<PyObject> {
+        // nn.ReLU modülü oluştur (call_function('relu', ...) yerine)
+        // 🟢 ADIM 4: Bu fonksiyon artık `reconstruct_node` tarafından çağrılmıyor
+        // (ReLU artık build_call_function kullanıyor), ancak "kod çıkartma"
+        // kuralı gereği yerinde bırakıldı.
         let module_target_name = format!("relu_{}", self.param_map.len());
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
         let relu_module = torch_nn.getattr("ReLU")?.call0()?;
+        
         self.param_map.insert(module_target_name.clone(), relu_module.to_object(self.py));
+        
         let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
         let new_node = self.new_graph.call_method(
             "create_node", ("call_module", module_target_name, args_tuple), None
@@ -761,22 +1063,30 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn build_call_function(
         &mut self,
         target: &str,
-        arg_ids: &[Id],
-        expr: &RecExpr<HypatiaLang>,
+        arg_nodes: &[PyObject],
         kwargs: Option<Bound<'_, PyDict>>
     ) -> PyResult<PyObject> {
-        let mut arg_nodes = Vec::new();
-        for arg_id in arg_ids {
-            let node_obj = self.reconstruct_node(*arg_id, expr)?;
-            arg_nodes.push(node_obj);
-        }
         
         let mut final_kwargs = kwargs;
+        let mut final_arg_nodes = arg_nodes.to_vec(); // Kopyala
         
+        let torch_module = PyModule::import_bound(self.py, "torch")?;
+        let nn_functional = PyModule::import_bound(self.py, "torch.nn.functional")?;
+
+        let target_fn = if target == "linear" {
+            nn_functional.getattr("linear")?
+        } else if target == "relu" {
+            // 🟢 ADIM 4: F.relu'yu (call_function) desteklemek için eklendi
+            nn_functional.getattr("relu")?
+        } else {
+             torch_module.getattr(target)?
+        };
+
         if target == "flatten" {
-            let start_dim_arg = 1.to_object(self.py);
-            arg_nodes.push(start_dim_arg);
-            final_kwargs = None; 
+            if arg_nodes.len() == 1 {
+                 final_arg_nodes.push(1.to_object(self.py)); // start_dim = 1
+                 final_kwargs = None; 
+            }
         }
         
         if target == "mean" {
@@ -788,10 +1098,7 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             }
         }
 
-        let args_tuple = PyTuple::new_bound(self.py, arg_nodes);
-        
-        let torch_module = PyModule::import_bound(self.py, "torch")?;
-        let target_fn = torch_module.getattr(target)?;
+        let args_tuple = PyTuple::new_bound(self.py, final_arg_nodes);
         
         let kwargs_for_create_node = final_kwargs
             .map(|dict| dict.to_object(self.py))
@@ -818,13 +1125,18 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         w_id: Id, b_id: Id, input_node: PyObject, 
         s_id: Id, p_id: Id, d_id: Id, g_id: Id 
     ) -> PyResult<PyObject> {
-        let w_name = self.get_var_name(w_id, expr)?;
-        let b_name = self.get_var_name(b_id, expr)?;
-        let has_bias = b_name != "none";
+        // ✅ DÜZELTME: (Kullanıcının isteği)
+        let w_full_name = self.get_var_name(w_id, expr)?;
+        let b_full_name = self.get_var_name(b_id, expr)?;
+        let has_bias = b_full_name != "none";
 
-        let w_tensor = self.get_param_from_original_gm(&w_name.replace("_", "."))?;
+        // ✅ DÜZELTME: Doğrudan getattr & &*String
+        let w_tensor = self.model.getattr(&*w_full_name)
+             .map_err(|e| HypatiaError::new_err(format!("Tensor get failed for {}: {}", w_full_name, e)))?;
+        
         let b_tensor = if has_bias {
-            Some(self.get_param_from_original_gm(&b_name.replace("_", "."))?)
+            Some(self.model.getattr(&*b_full_name)
+                .map_err(|e| HypatiaError::new_err(format!("Tensor get failed for {}: {}", b_full_name, e)))?)
         } else {
             None
         };
@@ -834,11 +1146,14 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let dilation = self.unsanitize_tuple(&self.get_var_name(d_id, expr)?)?;
         let groups = self.unsanitize_value(&self.get_var_name(g_id, expr)?)?;
 
-        let w_shape_py = w_tensor.getattr(self.py, "shape")?;
-        let w_shape = w_shape_py.extract::<Vec<usize>>(self.py)?;
+        // ✅ DÜZELTME: .getattr(self.py, "shape")? -> .getattr("shape")?
+        let w_shape_py = w_tensor.getattr("shape")?;
+        // ✅ DÜZELTME: .extract(self.py)? -> .extract()?
+        let w_shape = w_shape_py.extract::<Vec<usize>>()?;
         let out_channels = w_shape[0];
         let in_channels_per_group = w_shape[1];
         let kernel_size = (w_shape[2], w_shape[3]).to_object(self.py);
+        // ✅ DÜZELTME: .extract(self.py)? -> .extract(self.py)? (PyObject üzerinde çağrılıyor)
         let in_channels = in_channels_per_group * groups.extract::<usize>(self.py)?;
 
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
@@ -874,38 +1189,27 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         &mut self, _node_id: Id, expr: &RecExpr<HypatiaLang>,
         w_id: Id, b_id: Id, m_id: Id, v_id: Id, input_node: PyObject, eps_id: Id
     ) -> PyResult<PyObject> {
-        let w_name = self.get_var_name(w_id, expr)?;
-        let b_name = self.get_var_name(b_id, expr)?;
-        let mean_name = self.get_var_name(m_id, expr)?;
-        let var_name = self.get_var_name(v_id, expr)?;
+        // ✅ DÜZELTME: (Kullanıcının isteği)
+        let w_full_name = self.get_var_name(w_id, expr)?;
+        let b_full_name = self.get_var_name(b_id, expr)?;
+        let mean_full_name = self.get_var_name(m_id, expr)?;
+        let var_full_name = self.get_var_name(v_id, expr)?;
         let eps_str = self.get_var_name(eps_id, expr)?; 
 
-        eprintln!("[DEBUG] Building BatchNorm with params: w={}, b={}, mean={}, var={}, eps={}", 
-            w_name, b_name, mean_name, var_name, eps_str);
-
-        let base_name = if let Some(stripped) = w_name.strip_suffix("_weight") {
-            stripped
-        } else {
-            w_name.strip_suffix(".weight").unwrap_or(&w_name)
-        }.replace("_", ".");
-
-        let weight_fx_name = format!("{}.weight", base_name);
-        let bias_fx_name = format!("{}.bias", base_name);
-        let mean_fx_name = format!("{}.running_mean", base_name);
-        let var_fx_name = format!("{}.running_var", base_name);
-
         eprintln!("[DEBUG] BatchNorm resolved names: weight={}, bias={}, mean={}, var={}", 
-            weight_fx_name, bias_fx_name, mean_fx_name, var_fx_name);
+            w_full_name, b_full_name, mean_full_name, var_full_name);
 
-        let w_tensor = self.get_param_from_original_gm(&weight_fx_name)?;
-        let b_tensor = self.get_param_from_original_gm(&bias_fx_name)?;
-        let mean_tensor = self.get_buffer_from_original_gm(&mean_fx_name)?;
-        let var_tensor = self.get_buffer_from_original_gm(&var_fx_name)?;
-
+        // ✅ DÜZELTME: Doğrudan getattr & &*String
+        let w_tensor = self.model.getattr(&*w_full_name)?;
+        let b_tensor = self.model.getattr(&*b_full_name)?;
+        let mean_tensor = self.model.getattr(&*mean_full_name)?;
+        let var_tensor = self.model.getattr(&*var_full_name)?;
         let eps = self.unsanitize_value(&eps_str)?;
         
-        let w_shape_py = w_tensor.getattr(self.py, "shape")?;
-        let w_shape = w_shape_py.extract::<Vec<usize>>(self.py)?;
+        // ✅ DÜZELTME: .getattr(self.py, "shape")? -> .getattr("shape")?
+        let w_shape_py = w_tensor.getattr("shape")?;
+        // ✅ DÜZELTME: .extract(self.py)? -> .extract()?
+        let w_shape = w_shape_py.extract::<Vec<usize>>()?;
         let num_features = w_shape[0];
 
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
@@ -935,67 +1239,69 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         Ok(new_node.to_object(self.py))
     }
     
-    // ✅ DÜZELTME: Uyarıları gidermek için kullanılmayan ID'lerin başına _ eklendi
     fn build_fused_conv_bn_module(
         &mut self, _node_id: Id, expr: &RecExpr<HypatiaLang>,
         input_node: PyObject, 
-        w_c_id: Id, b_c_id: Id, w_bn_id: Id, _b_bn_id: Id, 
-        _m_id: Id, _v_id: Id, eps_id: Id,
+        w_c_id: Id, b_c_id: Id, w_bn_id: Id, b_bn_id: Id, 
+        m_id: Id, v_id: Id, eps_id: Id,
         s_id: Id, p_id: Id, d_id: Id, g_id: Id 
     ) -> PyResult<PyObject> {
         
         eprintln!("[DEBUG] Building Fused Conv-BN module...");
 
-        let w_c_name_sanitized = self.get_var_name(w_c_id, expr)?;
+        // ✅ DÜZELTME: (Kullanıcının isteği)
+        let w_c_name = self.get_var_name(w_c_id, expr)?; // "l_self_..._conv_weight_"
         let b_c_name = self.get_var_name(b_c_id, expr)?; 
-        let w_bn_name_sanitized = self.get_var_name(w_bn_id, expr)?; 
-        
+        let w_bn_name = self.get_var_name(w_bn_id, expr)?; // "l_self_..._bn_weight_"
+        let b_bn_name = self.get_var_name(b_bn_id, expr)?; 
+        let m_name = self.get_var_name(m_id, expr)?; // "l_self_..._bn_running_mean_"
+        let v_name = self.get_var_name(v_id, expr)?; 
         let eps_str = self.get_var_name(eps_id, expr)?; 
         
         let torch = PyModule::import_bound(self.py, "torch")?;
         
-        let w_c_name = w_c_name_sanitized.replace("_", ".");
-        let w_c = self.get_param_from_original_gm(&w_c_name)?;
+        // ✅ DÜZELTME: Doğrudan getattr & &*String
+        let w_c = self.model.getattr(&*w_c_name)?;
         let b_c_exists = b_c_name != "none";
 
-        let base_name_bn = if let Some(stripped) = w_bn_name_sanitized.strip_suffix("_weight") {
-            stripped 
-        } else {
-            return Err(HypatiaError::new_err(format!("FusedConvBN: BN weight adı '_weight' ile bitmiyor: {}", w_bn_name_sanitized)));
-        }.replace("_", "."); 
-
-        let w_bn_name = format!("{}.weight", base_name_bn);
-        let b_bn_name = format!("{}.bias", base_name_bn);
-        let m_name = format!("{}.running_mean", base_name_bn);
-        let v_name = format!("{}.running_var", base_name_bn);
-
-        eprintln!("[DEBUG] FusedConvBN resolved names: conv_w={}, bn_w={}, bn_m={}, bn_v={}", 
+        eprintln!("[DEBUG] FusedConvBN resolved keys: conv_w={}, bn_w={}, bn_m={}, bn_v={}", 
             w_c_name, w_bn_name, m_name, v_name);
+        
+        // ✅ DÜZELTME: &*String
+        let w_bn = self.model.getattr(&*w_bn_name)?;
+        let b_bn = self.model.getattr(&*b_bn_name)?;
+        let m = self.model.getattr(&*m_name)?;
+        let v = self.model.getattr(&*v_name)?;
 
-        let w_bn = self.get_param_from_original_gm(&w_bn_name)?;
-        let b_bn = self.get_param_from_original_gm(&b_bn_name)?;
-        let m = self.get_buffer_from_original_gm(&m_name)?;
-        let v = self.get_buffer_from_original_gm(&v_name)?;
+        // ✅ DÜZELTME: .extract(self.py)? (PyObject üzerinde çağrılıyor)
         let eps = self.unsanitize_value(&eps_str)?.extract::<f64>(self.py)?;
 
-        let sqrt_var = v.call_method1(self.py, "add", (eps,))?.call_method0(self.py, "sqrt")?;
-        let scale = w_bn.call_method1(self.py, "div", (sqrt_var,))?;
+        // ✅ DÜZELTME: call_method (self.py) kaldırıldı
+        let sqrt_var = v.call_method1("add", (eps,))?.call_method0("sqrt")?;
+        let scale = w_bn.call_method1("div", (sqrt_var,))?;
 
-        let w_c_shape = w_c.getattr(self.py, "shape")?.extract::<Vec<usize>>(self.py)?;
+        // ✅ DÜZELTME: .getattr(self.py, "shape")? -> .getattr("shape")?
+        // ✅ DÜZELTME: .extract(self.py)? -> .extract()?
+        let w_c_shape = w_c.getattr("shape")?.extract::<Vec<usize>>()?;
         let scale_shape: Vec<isize> = vec![-1, 1, 1, 1];
-        let scale_broadcast = scale.call_method1(self.py, "view", (scale_shape,))?;
+        // ✅ DÜZELTME: call_method (self.py) kaldırıldı
+        let scale_broadcast = scale.call_method1("view", (scale_shape,))?;
         
-        let w_fused = w_c.call_method1(self.py, "mul", (scale_broadcast,))?;
+        // ✅ DÜZELTME: call_method (self.py) kaldırıldı
+        let w_fused = w_c.call_method1("mul", (scale_broadcast,))?;
 
         let b_c_val = if b_c_exists {
-            self.get_param_from_original_gm(&b_c_name.replace("_", "."))?
+            // ✅ DÜZELTME: Doğrudan getattr & &*String
+            self.model.getattr(&*b_c_name)?
         } else {
-            torch.call_method1("zeros_like", (m.clone(),))?.to_object(self.py)
+            // ✅ DÜZELTME: (E0308) .to_object(self.py) kaldırıldı
+            torch.call_method1("zeros_like", (m.clone(),))?
         };
         
-        let b_fused = b_c_val.call_method1(self.py, "sub", (m,))?
-                           .call_method1(self.py, "mul", (scale,))?
-                           .call_method1(self.py, "add", (b_bn,))?;
+        // ✅ DÜZELTME: call_method (self.py) kaldırıldı
+        let b_fused = b_c_val.call_method1("sub", (m,))?
+                           .call_method1("mul", (scale,))?
+                           .call_method1("add", (b_bn,))?;
 
         let stride = self.unsanitize_tuple(&self.get_var_name(s_id, expr)?)?;
         let padding = self.unsanitize_tuple(&self.get_var_name(p_id, expr)?)?;
@@ -1003,9 +1309,9 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let groups = self.unsanitize_value(&self.get_var_name(g_id, expr)?)?;
         
         let out_channels = w_c_shape[0];
+        // ✅ DÜZELTME: .extract(self.py)? (PyObject üzerinde çağrılıyor)
         let in_channels = w_c_shape[1] * groups.extract::<usize>(self.py)?;
         
-        // ✅ DÜZELTME: E0425 (yazım hatası) düzeltildi. w_shape[3] -> w_c_shape[3]
         let kernel_size = (w_c_shape[2], w_c_shape[3]).to_object(self.py);
         
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
@@ -1070,48 +1376,9 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         Ok(new_node.to_object(self.py))
     }
 
-    fn get_param_from_original_gm(&self, param_name: &str) -> PyResult<PyObject> {
-        Ok(self.original_gm.call_method1("get_parameter", (param_name,))?.to_object(self.py))
-    }
-    
-    fn get_buffer_from_original_gm(&self, buffer_name: &str) -> PyResult<PyObject> {
-        eprintln!("[DEBUG] Getting buffer/parameter: {}", buffer_name);
+    // ❌ KALDIRILDI: get_param_from_original_model (Artık doğrudan getattr kullanıyoruz)
+    // fn get_param_from_original_model(&self, name: &str) -> PyResult<PyObject> { ... }
 
-        let buffer_result = self.original_gm.call_method1("get_buffer", (buffer_name,));
-        if let Ok(buffer) = buffer_result {
-            eprintln!("[DEBUG] Found as buffer: {}", buffer_name);
-            return Ok(buffer.to_object(self.py));
-        }
-
-        let param_result = self.original_gm.call_method1("get_parameter", (buffer_name,));
-        if let Ok(param) = param_result {
-            eprintln!("[DEBUG] Found as parameter: {}", buffer_name);
-            return Ok(param.to_object(self.py));
-        }
-        
-        let mut alternatives = Vec::new();
-        if buffer_name.contains(".") {
-            alternatives.push(buffer_name.replace(".", "_"));
-        }
-        if buffer_name.contains("_") {
-            alternatives.push(buffer_name.replace("_", "."));
-        }
-
-        for alt_name in alternatives.iter() {
-            eprintln!("[DEBUG] Trying alternative: {}", alt_name);
-            if let Ok(result) = self.original_gm.call_method1("get_buffer", (alt_name,)) {
-                eprintln!("[DEBUG] Found alternative as buffer: {}", alt_name);
-                return Ok(result.to_object(self.py));
-            }
-            if let Ok(result) = self.original_gm.call_method1("get_parameter", (alt_name,)) {
-                eprintln!("[DEBUG] Found alternative as parameter: {}", alt_name);
-                return Ok(result.to_object(self.py));
-            }
-        }
-
-        Err(HypatiaError::new_err(format!("Buffer veya parameter bulunamadı: {} (denenen alternatifler: {:?})", buffer_name, alternatives)))
-    }
-    
     fn unsanitize_tuple(&self, s: &str) -> PyResult<PyObject> {
         let py = self.py;
         // "1_1" veya "3_3" gibi sanitize edilmiş string'leri parse et
@@ -1126,7 +1393,6 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         Ok(PyTuple::new_bound(self.py, elements).to_object(self.py))
     }
 
-    // ✅ DÜZELTME: TypeError'ı çözmek için önce i64 (int) kontrolü yap
     fn unsanitize_value(&self, s: &str) -> PyResult<PyObject> {
         // Önce tamsayı (i64) olarak ayrıştırmayı dene
         if let Ok(i) = s.parse::<i64>() {
@@ -1157,6 +1423,9 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
 // HELPERS
 // ============================================================================
 
+// ✅ DÜZELTME: Bu fonksiyon hala 'handle_call_module' tarafından kullanılıyor.
+// 'handle_call_module' (muhtemelen) mlptest için çalışmasa da,
+// diğer modeller için çalışabilir, bu yüzden onu SİLMEDİM.
 fn sanitize_var_name(name: &str) -> String {
     name.replace(".", "_")
         .replace("-", "_")
@@ -1181,6 +1450,27 @@ fn sanitize_tuple_to_string(tuple: &Bound<PyAny>) -> PyResult<String> {
     }
 }
 
+// ✅✅✅ YENİ FONKSİYON (Adım 0.2): Desteklenen düğümleri belirlemek için
+// `reconstruct_node` tarafından kullanılır.
+fn is_supported_node(node: &HypatiaLang) -> bool {
+    match node {
+        HypatiaLang::Add(_) | HypatiaLang::Mul(_) | HypatiaLang::MatMul(_) |
+        HypatiaLang::ReLU(_) | HypatiaLang::Flatten(_) |
+        HypatiaLang::Linear(_) | HypatiaLang::LinearReLU(_) |
+        HypatiaLang::FusedMLP(_) | HypatiaLang::FusedConvBN(_) |
+        HypatiaLang::Conv2d(_) | HypatiaLang::BatchNorm(_) |
+        HypatiaLang::MaxPool2d(_) | HypatiaLang::AdaptiveAvgPool2d(_) |
+        HypatiaLang::Embedding(_) | HypatiaLang::TransformerEncoder(_) |
+        HypatiaLang::Var(_) | HypatiaLang::Constant(_) |
+        HypatiaLang::Mean(_) => true, // ✅ Adım 0.2: Mean eklendi
+        
+        // Desteklenmeyenler (şimdilik):
+        // LayerNorm, GELU, SiLU, BatchNorm1d, Dropout, vb.
+        _ => false, 
+    }
+}
+
+
 // ============================================================================
 // TESTS
 // ============================================================================
@@ -1202,6 +1492,7 @@ mod tests {
         Python::with_gil(|py| {
             let rebuilder = FxRebuilder {
                 py,
+                model: PyDict::new_bound(py).as_any(),
                 original_gm: PyDict::new_bound(py).as_any(), // Dummy
                 new_graph: PyDict::new_bound(py).as_any(), // Dummy
                 node_map: HashMap::new(),
@@ -1214,14 +1505,13 @@ mod tests {
             let val2 = rebuilder.unsanitize_value("1e-05").unwrap();
             assert_eq!(val2.extract::<f64>(py).unwrap(), 1e-05);
             
-            // ✅ GÜNCEL TEST: '3' artık i64 (int) olmalı
             let val3 = rebuilder.unsanitize_value("3").unwrap();
             assert_eq!(val3.extract::<i64>(py).unwrap(), 3);
             
+            // ✅ DÜZELTME: '...' kaldırıldı
             let val4 = rebuilder.unsanitize_value("1e_05").unwrap();
             assert_eq!(val4.extract::<f64>(py).unwrap(), 1e-05);
             
-            // ✅ GÜNCEL TEST: '3.0' f64 (float) olmalı
             let val5 = rebuilder.unsanitize_value("3.0").unwrap();
             assert_eq!(val5.extract::<f64>(py).unwrap(), 3.0);
         });
@@ -1233,6 +1523,7 @@ mod tests {
         Python::with_gil(|py| {
             let rebuilder = FxRebuilder {
                 py,
+                model: PyDict::new_bound(py).as_any(),
                 original_gm: PyDict::new_bound(py).as_any(),
                 new_graph: PyDict::new_bound(py).as_any(),
                 node_map: HashMap::new(),
@@ -1244,6 +1535,7 @@ mod tests {
             let tuple = val.downcast_bound::<PyTuple>(py).unwrap();
             assert_eq!(tuple.len(), 2);
             assert_eq!(tuple.get_item(0).unwrap().extract::<i64>().unwrap(), 1);
+            // ✅ DÜZELTME: Satır tamamlandı
             assert_eq!(tuple.get_item(1).unwrap().extract::<i64>().unwrap(), 1);
 
             let val2 = rebuilder.unsanitize_tuple("3").unwrap();

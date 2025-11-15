@@ -316,20 +316,26 @@ pub fn is_equivalent(expr1_str: String, expr2_str: String) -> PyResult<bool> {
     }
 }
 
-/// ✅ GÜNCELLENDİ: FX GRAPH COMPILATION (Phase 3)
+/// ✅ GÜNCELLENDİ: FX GRAPH COMPILATION (Nihai Düzeltme)
+/// Python'dan gelen 3 argümanlı çağrıya uyacak şekilde imza düzeltildi.
 #[pyfunction]
 pub fn compile_fx_graph(
-    py_graph_module: PyObject, 
-    _example_inputs: PyObject,
-    module_info_map: &Bound<'_, PyDict>
-) -> PyResult<PyObject> {
+    py_graph_module: PyObject,      // Arg 1: Python'dan gelen `gm` (GraphModule)
+    _example_inputs: PyObject,      // Arg 2: Python'dan gelen `example_inputs` (List)
+    module_info_map: &Bound<'_, PyDict>, // ✅ DÜZELTME: Deprecated uyarısı için &PyDict -> &Bound<'_, PyDict>
+) -> PyResult<Py<PyAny>> {
     Python::with_gil(|py| {
+        // ✅ DÜZELTME: `gm` (GraphModule) 1. argümandır.
         let gm = py_graph_module.bind(py);
+        // ✅ DÜZELTME: `model_bound` (parametreler için) de `gm`'dir.
+        // `sexpr_to_fx_graph` hem grafiğe hem de parametrelere (gm'nin kendisi) ihtiyaç duyar
+        let model_bound = py_graph_module.bind(py); 
         
-        eprintln!("[DEBUG] compile_fx_graph called successfully");
+        // `_example_inputs` (2. argüman) göz ardı edilir.
+        
+        eprintln!("[DEBUG] compile_fx_graph called (Doğru 3-arg Rust signature)");
 
-        // Manuel FromPyObject implementasyonu sayesinde bu çağrı artık
-        // eksik 'is_inference' anahtarı için hata vermeyecektir.
+        // ✅ DÜZELTME: `module_info_map` (Dict) 3. argümandır ve zorunludur.
         let info_map: HashMap<String, ModuleInfo> = module_info_map
             .iter()
             .map(|(k, v)| {
@@ -344,6 +350,7 @@ pub fn compile_fx_graph(
             is_inference: true // Varsayılan
         });
         
+        // Bu çağrı artık `gm`'yi doğru şekilde almalı
         let sexpr = match crate::fx_bridge::fx_graph_to_sexpr(py, &gm, &info_map) {
             Ok(s) => {
                 eprintln!("[DEBUG] S-expression (ilk 500 karakter): {:.500}...", s);
@@ -366,7 +373,8 @@ pub fn compile_fx_graph(
         
         eprintln!("[DEBUG] Optimized AST: {}", crate::egraph_optimizer::rec_to_string(&optimized_ast));
 
-        match crate::fx_bridge::sexpr_to_fx_graph(py, &gm, optimized_ast) {
+        // ✅ DÜZELTME: `sexpr_to_fx_graph`'a `model` ve `gm` olarak `gm`'nin kendisini (farklı binding'lerle) ver
+        match crate::fx_bridge::sexpr_to_fx_graph(py, model_bound, &gm, optimized_ast) {
             Ok(optimized_gm) => {
                 let params: Vec<_> = optimized_gm.bind(py).call_method0("parameters")?.iter()?.collect::<PyResult<_>>()?;
                 if params.is_empty() {
