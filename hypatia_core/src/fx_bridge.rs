@@ -878,6 +878,18 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             })
     }
 
+    /// ✅ Helper: Modülü referans tensörün device'ına taşı
+    /// Bu, CUDA tensörlerle çalışırken critical!
+    fn move_module_to_tensor_device(
+        &self,
+        module: &Bound<'py, PyAny>,
+        tensor: &Bound<'py, PyAny>,
+    ) -> PyResult<()> {
+        let device = tensor.getattr("device")?;
+        module.call_method1("to", (device,))?;
+        Ok(())
+    }
+
     /// ✅ YENİ: Canonical parameter name al
     /// Parametre ismini desanitize eder ("l_self_modules_fc1_parameters_weight_" → "fc1.weight")
     /// Değilse sanitized var name döner ("l_x_")
@@ -1245,6 +1257,11 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let embedding_dim = w_shape[1];
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
         let embedding_module = torch_nn.getattr("Embedding")?.call1((num_embeddings, embedding_dim))?;
+
+        // ✅ CRITICAL: Modülü weight'in device'ına taşı (CUDA support için)
+        self.move_module_to_tensor_device(&embedding_module, &w_tensor)?;
+
+        // Artık aynı device'tayız, copy yapabiliriz!
         embedding_module.getattr("weight")?.getattr("data")?.call_method1("copy_", (w_tensor,))?;
         
         self.param_map.insert(module_target_name.clone(), embedding_module.to_object(self.py));
@@ -1298,7 +1315,10 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
         let linear_module = torch_nn.getattr("Linear")?.call1((in_features, out_features))?;
 
-        // 4. ✅ PARAMETRELERİ (Tensörleri) KOPYALA
+        // 3.5. ✅ CRITICAL: Modülü weight'in device'ına taşı (CUDA support için)
+        self.move_module_to_tensor_device(&linear_module, &weight_tensor)?;
+
+        // 4. ✅ PARAMETRELERİ (Tensörleri) KOPYALA (artık aynı device'tayız!)
         linear_module.getattr("weight")?.call_method1("copy_", (weight_tensor,))?;
         if let Some(bias_t) = bias_tensor {
             linear_module.getattr("bias")?.call_method1("copy_", (bias_t,))?;
@@ -1360,7 +1380,10 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             Some(&kwargs)
         )?;
 
-        // 4. ✅ PARAMETRELERİ (Tensörleri) KOPYALA
+        // 3.5. ✅ CRITICAL: Modülü weight'in device'ına taşı (CUDA support için)
+        self.move_module_to_tensor_device(&conv_module, &weight_tensor)?;
+
+        // 4. ✅ PARAMETRELERİ (Tensörleri) KOPYALA (artık aynı device'tayız!)
         conv_module.getattr("weight")?.call_method1("copy_", (weight_tensor,))?;
         if let Some(bias_t) = bias_tensor {
             conv_module.getattr("bias")?.call_method1("copy_", (bias_t,))?;
@@ -1464,7 +1487,14 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             Some(&kwargs)
         )?;
 
-        // 5. ✅ PARAMETRELERİ (Tensörleri) KOPYALA
+        // 4.5. ✅ CRITICAL: Modülü referans tensörün device'ına taşı (CUDA support için)
+        if let Some(ref weight) = weight_tensor {
+            self.move_module_to_tensor_device(&ln_module, weight)?;
+        } else if let Some(ref bias) = bias_tensor {
+            self.move_module_to_tensor_device(&ln_module, bias)?;
+        }
+
+        // 5. ✅ PARAMETRELERİ (Tensörleri) KOPYALA (artık aynı device'tayız!)
         if let Some(weight) = weight_tensor {
             ln_module.getattr("weight")?.call_method1("copy_", (weight,))?;
         }
@@ -1579,6 +1609,10 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             Some(&kwargs)
         )?;
 
+        // ✅ CRITICAL: Modülü weight'in device'ına taşı (CUDA support için)
+        self.move_module_to_tensor_device(&bn_module, &w_tensor)?;
+
+        // Artık aynı device'tayız, copy yapabiliriz!
         bn_module.getattr("weight")?.getattr("data")?.call_method1("copy_", (w_tensor,))?;
         bn_module.getattr("bias")?.getattr("data")?.call_method1("copy_", (b_tensor,))?;
         bn_module.getattr("running_mean")?.getattr("data")?.call_method1("copy_", (mean_tensor,))?;
@@ -1678,10 +1712,6 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let in_channels = w_c_shape[1] * groups_val;
         let kernel_size = (w_c_shape[2], w_c_shape[3]).to_object(self.py);
 
-        // 8) Preserve device and dtype from original conv weight
-        let device = w_c.getattr("device")?;
-        let dtype = w_c.getattr("dtype")?;
-
         log::debug!("Creating fused Conv2d: in={}, out={}, kernel={:?}, stride={:?}, groups={}",
                     in_channels, out_channels, (w_c_shape[2], w_c_shape[3]),
                     stride, groups_val);
@@ -1700,14 +1730,14 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             Some(&kwargs)
         )?;
 
-        // 10) Copy fused parameters to module
+        // 9.5) ✅ CRITICAL: ÖNCE modülü device'a taşı, SONRA copy yap!
+        // Bu sayede CPU→CUDA copy hatası almayız
+        self.move_module_to_tensor_device(&fused_conv, &w_c)?;
+
+        // 10) Copy fused parameters to module (artık aynı device'tayız!)
         // Note: copy_ preserves dtype automatically
         fused_conv.getattr("weight")?.getattr("data")?.call_method1("copy_", (w_fused,))?;
         fused_conv.getattr("bias")?.getattr("data")?.call_method1("copy_", (b_fused,))?;
-
-        // 11) Move module to original device if needed
-        // (Usually not necessary as GraphModule is on CPU, but safer to preserve)
-        fused_conv.call_method1("to", (device,))?;
 
         // 12) Register fused module in param_map and create FX node
         let module_target_name = format!("fused_conv_bn_{}", self.param_map.len());
