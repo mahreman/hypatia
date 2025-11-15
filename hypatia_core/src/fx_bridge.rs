@@ -861,6 +861,18 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 let input_node = self.reconstruct_node(*x_id, expr)?;
                 self.build_embedding_module(node_id, expr, *w_id, input_node, "embedding")
             }
+            // ✅ YENİ: GELU aktivasyon
+            HypatiaLang::GELU(x_id) => {
+                self.reconstruct_gelu(*x_id, expr)
+            }
+            // ✅ YENİ: SiLU/Swish aktivasyon
+            HypatiaLang::SiLU(x_id) => {
+                self.reconstruct_silu(*x_id, expr)
+            }
+            // ✅ YENİ: LayerNorm ile parametre kopyalama
+            HypatiaLang::LayerNorm([w_id, b_id, x_id, eps_id]) => {
+                self.reconstruct_layernorm(*w_id, *b_id, *x_id, *eps_id, expr)
+            }
 
             // ✅ YENİ: (linear-relu w b x) -> nn.ReLU(nn.Linear(x, w, b))
             // Parametre kopyalama ile nn.Linear ve nn.ReLU modülleri oluştur
@@ -1160,6 +1172,114 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
         let new_node = self.new_graph.call_method(
             "create_node", ("call_module", module_target_name, args_tuple), None
+        )?;
+        Ok(new_node.to_object(self.py))
+    }
+
+    // ✅ YENİ FONKSİYON: reconstruct_gelu() - GELU aktivasyon
+    fn reconstruct_gelu(&mut self, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+
+        // GELU modül oluştur (parametre yok)
+        let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
+        let gelu_module = torch_nn.getattr("GELU")?.call0()?;
+
+        // Module map'e ekle ve node oluştur
+        let module_name = format!("gelu_{}", self.param_map.len());
+        self.param_map.insert(module_name.clone(), gelu_module.to_object(self.py));
+
+        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
+        let new_node = self.new_graph.call_method(
+            "create_node", ("call_module", module_name, args_tuple), None
+        )?;
+        Ok(new_node.to_object(self.py))
+    }
+
+    // ✅ YENİ FONKSİYON: reconstruct_silu() - SiLU/Swish aktivasyon
+    fn reconstruct_silu(&mut self, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+
+        // SiLU modül oluştur (parametre yok)
+        let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
+        let silu_module = torch_nn.getattr("SiLU")?.call0()?;
+
+        // Module map'e ekle ve node oluştur
+        let module_name = format!("silu_{}", self.param_map.len());
+        self.param_map.insert(module_name.clone(), silu_module.to_object(self.py));
+
+        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
+        let new_node = self.new_graph.call_method(
+            "create_node", ("call_module", module_name, args_tuple), None
+        )?;
+        Ok(new_node.to_object(self.py))
+    }
+
+    // ✅ YENİ FONKSİYON: reconstruct_layernorm() - LayerNorm ile parametre kopyalama
+    fn reconstruct_layernorm(&mut self, w_id: Id, b_id: Id, x_id: Id, eps_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+
+        // 1. Orijinal parametreleri al
+        let w_full_name = self.get_var_name(w_id, expr)?;
+        let b_full_name = self.get_var_name(b_id, expr)?;
+
+        let has_weight = w_full_name != "none";
+        let has_bias = b_full_name != "none";
+
+        let original_weight = if has_weight {
+            Some(self.model.getattr(&*w_full_name)
+                .map_err(|e| HypatiaError::new_err(format!("LayerNorm weight '{}' not found: {}", w_full_name, e)))?)
+        } else {
+            None
+        };
+
+        let original_bias = if has_bias {
+            Some(self.model.getattr(&*b_full_name)
+                .map_err(|e| HypatiaError::new_err(format!("LayerNorm bias '{}' not found: {}", b_full_name, e)))?)
+        } else {
+            None
+        };
+
+        // 2. Shape'ten normalized_shape çıkar
+        let normalized_shape = if let Some(ref weight) = original_weight {
+            let w_shape = weight.getattr("shape")?;
+            w_shape.extract::<Vec<i64>>()?
+        } else if let Some(ref bias) = original_bias {
+            let b_shape = bias.getattr("shape")?;
+            b_shape.extract::<Vec<i64>>()?
+        } else {
+            return Err(HypatiaError::new_err("LayerNorm: Both weight and bias are 'none'"));
+        };
+
+        // 3. eps değerini al
+        let eps_str = self.get_var_name(eps_id, expr)?;
+        let eps_value = self.unsanitize_value(&eps_str)?;
+
+        // 4. LayerNorm modül oluştur
+        let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
+        let kwargs = PyDict::new_bound(self.py);
+        kwargs.set_item("eps", eps_value)?;
+        kwargs.set_item("elementwise_affine", has_weight || has_bias)?;
+
+        let ln_module = torch_nn.getattr("LayerNorm")?.call(
+            (normalized_shape,),
+            Some(&kwargs)
+        )?;
+
+        // 5. ✅ PARAMETRELERİ KOPYALA
+        if let Some(weight_tensor) = original_weight {
+            ln_module.getattr("weight")?.call_method1("copy_", (weight_tensor,))?;
+        }
+        if let Some(bias_tensor) = original_bias {
+            ln_module.getattr("bias")?.call_method1("copy_", (bias_tensor,))?;
+        }
+
+        // 6. Module map'e ekle ve node oluştur
+        let module_name = format!("layernorm_{}", self.param_map.len());
+        self.param_map.insert(module_name.clone(), ln_module.to_object(self.py));
+
+        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
+        let new_node = self.new_graph.call_method(
+            "create_node", ("call_module", module_name, args_tuple), None
         )?;
         Ok(new_node.to_object(self.py))
     }
@@ -1500,11 +1620,12 @@ fn is_supported_node(node: &HypatiaLang) -> bool {
         HypatiaLang::MaxPool2d(_) | HypatiaLang::AdaptiveAvgPool2d(_) |
         HypatiaLang::Embedding(_) | HypatiaLang::TransformerEncoder(_) |
         HypatiaLang::Var(_) | HypatiaLang::Constant(_) |
-        HypatiaLang::Mean(_) => true, // ✅ Adım 0.2: Mean eklendi
-        
+        HypatiaLang::Mean(_) | // ✅ Adım 0.2: Mean eklendi
+        HypatiaLang::GELU(_) | HypatiaLang::SiLU(_) | HypatiaLang::LayerNorm(_) => true, // ✅ Task 1.4: GELU, SiLU, LayerNorm eklendi
+
         // Desteklenmeyenler (şimdilik):
-        // LayerNorm, GELU, SiLU, BatchNorm1d, Dropout, vb.
-        _ => false, 
+        // BatchNorm1d, Dropout, vb.
+        _ => false,
     }
 }
 
