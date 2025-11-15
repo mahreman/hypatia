@@ -7,14 +7,18 @@ import hypatia_core  # Rust modülünüz
 # --- HYPATIA BACKEND KAYDI ---
 print("--- 'hypatia' backend'i PyTorch Dynamo'ya kaydediliyor... ---")
 
+# Global değişken ile orijinal modeli sakla
+_original_model = None
+
 @dynamo.register_backend
 def hypatia(gm: torch.fx.GraphModule, example_inputs: list):
     """
     Bu, torch.compile'ın çağıracağı köprü fonksiyondur.
     Rust fonksiyonumuzun beklediği 'module_info_map' argümanını hazırlar.
     """
+    global _original_model
     print("\n[Hypatia] Backend Wrapper (hypatia) çağrıldı. ModuleInfoMap oluşturuluyor...")
-    
+
     module_info_map = {}
     for name, module in gm.named_modules():
         is_inference = not getattr(module, "training", False)
@@ -26,15 +30,17 @@ def hypatia(gm: torch.fx.GraphModule, example_inputs: list):
             "has_bias": has_bias,
             "is_inference": is_inference,
         }
-        
+
     print(f"[Hypatia] {len(module_info_map)} modül bilgisi toplandı.")
+
+    # Orijinal modeli kullan (global değişkenden)
+    original_model_for_params = _original_model if _original_model is not None else gm
 
     # Hazırlanan argümanlarla asıl Rust fonksiyonunu çağırın
     try:
-        print(f"[Hypatia] GraphModule attributes: {[x for x in dir(gm) if not x.startswith('__')][:20]}")
-        print(f"[Hypatia] Has _orig_mod: {hasattr(gm, '_orig_mod')}")
         compiled_gm = hypatia_core.compile_fx_graph(
-            gm,
+            gm,  # GraphModule (graph için)
+            original_model_for_params,  # ✅ YENİ: Orijinal model (parametreler için)
             example_inputs,
             module_info_map
         )
@@ -82,6 +88,7 @@ BENCH_ITER = 100
 # --- BENCHMARK ÇALIŞTIRMA ---
 print(f"\n--- torch.compile(backend='hypatia') çağrılıyor (Model: MLP)... ---")
 try:
+    _original_model = model  # ✅ Orijinal modeli sakla
     optimized = torch.compile(model, backend="hypatia")
     print("--- torch.compile başarılı! ---")
 
