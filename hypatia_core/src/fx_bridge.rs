@@ -1113,13 +1113,11 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         &mut self, _node_id: Id, expr: &RecExpr<HypatiaLang>,
         w_id: Id, input_node: PyObject, prefix: &str,
     ) -> PyResult<PyObject> {
-        // ✅ DÜZELTME: (Kullanıcının isteği)
-        let w_full_name = self.get_var_name(w_id, expr)?; // "l_self_..._weight_"
-        let module_target_name = format!("{}_{}", prefix, self.param_map.len());
+        // Get canonical param name and tensor
+        let w_real_name = self.get_canonical_param_name(w_id, expr)?; // "embedding.weight"
+        let w_tensor = self.get_param_tensor(&w_real_name)?;
 
-        // ✅ DÜZELTME: Doğrudan getattr & &*String
-        let w_tensor = self.model.getattr(&*w_full_name)
-            .map_err(|e| HypatiaError::new_err(format!("Tensor get failed for {}: {}", w_full_name, e)))?;
+        let module_target_name = format!("{}_{}", prefix, self.param_map.len());
         
         // ✅ DÜZELTME: .getattr(self.py, "shape")? -> .getattr("shape")?
         let w_shape_py = w_tensor.getattr("shape")?;
@@ -1435,21 +1433,21 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         &mut self, _node_id: Id, expr: &RecExpr<HypatiaLang>,
         w_id: Id, b_id: Id, m_id: Id, v_id: Id, input_node: PyObject, eps_id: Id
     ) -> PyResult<PyObject> {
-        // ✅ DÜZELTME: (Kullanıcının isteği)
-        let w_full_name = self.get_var_name(w_id, expr)?;
-        let b_full_name = self.get_var_name(b_id, expr)?;
-        let mean_full_name = self.get_var_name(m_id, expr)?;
-        let var_full_name = self.get_var_name(v_id, expr)?;
-        let eps_str = self.get_var_name(eps_id, expr)?; 
+        // Get canonical param names and tensors
+        let w_real_name = self.get_canonical_param_name(w_id, expr)?;
+        let b_real_name = self.get_canonical_param_name(b_id, expr)?;
+        let mean_real_name = self.get_canonical_param_name(m_id, expr)?;
+        let var_real_name = self.get_canonical_param_name(v_id, expr)?;
 
-        eprintln!("[DEBUG] BatchNorm resolved names: weight={}, bias={}, mean={}, var={}", 
-            w_full_name, b_full_name, mean_full_name, var_full_name);
+        eprintln!("[DEBUG] BatchNorm resolved names: weight={}, bias={}, mean={}, var={}",
+            w_real_name, b_real_name, mean_real_name, var_real_name);
 
-        // ✅ DÜZELTME: Doğrudan getattr & &*String
-        let w_tensor = self.model.getattr(&*w_full_name)?;
-        let b_tensor = self.model.getattr(&*b_full_name)?;
-        let mean_tensor = self.model.getattr(&*mean_full_name)?;
-        let var_tensor = self.model.getattr(&*var_full_name)?;
+        let w_tensor = self.get_param_tensor(&w_real_name)?;
+        let b_tensor = self.get_param_tensor(&b_real_name)?;
+        let mean_tensor = self.get_param_tensor(&mean_real_name)?;
+        let var_tensor = self.get_param_tensor(&var_real_name)?;
+
+        let eps_str = self.get_var_name(eps_id, expr)?;
         let eps = self.unsanitize_value(&eps_str)?;
         
         // ✅ DÜZELTME: .getattr(self.py, "shape")? -> .getattr("shape")?
@@ -1487,60 +1485,52 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     
     fn build_fused_conv_bn_module(
         &mut self, _node_id: Id, expr: &RecExpr<HypatiaLang>,
-        input_node: PyObject, 
-        w_c_id: Id, b_c_id: Id, w_bn_id: Id, b_bn_id: Id, 
+        input_node: PyObject,
+        w_c_id: Id, b_c_id: Id, w_bn_id: Id, b_bn_id: Id,
         m_id: Id, v_id: Id, eps_id: Id,
-        s_id: Id, p_id: Id, d_id: Id, g_id: Id 
+        s_id: Id, p_id: Id, d_id: Id, g_id: Id
     ) -> PyResult<PyObject> {
-        
+
         eprintln!("[DEBUG] Building Fused Conv-BN module...");
 
-        // ✅ DÜZELTME: (Kullanıcının isteği)
-        let w_c_name = self.get_var_name(w_c_id, expr)?; // "l_self_..._conv_weight_"
-        let b_c_name = self.get_var_name(b_c_id, expr)?; 
-        let w_bn_name = self.get_var_name(w_bn_id, expr)?; // "l_self_..._bn_weight_"
-        let b_bn_name = self.get_var_name(b_bn_id, expr)?; 
-        let m_name = self.get_var_name(m_id, expr)?; // "l_self_..._bn_running_mean_"
-        let v_name = self.get_var_name(v_id, expr)?; 
-        let eps_str = self.get_var_name(eps_id, expr)?; 
-        
-        let torch = PyModule::import_bound(self.py, "torch")?;
-        
-        // ✅ DÜZELTME: Doğrudan getattr & &*String
-        let w_c = self.model.getattr(&*w_c_name)?;
+        // Get canonical param names
+        let b_c_name = self.get_var_name(b_c_id, expr)?;
         let b_c_exists = b_c_name != "none";
 
-        eprintln!("[DEBUG] FusedConvBN resolved keys: conv_w={}, bn_w={}, bn_m={}, bn_v={}", 
-            w_c_name, w_bn_name, m_name, v_name);
-        
-        // ✅ DÜZELTME: &*String
-        let w_bn = self.model.getattr(&*w_bn_name)?;
-        let b_bn = self.model.getattr(&*b_bn_name)?;
-        let m = self.model.getattr(&*m_name)?;
-        let v = self.model.getattr(&*v_name)?;
+        let w_c_real_name = self.get_canonical_param_name(w_c_id, expr)?;
+        let w_bn_real_name = self.get_canonical_param_name(w_bn_id, expr)?;
+        let b_bn_real_name = self.get_canonical_param_name(b_bn_id, expr)?;
+        let m_real_name = self.get_canonical_param_name(m_id, expr)?;
+        let v_real_name = self.get_canonical_param_name(v_id, expr)?;
 
-        // ✅ DÜZELTME: .extract(self.py)? (PyObject üzerinde çağrılıyor)
+        eprintln!("[DEBUG] FusedConvBN resolved keys: conv_w={}, bn_w={}, bn_m={}, bn_v={}",
+            w_c_real_name, w_bn_real_name, m_real_name, v_real_name);
+
+        // Get tensors
+        let torch = PyModule::import_bound(self.py, "torch")?;
+
+        let w_c = self.get_param_tensor(&w_c_real_name)?;
+        let w_bn = self.get_param_tensor(&w_bn_real_name)?;
+        let b_bn = self.get_param_tensor(&b_bn_real_name)?;
+        let m = self.get_param_tensor(&m_real_name)?;
+        let v = self.get_param_tensor(&v_real_name)?;
+
+        let eps_str = self.get_var_name(eps_id, expr)?;
         let eps = self.unsanitize_value(&eps_str)?.extract::<f64>(self.py)?;
 
-        // ✅ DÜZELTME: call_method (self.py) kaldırıldı
         let sqrt_var = v.call_method1("add", (eps,))?.call_method0("sqrt")?;
         let scale = w_bn.call_method1("div", (sqrt_var,))?;
 
-        // ✅ DÜZELTME: .getattr(self.py, "shape")? -> .getattr("shape")?
-        // ✅ DÜZELTME: .extract(self.py)? -> .extract()?
         let w_c_shape = w_c.getattr("shape")?.extract::<Vec<usize>>()?;
         let scale_shape: Vec<isize> = vec![-1, 1, 1, 1];
-        // ✅ DÜZELTME: call_method (self.py) kaldırıldı
         let scale_broadcast = scale.call_method1("view", (scale_shape,))?;
-        
-        // ✅ DÜZELTME: call_method (self.py) kaldırıldı
+
         let w_fused = w_c.call_method1("mul", (scale_broadcast,))?;
 
         let b_c_val = if b_c_exists {
-            // ✅ DÜZELTME: Doğrudan getattr & &*String
-            self.model.getattr(&*b_c_name)?
+            let b_c_real_name = self.get_canonical_param_name(b_c_id, expr)?;
+            self.get_param_tensor(&b_c_real_name)?
         } else {
-            // ✅ DÜZELTME: (E0308) .to_object(self.py) kaldırıldı
             torch.call_method1("zeros_like", (m.clone(),))?
         };
         
