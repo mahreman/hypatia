@@ -376,6 +376,9 @@ pub fn compile_fx_graph(
             Ok(optimized_gm) => {
                 // ✅ YENİ: Gelişmiş parametre doğrulama mekanizması
 
+                // Read checksum validation mode from environment
+                let checksum_mode = crate::fx_bridge::ChecksumMode::from_env();
+
                 // 1. Orijinal ve optimize edilmiş parametreleri al
                 let original_params: Vec<_> = gm.call_method0("parameters")?
                     .iter()?
@@ -384,55 +387,66 @@ pub fn compile_fx_graph(
                     .iter()?
                     .collect::<PyResult<_>>()?;
 
-                // 2. Parametre sayısı kontrolü
+                // 2. Always check parameter count (critical structural validation)
                 if original_params.len() != optimized_params.len() {
                     log::error!("Parameter count mismatch during reconstruction: {} → {}. Falling back to original model.",
                                 original_params.len(), optimized_params.len());
                     return Ok(gm.to_object(py));
                 }
 
-                // 3. Boş model kontrolü (önceki davranışı koru)
+                // 3. Always check for empty model (critical structural validation)
                 if optimized_params.is_empty() && !original_params.is_empty() {
                     log::error!("Optimized model has no parameters (original had {}). Falling back to original model.",
                                 original_params.len());
                     return Ok(gm.to_object(py));
                 }
 
-                // 4. Parametre checksum kontrolü
-                let mut mismatch_count = 0;
-                for (i, (orig, opt)) in original_params.iter().zip(optimized_params.iter()).enumerate() {
-                    // PyTorch tensor'lerin sum() methodunu kullan
-                    let orig_sum_result = orig.call_method0("sum");
-                    let opt_sum_result = opt.call_method0("sum");
+                // 4. Parametre checksum kontrolü (mode-dependent)
+                match checksum_mode {
+                    crate::fx_bridge::ChecksumMode::Off => {
+                        // Skip checksum validation entirely
+                        log::info!("Checksum validation skipped (mode: Off). Accepting optimized model with {} params.",
+                                   original_params.len());
+                        Ok(optimized_gm)
+                    }
+                    crate::fx_bridge::ChecksumMode::Soft | crate::fx_bridge::ChecksumMode::Strict => {
+                        // Perform checksum validation
+                        let mut mismatch_count = 0;
+                        for (i, (orig, opt)) in original_params.iter().zip(optimized_params.iter()).enumerate() {
+                            // PyTorch tensor'lerin sum() methodunu kullan
+                            let orig_sum_result = orig.call_method0("sum");
+                            let opt_sum_result = opt.call_method0("sum");
 
-                    if let (Ok(orig_sum_obj), Ok(opt_sum_obj)) = (orig_sum_result, opt_sum_result) {
-                        // .item() ile Python scalar'ı al, sonra f32'ye çevir
-                        let orig_sum_item = orig_sum_obj.call_method0("item")?;
-                        let opt_sum_item = opt_sum_obj.call_method0("item")?;
+                            if let (Ok(orig_sum_obj), Ok(opt_sum_obj)) = (orig_sum_result, opt_sum_result) {
+                                // .item() ile Python scalar'ı al, sonra f32'ye çevir
+                                let orig_sum_item = orig_sum_obj.call_method0("item")?;
+                                let opt_sum_item = opt_sum_obj.call_method0("item")?;
 
-                        if let (Ok(orig_sum), Ok(opt_sum)) = (
-                            orig_sum_item.extract::<f32>(),
-                            opt_sum_item.extract::<f32>()
-                        ) {
-                            let diff = (orig_sum - opt_sum).abs();
-                            if diff > 1e-3 {
-                                log::warn!("Parameter #{} checksum mismatch: {:.6} vs {:.6} (diff: {:.6})",
-                                           i, orig_sum, opt_sum, diff);
-                                mismatch_count += 1;
+                                if let (Ok(orig_sum), Ok(opt_sum)) = (
+                                    orig_sum_item.extract::<f32>(),
+                                    opt_sum_item.extract::<f32>()
+                                ) {
+                                    let diff = (orig_sum - opt_sum).abs();
+                                    if diff > 1e-3 {
+                                        log::warn!("Parameter #{} checksum mismatch: {:.6} vs {:.6} (diff: {:.6})",
+                                                   i, orig_sum, opt_sum, diff);
+                                        mismatch_count += 1;
+                                    }
+                                }
                             }
                         }
+
+                        if mismatch_count > 0 {
+                            log::error!("{} out of {} parameters have checksum mismatches. Falling back to original model.",
+                                        mismatch_count, original_params.len());
+                            return Ok(gm.to_object(py));
+                        }
+
+                        // 5. Tüm doğrulamalar başarılı
+                        log::info!("Parameter preservation verified: {} params", original_params.len());
+                        Ok(optimized_gm)
                     }
                 }
-
-                if mismatch_count > 0 {
-                    log::error!("{} out of {} parameters have checksum mismatches. Falling back to original model.",
-                                mismatch_count, original_params.len());
-                    return Ok(gm.to_object(py));
-                }
-
-                // 5. Tüm doğrulamalar başarılı
-                log::info!("Parameter preservation verified: {} params", original_params.len());
-                Ok(optimized_gm)
             }
             Err(err) => {
                 log::error!("Graph reconstruction failed: {:?}. Falling back to original GraphModule.", err);

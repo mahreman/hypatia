@@ -6,6 +6,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyTuple, PyDict, PyModule};
 use crate::python_bindings::{HypatiaError, ModuleInfo};
 use std::collections::HashMap;
+use std::env;
 
 use egg::{RecExpr, Id};
 use crate::egraph_optimizer::HypatiaLang;
@@ -19,6 +20,48 @@ use crate::egraph_optimizer::HypatiaLang;
 
 // ❌ KALDIRILDI: normalize_placeholder (Artık kullanılmıyor)
 // fn normalize_placeholder(name: &str) -> String { ... }
+
+// ============================================================================
+// CHECKSUM VALIDATION MODE
+// ============================================================================
+
+/// Parameter checksum validation mode
+/// - Off: No checksum validation (fastest, least safe)
+/// - Soft: Checksum only for non-structural optimizations (balanced)
+/// - Strict: Always validate checksums, fallback on mismatch (safest, slowest)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumMode {
+    Off,
+    Soft,
+    Strict,
+}
+
+impl ChecksumMode {
+    /// Read checksum mode from HYPATIA_CHECKSUM_MODE environment variable
+    /// - "off" or "0" → Off
+    /// - "strict" or "2" → Strict
+    /// - "soft" or "1" or default → Soft
+    pub fn from_env() -> Self {
+        let val = env::var("HYPATIA_CHECKSUM_MODE")
+            .unwrap_or_else(|_| "soft".to_string())
+            .to_lowercase();
+
+        match val.as_str() {
+            "off" | "0" => {
+                log::info!("Checksum mode: Off (no validation)");
+                ChecksumMode::Off
+            }
+            "strict" | "2" => {
+                log::info!("Checksum mode: Strict (always validate)");
+                ChecksumMode::Strict
+            }
+            _ => {
+                log::info!("Checksum mode: Soft (validate non-structural optimizations)");
+                ChecksumMode::Soft
+            }
+        }
+    }
+}
 
 
 // ============================================================================
