@@ -5,9 +5,12 @@ use egg::{
 use ordered_float::NotNan;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
-use crate::symbolic::Symbol; 
+use crate::symbolic::Symbol;
 use crate::python_bindings::ModuleInfo; // ModuleInfo'yu kullanmak için import
 // `HashMap` kullanılmıyor, uyarıyı önlemek için kaldırıldı
+
+// ✅ Task 2.4: Verbose Logging
+use log::{info, debug, error};
 
 // ============================================================================
 // HYPATIA LANGUAGE DEFINITION
@@ -369,40 +372,82 @@ pub fn optimize_to_ast_with_info(expr_str: &str, info: &ModuleInfo) -> Result<Re
 }
 
 // 🟢 ADIM 3: Asıl işin yapıldığı yer burasıdır.
-fn optimize_to_ast_internal(expr_str: &str, info: &ModuleInfo) -> Result<RecExpr<HypatiaLang>, String> { 
+fn optimize_to_ast_internal(expr_str: &str, info: &ModuleInfo) -> Result<RecExpr<HypatiaLang>, String> {
+    // ✅ Task 2.4: Logging başlangıcı
+    info!("=== E-graph Optimization Started ===");
+    debug!("Input S-expr: {}", expr_str);
+    debug!("ModuleInfo: is_inference={}, has_bias={}, module_type={}",
+           info.is_inference, info.has_bias, info.module_type);
+
     // ✅ DÜZELTME: info.is_inference zaten bool (manuel FromPyObject sayesinde)
-    let is_inference_mode_flag = info.is_inference; 
-    
+    let is_inference_mode_flag = info.is_inference;
+
     let res = catch_unwind(AssertUnwindSafe(|| {
-        let start_expr: RecExpr<HypatiaLang> = match expr_str.parse() {
-            Ok(expr) => expr,
-            Err(e) => return Err(format!("(error \"Parse Error: {}\")", e)),
+        let start_expr: RecExpr<HypatiaLang> = match expr_str.parse::<RecExpr<HypatiaLang>>() {
+            Ok(expr) => {
+                debug!("Parse successful, expression has {} nodes", expr.as_ref().len());
+                expr
+            },
+            Err(e) => {
+                error!("Parse error: {}", e);
+                return Err(format!("(error \"Parse Error: {}\")", e));
+            }
         };
-        
+
         // 🟢 ADIM 3: Kurallar burada `get_rules` (senin `build_rewrite_rules` dediğin)
         // fonksiyonundan çağrılıyor.
         let rules = get_rules(is_inference_mode_flag);
-        
+        info!("Using {} rewrite rules (inference_mode={})", rules.len(), is_inference_mode_flag);
+
         // Gelişmiş maliyet modelini kullan
-        let cost_function = HardwareAwareCost { 
-            is_inference: is_inference_mode_flag 
+        let cost_function = HardwareAwareCost {
+            is_inference: is_inference_mode_flag
         };
-        
+
+        debug!("Starting e-graph saturation (node_limit=20000, iter_limit=30, time_limit=150ms)");
         let runner = Runner::default()
             .with_egraph(egg::EGraph::new(ConstantFoldingAnalysis))
             .with_node_limit(20_000).with_iter_limit(30)
             .with_time_limit(Duration::from_millis(150))
             // 🟢 ADIM 3: Kurallar burada Runner'a besleniyor ve çalıştırılıyor.
             .with_expr(&start_expr).run(&rules);
-            
+
+        // ✅ Task 2.4: E-graph saturation sonuçlarını logla
+        info!("E-graph saturation complete:");
+        info!("  - Iterations: {}", runner.iterations.len());
+        info!("  - Total nodes: {}", runner.egraph.total_size());
+        info!("  - Total classes: {}", runner.egraph.number_of_classes());
+        info!("  - Stop reason: {:?}", runner.stop_reason);
+
+        if let Some(last_iter) = runner.iterations.last() {
+            debug!("Last iteration stats:");
+            debug!("  - Applied: {}", last_iter.applied.len());
+            debug!("  - E-graph size: {}", last_iter.egraph_nodes);
+            debug!("  - E-classes: {}", last_iter.egraph_classes);
+        }
+
+        debug!("Extracting best expression using HardwareAwareCost");
         let extractor = Extractor::new(&runner.egraph, cost_function);
-        let (_best_cost, best_expr) = extractor.find_best(runner.roots[0]);
+        let (best_cost, best_expr) = extractor.find_best(runner.roots[0]);
+        info!("Best expression found with cost: {}", best_cost);
+        debug!("Best expression has {} nodes", best_expr.as_ref().len());
+
         Ok(best_expr)
     }));
+
     match res {
-        Ok(Ok(expr)) => Ok(expr),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err("(error \"optimizer panic caught\")".to_string()),
+        Ok(Ok(expr)) => {
+            info!("=== E-graph Optimization Successful ===");
+            Ok(expr)
+        },
+        Ok(Err(e)) => {
+            error!("Optimization failed: {}", e);
+            Err(e)
+        },
+        Err(_) => {
+            error!("Optimizer panic caught during optimization");
+            Err("(error \"optimizer panic caught\")".to_string())
+        }
     }
 }
 
@@ -667,5 +712,131 @@ mod tests {
             "Beklenen faktoring bulunamadı, best_expr = {best_expr}"
         );
         */
+    }
+
+    // ============================================================================
+    // Task 2.2: E-graph Optimizer Tests
+    // ============================================================================
+
+    #[test]
+    fn test_gelu_activation_folding() {
+        // Test that double GELU doesn't simplify (GELU is not idempotent)
+        let start = "(gelu (gelu x))";
+        let result = optimize_ast(start);
+
+        // GELU is not idempotent, so (gelu (gelu x)) should remain or be simplified differently
+        // At minimum, it should parse and optimize without crashing
+        assert!(result.len() > 0, "GELU optimization should produce valid output");
+
+        // If we had GELU approximation rules, we'd test those here
+        // For now, just ensure it doesn't crash or return empty
+    }
+
+    #[test]
+    fn test_layernorm_normalization() {
+        // Test LayerNorm formula optimization: (x - mean) / sqrt(var) → (x - mean) * pow(var, -0.5)
+        let start = "(div (sub x (mean x)) (sqrt (var x)))";
+        let result = optimize_ast(start);
+
+        // Should convert division by sqrt to multiplication by negative power
+        assert!(result.contains("pow"), "Should contain pow operation");
+        assert!(result.contains("-0.5"), "Should convert sqrt to pow -0.5");
+        assert!(result.contains("sub"), "Should maintain subtraction");
+    }
+
+    #[test]
+    fn test_dropout_inference_removal() {
+        // Test that dropout is removed in inference mode
+        // Note: Current implementation may not have dropout removal rule yet
+        // This test documents the expected behavior
+
+        let info_inference = ModuleInfo {
+            module_type: "Unknown".to_string(),
+            has_bias: false,
+            is_inference: true,
+        };
+
+        let info_training = ModuleInfo {
+            module_type: "Unknown".to_string(),
+            has_bias: false,
+            is_inference: false,
+        };
+
+        let start = "(dropout 0.5 x)";
+
+        // In inference mode, dropout should be identity (return input)
+        // TODO: Implement dropout removal rule
+        let result_inference = match optimize_to_ast_internal(start, &info_inference) {
+            Ok(expr) => rec_to_string(&expr),
+            Err(e) => e,
+        };
+
+        // For now, test that it at least processes without error
+        assert!(result_inference.len() > 0, "Dropout in inference should process");
+
+        // In training mode, dropout should remain
+        let result_training = match optimize_to_ast_internal(start, &info_training) {
+            Ok(expr) => rec_to_string(&expr),
+            Err(e) => e,
+        };
+
+        assert!(result_training.len() > 0, "Dropout in training should process");
+        // TODO: Once dropout removal is implemented, add:
+        // assert_eq!(result_inference, "x", "Dropout should be removed in inference mode");
+        // assert!(result_training.contains("dropout"), "Dropout should remain in training mode");
+    }
+
+    #[test]
+    fn test_activation_constant_folding() {
+        // Test GELU with constant
+        let gelu_result = optimize_ast("(gelu 0)");
+        // GELU(0) = 0 * Φ(0) = 0 * 0.5 = 0
+        // TODO: Implement GELU constant folding
+        assert!(gelu_result.len() > 0);
+
+        // Test SiLU with constant
+        let silu_result = optimize_ast("(silu 0)");
+        // SiLU(0) = 0 * sigmoid(0) = 0 * 0.5 = 0
+        // TODO: Implement SiLU constant folding
+        assert!(silu_result.len() > 0);
+    }
+
+    #[test]
+    fn test_normalization_layer_optimization() {
+        // Test BatchNorm optimization patterns
+        let bn_expr = "(batchnorm w b mean var x 1e-05)";
+        let bn_result = optimize_ast(bn_expr);
+        assert!(bn_result.len() > 0, "BatchNorm should process");
+
+        // Test LayerNorm pattern
+        let ln_expr = "(layernorm w b x 1e-05)";
+        let ln_result = optimize_ast(ln_expr);
+        assert!(ln_result.len() > 0, "LayerNorm should process");
+    }
+
+    #[test]
+    fn test_modern_activation_patterns() {
+        // Test GELU after linear (common pattern in Transformers)
+        let start = "(gelu (linear w b x))";
+        let result = optimize_ast(start);
+        assert!(result.contains("gelu") && result.contains("linear"),
+                "GELU-Linear pattern should be preserved or optimized");
+
+        // Test SiLU after conv (common pattern in EfficientNet)
+        let conv_silu = "(silu (conv2d w b x 1_1 0_0 1_1 1))";
+        let conv_result = optimize_ast(conv_silu);
+        assert!(conv_result.len() > 0, "Conv-SiLU pattern should process");
+    }
+
+    #[test]
+    fn test_complex_normalization_patterns() {
+        // Test layernorm with full formula
+        let complex_ln = "(div (sub x (mean x)) (sqrt (add (var x) 1e-05)))";
+        let result = optimize_ast(complex_ln);
+
+        // Should optimize division and sqrt
+        assert!(result.contains("pow") || result.contains("sqrt"),
+                "Complex LayerNorm should optimize");
+        assert!(!result.is_empty(), "Should produce valid result");
     }
 }

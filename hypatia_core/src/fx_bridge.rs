@@ -7,7 +7,7 @@ use pyo3::types::{PyAny, PyTuple, PyDict, PyModule};
 use crate::python_bindings::{HypatiaError, ModuleInfo};
 use std::collections::HashMap;
 
-use egg::{RecExpr, Id, Language}; // `Language` trait'i eklendi (E0599)
+use egg::{RecExpr, Id};
 use crate::egraph_optimizer::HypatiaLang;
 
 // ❌ KALDIRILDI: Regex bağımlılıkları (Artık kullanılmıyor)
@@ -802,8 +802,8 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 self.build_call_function("add", &[a_node, b_node], None)
             }
             HypatiaLang::Conv2d([w_id, b_id, x_id, s_id, p_id, d_id, g_id]) => {
-                let input_node = self.reconstruct_node(*x_id, expr)?;
-                self.build_conv2d_module(node_id, expr, *w_id, *b_id, input_node, *s_id, *p_id, *d_id, *g_id)
+                // ✅ YENİ: reconstruct_conv2d kullanarak parametre kopyalama ile nn.Conv2d modülü oluştur
+                self.reconstruct_conv2d(*w_id, *b_id, *x_id, *s_id, *p_id, *d_id, *g_id, expr)
             }
             HypatiaLang::BatchNorm([w_id, b_id, m_id, v_id, x_id, eps_id]) => {
                 let input_node = self.reconstruct_node(*x_id, expr)?;
@@ -860,6 +860,18 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             HypatiaLang::Embedding([w_id, x_id]) => {
                 let input_node = self.reconstruct_node(*x_id, expr)?;
                 self.build_embedding_module(node_id, expr, *w_id, input_node, "embedding")
+            }
+            // ✅ YENİ: GELU aktivasyon
+            HypatiaLang::GELU(x_id) => {
+                self.reconstruct_gelu(*x_id, expr)
+            }
+            // ✅ YENİ: SiLU/Swish aktivasyon
+            HypatiaLang::SiLU(x_id) => {
+                self.reconstruct_silu(*x_id, expr)
+            }
+            // ✅ YENİ: LayerNorm ile parametre kopyalama
+            HypatiaLang::LayerNorm([w_id, b_id, x_id, eps_id]) => {
+                self.reconstruct_layernorm(*w_id, *b_id, *x_id, *eps_id, expr)
             }
 
             // ✅ YENİ: (linear-relu w b x) -> nn.ReLU(nn.Linear(x, w, b))
@@ -954,16 +966,29 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 let b_node = self.reconstruct_node(*b, expr)?;
                 self.build_call_function("mul", &[a_node, b_node], None)
             },
-            
-            _ => { 
-                eprintln!("[WARNING] Unsupported node in reconstruction, falling back to first child: {:?}", node);
-                if node.children().is_empty() {
-                    return Err(HypatiaError::new_err(format!("Unsupported node with no children: {:?}", node)));
+
+            // ========== Catch-all: Unsupported Operations ==========
+            _ => {
+                // Check if this operation is marked as supported in is_supported_node()
+                if is_supported_node(node) {
+                    // Operation is supported but reconstruction not implemented
+                    eprintln!("[ERROR] Reconstruction not implemented for supported operation: {:?}", node);
+                    Err(HypatiaError::new_err(format!(
+                        "Reconstruction not implemented for supported operation: {:?}. \
+                         This is a bug - the operation is marked as supported but has no reconstruction handler.",
+                        node
+                    )))
+                } else {
+                    // Operation is truly unsupported
+                    eprintln!("[ERROR] Attempted to reconstruct unsupported operation: {:?}", node);
+                    Err(HypatiaError::new_err(format!(
+                        "Unsupported operation in reconstruction: {:?}. \
+                         This operation is not currently supported by Hypatia's optimizer.",
+                        node
+                    )))
                 }
-                // Fallback: İlk çocuğu (girdiyi) döndür
-                return self.reconstruct_node(*node.children().first().unwrap(), expr);
             }
-            
+
         }?;
         self.node_map.insert(node_id, new_node_obj.clone_ref(self.py));
         Ok(new_node_obj)
@@ -1099,6 +1124,179 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         Ok(new_node.to_object(self.py))
     }
 
+    // ✅ YENİ FONKSİYON: reconstruct_conv2d() - Parametre kopyalama ile
+    fn reconstruct_conv2d(&mut self, w_id: Id, b_id: Id, x_id: Id, s_id: Id, p_id: Id, d_id: Id, g_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+
+        // 1. Orijinal parametreleri al
+        let w_full_name = self.get_var_name(w_id, expr)?;
+        let b_full_name = self.get_var_name(b_id, expr)?;
+
+        let original_weight = self.model.getattr(&*w_full_name)
+            .map_err(|e| HypatiaError::new_err(format!("Weight '{}' not found: {}", w_full_name, e)))?;
+
+        let has_bias = b_full_name != "none";
+        let original_bias = if has_bias {
+            Some(self.model.getattr(&*b_full_name)
+                .map_err(|e| HypatiaError::new_err(format!("Bias '{}' not found: {}", b_full_name, e)))?)
+        } else {
+            None
+        };
+
+        // 2. Shape bilgisini ve hyperparametreleri çıkar
+        let weight_shape = original_weight.getattr("shape")?;
+        let out_channels: i64 = weight_shape.get_item(0)?.extract()?;
+        let in_channels_per_group: i64 = weight_shape.get_item(1)?.extract()?;
+        let kernel_h: i64 = weight_shape.get_item(2)?.extract()?;
+        let kernel_w: i64 = weight_shape.get_item(3)?.extract()?;
+
+        let stride = self.unsanitize_tuple(&self.get_var_name(s_id, expr)?)?;
+        let padding = self.unsanitize_tuple(&self.get_var_name(p_id, expr)?)?;
+        let dilation = self.unsanitize_tuple(&self.get_var_name(d_id, expr)?)?;
+        let groups = self.unsanitize_value(&self.get_var_name(g_id, expr)?)?;
+
+        let in_channels = in_channels_per_group * groups.extract::<i64>(self.py)?;
+        let kernel_size = (kernel_h, kernel_w).to_object(self.py);
+
+        // 3. Yeni Conv2d modül oluştur
+        let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
+        let kwargs = PyDict::new_bound(self.py);
+        kwargs.set_item("stride", stride)?;
+        kwargs.set_item("padding", padding)?;
+        kwargs.set_item("dilation", dilation)?;
+        kwargs.set_item("groups", groups)?;
+        kwargs.set_item("bias", has_bias)?;
+
+        let conv_module = torch_nn.getattr("Conv2d")?.call(
+            (in_channels, out_channels, kernel_size),
+            Some(&kwargs)
+        )?;
+
+        // 4. ✅ PARAMETRELERİ KOPYALA
+        conv_module.getattr("weight")?.call_method1("copy_", (original_weight,))?;
+        if let Some(bias_tensor) = original_bias {
+            conv_module.getattr("bias")?.call_method1("copy_", (bias_tensor,))?;
+        }
+
+        // 5. Module map'e ekle ve node oluştur
+        let module_target_name = format!("conv2d_{}", self.param_map.len());
+        self.param_map.insert(module_target_name.clone(), conv_module.to_object(self.py));
+
+        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
+        let new_node = self.new_graph.call_method(
+            "create_node", ("call_module", module_target_name, args_tuple), None
+        )?;
+        Ok(new_node.to_object(self.py))
+    }
+
+    // ✅ YENİ FONKSİYON: reconstruct_gelu() - GELU aktivasyon
+    fn reconstruct_gelu(&mut self, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+
+        // GELU modül oluştur (parametre yok)
+        let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
+        let gelu_module = torch_nn.getattr("GELU")?.call0()?;
+
+        // Module map'e ekle ve node oluştur
+        let module_name = format!("gelu_{}", self.param_map.len());
+        self.param_map.insert(module_name.clone(), gelu_module.to_object(self.py));
+
+        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
+        let new_node = self.new_graph.call_method(
+            "create_node", ("call_module", module_name, args_tuple), None
+        )?;
+        Ok(new_node.to_object(self.py))
+    }
+
+    // ✅ YENİ FONKSİYON: reconstruct_silu() - SiLU/Swish aktivasyon
+    fn reconstruct_silu(&mut self, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+
+        // SiLU modül oluştur (parametre yok)
+        let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
+        let silu_module = torch_nn.getattr("SiLU")?.call0()?;
+
+        // Module map'e ekle ve node oluştur
+        let module_name = format!("silu_{}", self.param_map.len());
+        self.param_map.insert(module_name.clone(), silu_module.to_object(self.py));
+
+        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
+        let new_node = self.new_graph.call_method(
+            "create_node", ("call_module", module_name, args_tuple), None
+        )?;
+        Ok(new_node.to_object(self.py))
+    }
+
+    // ✅ YENİ FONKSİYON: reconstruct_layernorm() - LayerNorm ile parametre kopyalama
+    fn reconstruct_layernorm(&mut self, w_id: Id, b_id: Id, x_id: Id, eps_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+
+        // 1. Orijinal parametreleri al
+        let w_full_name = self.get_var_name(w_id, expr)?;
+        let b_full_name = self.get_var_name(b_id, expr)?;
+
+        let has_weight = w_full_name != "none";
+        let has_bias = b_full_name != "none";
+
+        let original_weight = if has_weight {
+            Some(self.model.getattr(&*w_full_name)
+                .map_err(|e| HypatiaError::new_err(format!("LayerNorm weight '{}' not found: {}", w_full_name, e)))?)
+        } else {
+            None
+        };
+
+        let original_bias = if has_bias {
+            Some(self.model.getattr(&*b_full_name)
+                .map_err(|e| HypatiaError::new_err(format!("LayerNorm bias '{}' not found: {}", b_full_name, e)))?)
+        } else {
+            None
+        };
+
+        // 2. Shape'ten normalized_shape çıkar
+        let normalized_shape = if let Some(ref weight) = original_weight {
+            let w_shape = weight.getattr("shape")?;
+            w_shape.extract::<Vec<i64>>()?
+        } else if let Some(ref bias) = original_bias {
+            let b_shape = bias.getattr("shape")?;
+            b_shape.extract::<Vec<i64>>()?
+        } else {
+            return Err(HypatiaError::new_err("LayerNorm: Both weight and bias are 'none'"));
+        };
+
+        // 3. eps değerini al
+        let eps_str = self.get_var_name(eps_id, expr)?;
+        let eps_value = self.unsanitize_value(&eps_str)?;
+
+        // 4. LayerNorm modül oluştur
+        let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
+        let kwargs = PyDict::new_bound(self.py);
+        kwargs.set_item("eps", eps_value)?;
+        kwargs.set_item("elementwise_affine", has_weight || has_bias)?;
+
+        let ln_module = torch_nn.getattr("LayerNorm")?.call(
+            (normalized_shape,),
+            Some(&kwargs)
+        )?;
+
+        // 5. ✅ PARAMETRELERİ KOPYALA
+        if let Some(weight_tensor) = original_weight {
+            ln_module.getattr("weight")?.call_method1("copy_", (weight_tensor,))?;
+        }
+        if let Some(bias_tensor) = original_bias {
+            ln_module.getattr("bias")?.call_method1("copy_", (bias_tensor,))?;
+        }
+
+        // 6. Module map'e ekle ve node oluştur
+        let module_name = format!("layernorm_{}", self.param_map.len());
+        self.param_map.insert(module_name.clone(), ln_module.to_object(self.py));
+
+        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
+        let new_node = self.new_graph.call_method(
+            "create_node", ("call_module", module_name, args_tuple), None
+        )?;
+        Ok(new_node.to_object(self.py))
+    }
+
     fn build_call_function(
         &mut self,
         target: &str,
@@ -1158,72 +1356,6 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         Ok(new_node.to_object(self.py))
     }
 
-    
-    fn build_conv2d_module(
-        &mut self, _node_id: Id, expr: &RecExpr<HypatiaLang>,
-        w_id: Id, b_id: Id, input_node: PyObject, 
-        s_id: Id, p_id: Id, d_id: Id, g_id: Id 
-    ) -> PyResult<PyObject> {
-        // ✅ DÜZELTME: (Kullanıcının isteği)
-        let w_full_name = self.get_var_name(w_id, expr)?;
-        let b_full_name = self.get_var_name(b_id, expr)?;
-        let has_bias = b_full_name != "none";
-
-        // ✅ DÜZELTME: Doğrudan getattr & &*String
-        let w_tensor = self.model.getattr(&*w_full_name)
-             .map_err(|e| HypatiaError::new_err(format!("Tensor get failed for {}: {}", w_full_name, e)))?;
-        
-        let b_tensor = if has_bias {
-            Some(self.model.getattr(&*b_full_name)
-                .map_err(|e| HypatiaError::new_err(format!("Tensor get failed for {}: {}", b_full_name, e)))?)
-        } else {
-            None
-        };
-        
-        let stride = self.unsanitize_tuple(&self.get_var_name(s_id, expr)?)?;
-        let padding = self.unsanitize_tuple(&self.get_var_name(p_id, expr)?)?;
-        let dilation = self.unsanitize_tuple(&self.get_var_name(d_id, expr)?)?;
-        let groups = self.unsanitize_value(&self.get_var_name(g_id, expr)?)?;
-
-        // ✅ DÜZELTME: .getattr(self.py, "shape")? -> .getattr("shape")?
-        let w_shape_py = w_tensor.getattr("shape")?;
-        // ✅ DÜZELTME: .extract(self.py)? -> .extract()?
-        let w_shape = w_shape_py.extract::<Vec<usize>>()?;
-        let out_channels = w_shape[0];
-        let in_channels_per_group = w_shape[1];
-        let kernel_size = (w_shape[2], w_shape[3]).to_object(self.py);
-        // ✅ DÜZELTME: .extract(self.py)? -> .extract(self.py)? (PyObject üzerinde çağrılıyor)
-        let in_channels = in_channels_per_group * groups.extract::<usize>(self.py)?;
-
-        let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
-        
-        let kwargs = PyDict::new_bound(self.py);
-        kwargs.set_item("stride", stride)?;
-        kwargs.set_item("padding", padding)?;
-        kwargs.set_item("dilation", dilation)?;
-        kwargs.set_item("groups", groups)?;
-        kwargs.set_item("bias", has_bias)?;
-        
-        let conv_module = torch_nn.getattr("Conv2d")?.call(
-            (in_channels, out_channels, kernel_size),
-            Some(&kwargs)
-        )?;
-        
-        conv_module.getattr("weight")?.getattr("data")?.call_method1("copy_", (w_tensor,))?;
-        if let Some(b_tensor_val) = b_tensor {
-            conv_module.getattr("bias")?.getattr("data")?.call_method1("copy_", (b_tensor_val,))?;
-        }
-        
-        let module_target_name = format!("conv2d_{}", self.param_map.len());
-        self.param_map.insert(module_target_name.clone(), conv_module.to_object(self.py));
-        
-        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
-        let new_node = self.new_graph.call_method(
-            "create_node", ("call_module", module_target_name, args_tuple), None
-        )?;
-        Ok(new_node.to_object(self.py))
-    }
-    
     fn build_batchnorm_module(
         &mut self, _node_id: Id, expr: &RecExpr<HypatiaLang>,
         w_id: Id, b_id: Id, m_id: Id, v_id: Id, input_node: PyObject, eps_id: Id
@@ -1489,23 +1621,84 @@ fn sanitize_tuple_to_string(tuple: &Bound<PyAny>) -> PyResult<String> {
     }
 }
 
-// ✅✅✅ YENİ FONKSİYON (Adım 0.2): Desteklenen düğümleri belirlemek için
-// `reconstruct_node` tarafından kullanılır.
+// ============================================================================
+// NODE SUPPORT CHECKER
+// ============================================================================
+// Desteklenen düğümleri kategorize ederek kontrol eder ve desteklenmeyen
+// operasyonlar için uyarı mesajları verir.
 fn is_supported_node(node: &HypatiaLang) -> bool {
     match node {
-        HypatiaLang::Add(_) | HypatiaLang::Mul(_) | HypatiaLang::MatMul(_) |
-        HypatiaLang::ReLU(_) | HypatiaLang::Flatten(_) |
-        HypatiaLang::Linear(_) | HypatiaLang::LinearReLU(_) |
-        HypatiaLang::FusedMLP(_) | HypatiaLang::FusedConvBN(_) |
-        HypatiaLang::Conv2d(_) | HypatiaLang::BatchNorm(_) |
-        HypatiaLang::MaxPool2d(_) | HypatiaLang::AdaptiveAvgPool2d(_) |
-        HypatiaLang::Embedding(_) | HypatiaLang::TransformerEncoder(_) |
-        HypatiaLang::Var(_) | HypatiaLang::Constant(_) |
-        HypatiaLang::Mean(_) => true, // ✅ Adım 0.2: Mean eklendi
-        
-        // Desteklenmeyenler (şimdilik):
-        // LayerNorm, GELU, SiLU, BatchNorm1d, Dropout, vb.
-        _ => false, 
+        // ========== Aritmetik Operatörler ==========
+        HypatiaLang::Add(_) | HypatiaLang::Mul(_) => true,
+        HypatiaLang::Sub(_) | HypatiaLang::Div(_) | HypatiaLang::Neg(_) => {
+            eprintln!("[WARN] Arithmetic op {:?} not fully implemented in reconstruction", node);
+            false
+        }
+        HypatiaLang::Exp(_) | HypatiaLang::Log(_) | HypatiaLang::Sqrt(_) | HypatiaLang::Pow(_) => {
+            eprintln!("[WARN] Advanced math op {:?} not supported", node);
+            false
+        }
+
+        // ========== Aktivasyon Fonksiyonları ==========
+        HypatiaLang::ReLU(_) | HypatiaLang::GELU(_) | HypatiaLang::SiLU(_) => true,
+        HypatiaLang::Sigmoid(_) | HypatiaLang::Tanh(_) | HypatiaLang::Softmax(_) => {
+            eprintln!("[WARN] Activation {:?} not implemented in reconstruction (may work via fallback)", node);
+            false
+        }
+        HypatiaLang::ReLUGrad(_) | HypatiaLang::LeakyReLU(_) | HypatiaLang::ELU(_) => {
+            eprintln!("[WARN] Activation {:?} not supported", node);
+            false
+        }
+
+        // ========== NN Layers ==========
+        HypatiaLang::Linear(_) | HypatiaLang::Conv2d(_) | HypatiaLang::MatMul(_) => true,
+        HypatiaLang::Embedding(_) | HypatiaLang::TransformerEncoder(_) => true,
+        HypatiaLang::Attention(_) => {
+            eprintln!("[WARN] Attention layer reconstruction not implemented");
+            false
+        }
+
+        // ========== Normalization Layers ==========
+        HypatiaLang::BatchNorm(_) | HypatiaLang::LayerNorm(_) => true,
+        HypatiaLang::BatchNorm1d(_) | HypatiaLang::GroupNorm(_) => {
+            eprintln!("[WARN] Normalization layer {:?} not implemented", node);
+            false
+        }
+
+        // ========== Pooling Layers ==========
+        HypatiaLang::MaxPool2d(_) | HypatiaLang::AdaptiveAvgPool2d(_) => true,
+        HypatiaLang::AvgPool2d(_) => {
+            eprintln!("[WARN] AvgPool2d reconstruction not implemented");
+            false
+        }
+
+        // ========== Fusion Operations ==========
+        HypatiaLang::LinearReLU(_) | HypatiaLang::FusedMLP(_) | HypatiaLang::FusedConvBN(_) => true,
+
+        // ========== Statistical Operations ==========
+        HypatiaLang::Mean(_) => true,
+        HypatiaLang::Variance(_) | HypatiaLang::Max(_) | HypatiaLang::Min(_) => {
+            eprintln!("[WARN] Statistical op {:?} not supported", node);
+            false
+        }
+
+        // ========== Shape Operations ==========
+        HypatiaLang::Flatten(_) => true,
+
+        // ========== Regularization ==========
+        HypatiaLang::Dropout(_) => {
+            eprintln!("[WARN] Dropout reconstruction not implemented (inference mode may pass through)");
+            false
+        }
+
+        // ========== Primitives ==========
+        HypatiaLang::Var(_) | HypatiaLang::Constant(_) => true,
+
+        // ========== Catch-all for Unknown ==========
+        _ => {
+            eprintln!("[ERROR] Unknown/unsupported node type: {:?}", node);
+            false
+        }
     }
 }
 

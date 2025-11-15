@@ -31,6 +31,10 @@ ordered-float = "3.4.0"
 # ✅ YENİ: Jenerik GA (FEZ 11.5) için eklendi
 num-traits = "0.2"
 
+# ✅ Task 2.4: Verbose Logging
+log = "0.4"
+env_logger = "0.11"
+
 
 [package.metadata.maturin]
 bindings = "pyo3"
