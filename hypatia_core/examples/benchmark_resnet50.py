@@ -94,15 +94,20 @@ def main():
 
                 model_fn_base = lambda om=original_model: om
 
+                # ====================================================================
+                # ✅ CRITICAL FIX: `precision_str` argümanı eklendi
+                # ====================================================================
                 res_base = run_benchmark(
                     model_fn=model_fn_base,
                     device=device,
                     batch_size=batch_size,
                     input_shape=input_shape,
                     precision=precision,
+                    precision_str=precision_str, # <-- YENİ EKLENDİ
                     original_model=None,
                     test_loader=dummy_loader,
                 )
+                # ====================================================================
 
                 if res_base:
                     res_base["scenario"] = f"{scenario_name}-Baseline"
@@ -151,15 +156,20 @@ def main():
 
                 model_fn_opt = lambda om=optimized_model: om
 
+                # ====================================================================
+                # ✅ CRITICAL FIX: `precision_str` argümanı eklendi
+                # ====================================================================
                 res_opt = run_benchmark(
                     model_fn=model_fn_opt,
                     device=device,
                     batch_size=batch_size,
                     input_shape=input_shape,
                     precision=precision,
+                    precision_str=precision_str, # <-- YENİ EKLENDİ
                     original_model=original_model,
                     test_loader=dummy_loader,
                 )
+                # ====================================================================
 
                 if res_opt:
                     res_opt["scenario"] = f"{scenario_name}-Hypatia"

@@ -54,7 +54,7 @@ except ImportError:
 
 # ====================================================================
 # ✅ GÜNCELLENDİ: HYPATIA TRACER
-# Transformer modüllerini "leaf" (kara kutu) olarak işaretle
+# Transformer ve ResNet blokları için destek eklendi.
 # ====================================================================
 
 class HypatiaTracer(torch.fx.Tracer):
@@ -65,7 +65,6 @@ class HypatiaTracer(torch.fx.Tracer):
     def is_leaf_module(self, m: torch.nn.Module, module_qualified_name: str) -> bool:
         # ====================================================================
         # ✅ CRITICAL FIX: Bu modüller ÇOK karmaşık, içlerine GİRME (Leaf=True)
-        # =".yüzden" "kara kutu" olarak kabul et.
         # ====================================================================
         if isinstance(m, (
             nn.TransformerEncoder,
@@ -211,7 +210,6 @@ def safe_model_to_device(model, device, precision):
                 print("  > UYARI: Optimize edilmiş modelin parametresi yok (bu normal olabilir).")
                 return model, None
             
-            # Transformer (Embedding) FP16/BF16'e çevrilemez, bu yüzden atla
             is_transformer = any(isinstance(m, (nn.TransformerEncoder, nn.Embedding)) for m in model.modules())
 
             if not is_transformer and precision != torch.long and hasattr(params[0], 'is_floating_point'):
@@ -229,7 +227,7 @@ def safe_model_to_device(model, device, precision):
 
 # ====================================================================
 # ✅ GÜNCELLENDİ: optimize_model_from_base
-# (module_type_map eklendi, mantık aynı)
+# (module_type_map -> module_info_map { 'type', 'has_bias' } oldu)
 # ====================================================================
 
 def optimize_model_from_base(
@@ -243,7 +241,6 @@ def optimize_model_from_base(
     """
     model_cpu = copy.deepcopy(original_model).to("cpu")
     
-    # Transformer (Embedding) FP16/BF16'e çevrilemez, bu yüzden atla
     is_transformer = any(isinstance(m, (nn.TransformerEncoder, nn.Embedding)) for m in model_cpu.modules())
 
     try:
@@ -265,11 +262,20 @@ def optimize_model_from_base(
         graph = tracer.trace(model_cpu)
         graph_module = torch.fx.GraphModule(tracer.root, graph)
 
-        module_type_map = {}
+        # ====================================================================
+        # ✅ CRITICAL FIX: Modül Bilgi Haritası (Bias Tespiti)
+        # ====================================================================
+        module_info_map = {}
         for node in graph_module.graph.nodes:
             if node.op == 'call_module':
                 module = graph_module.get_submodule(node.target)
-                module_type_map[node.target] = type(module).__name__
+                module_info_map[node.target] = {
+                    'type': type(module).__name__,
+                    # 'bias' attribute'u var mı VE None değil mi kontrol et
+                    'has_bias': (hasattr(module, 'bias') and module.bias is not None)
+                }
+        # ====================================================================
+
 
         if HYPATIA_AVAILABLE and hasattr(hypatia_core, "compile_fx_graph"):
             print(f"  > [HYPATIA] Gerçek 'compile_fx_graph' optimizasyonu uygulanıyor...")
@@ -277,7 +283,7 @@ def optimize_model_from_base(
             optimized_model_obj = hypatia_core.compile_fx_graph(
                 graph_module, 
                 example_inputs_cpu,
-                module_type_map 
+                module_info_map # <-- ✅ GÜNCELLENDİ
             )
         else:
             print(f"  > [HYPATIA PLACEHOLDER] 'torch.compile' kullanılıyor...")
@@ -345,7 +351,12 @@ def calculate_flops(model: nn.Module, inputs: torch.Tensor) -> float:
         flops = FlopCountAnalysis(model_cpu, (inputs_cpu,))
         return flops.total()
     except Exception as e:
-        print(f"  > FLOPs hesaplama hatası: {e}")
+        # ✅ DÜZELTME: 'Unsupported operator' hatasını 'hata' değil, 'uyarı' olarak ele al.
+        # Bu, Hypatia'nın değil, fvcore kütüphanesinin bir sınırlamasıdır.
+        if "Unsupported operator" in str(e):
+            print(f"  > FLOPs hesaplama UYARISI: fvcore bazı operatörleri tanımadı (bu normaldir): {e}")
+        else:
+            print(f"  > FLOPs hesaplama hatası: {e}")
         return -1.0
 
 
@@ -499,17 +510,13 @@ def run_benchmark(
         assert accuracy_check["cosine_similarity"] > cos_sim_threshold, \
             f"Doğruluk kaybı! Cosine Sim: {accuracy_check['cosine_similarity']:.4f} (Eşik: >{cos_sim_threshold})"
         
-        # ====================================================================
-        # ✅ CRITICAL FIX: FP16/BF16 için assert'i yoruma al
-        # ====================================================================
-        if precision == torch.float32:
+        if precision_str == "FP32":
             assert accuracy_check["relative_error"] < rel_err_threshold, \
                 f"Numerik hata! Rel Err: {accuracy_check['relative_error']:.4f} (Eşik: <{rel_err_threshold})"
         else:
             if accuracy_check["relative_error"] >= rel_err_threshold:
                 print(f"  > [UYARI] {precision_str} için rel_err={accuracy_check['relative_error']:.4f}, "
                       f"optimizasyon şu anda sadece FP32 doğruluğu için garanti ediliyor.")
-        # ====================================================================
 
         results["accuracy_cosine_sim"] = accuracy_check["cosine_similarity"]
         results["accuracy_max_diff"] = accuracy_check["max_difference"]
