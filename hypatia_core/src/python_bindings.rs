@@ -376,14 +376,66 @@ pub fn compile_fx_graph(
         // ✅ DÜZELTME: `sexpr_to_fx_graph`'a `model` ve `gm` olarak `gm`'nin kendisini (farklı binding'lerle) ver
         match crate::fx_bridge::sexpr_to_fx_graph(py, model_bound, &gm, optimized_ast) {
             Ok(optimized_gm) => {
-                let params: Vec<_> = optimized_gm.bind(py).call_method0("parameters")?.iter()?.collect::<PyResult<_>>()?;
-                if params.is_empty() {
-                    let original_params: Vec<_> = gm.call_method0("parameters")?.iter()?.collect::<PyResult<_>>()?;
-                    if !original_params.is_empty() {
-                        eprintln!("[compile_fx_graph] Reconstruction FAILED: Model parametresiz döndü. Using original.");
-                        return Ok(gm.to_object(py)); // Fallback
+                // ✅ YENİ: Gelişmiş parametre doğrulama mekanizması
+
+                // 1. Orijinal ve optimize edilmiş parametreleri al
+                let original_params: Vec<_> = gm.call_method0("parameters")?
+                    .iter()?
+                    .collect::<PyResult<_>>()?;
+                let optimized_params: Vec<_> = optimized_gm.bind(py).call_method0("parameters")?
+                    .iter()?
+                    .collect::<PyResult<_>>()?;
+
+                // 2. Parametre sayısı kontrolü
+                if original_params.len() != optimized_params.len() {
+                    eprintln!("[PARAM LOSS] Parameter count mismatch: {} → {}",
+                              original_params.len(), optimized_params.len());
+                    eprintln!("[PARAM LOSS] Falling back to original model");
+                    return Ok(gm.to_object(py));
+                }
+
+                // 3. Boş model kontrolü (önceki davranışı koru)
+                if optimized_params.is_empty() && !original_params.is_empty() {
+                    eprintln!("[PARAM LOSS] Optimized model has no parameters (original had {})",
+                              original_params.len());
+                    return Ok(gm.to_object(py));
+                }
+
+                // 4. Parametre checksum kontrolü
+                let mut mismatch_count = 0;
+                for (i, (orig, opt)) in original_params.iter().zip(optimized_params.iter()).enumerate() {
+                    // PyTorch tensor'lerin sum() methodunu kullan
+                    let orig_sum_result = orig.call_method0("sum");
+                    let opt_sum_result = opt.call_method0("sum");
+
+                    if let (Ok(orig_sum_obj), Ok(opt_sum_obj)) = (orig_sum_result, opt_sum_result) {
+                        // .item() ile Python scalar'ı al, sonra f32'ye çevir
+                        let orig_sum_item = orig_sum_obj.call_method0("item")?;
+                        let opt_sum_item = opt_sum_obj.call_method0("item")?;
+
+                        if let (Ok(orig_sum), Ok(opt_sum)) = (
+                            orig_sum_item.extract::<f32>(),
+                            opt_sum_item.extract::<f32>()
+                        ) {
+                            let diff = (orig_sum - opt_sum).abs();
+                            if diff > 1e-3 {
+                                eprintln!("[PARAM MISMATCH] Param #{} checksum failed: {:.6} vs {:.6} (diff: {:.6})",
+                                          i, orig_sum, opt_sum, diff);
+                                mismatch_count += 1;
+                            }
+                        }
                     }
                 }
+
+                if mismatch_count > 0 {
+                    eprintln!("[PARAM MISMATCH] {} out of {} parameters have checksum mismatches",
+                              mismatch_count, original_params.len());
+                    eprintln!("[PARAM MISMATCH] Falling back to original model");
+                    return Ok(gm.to_object(py));
+                }
+
+                // 5. Tüm doğrulamalar başarılı
+                eprintln!("✅ Parameter preservation verified: {} params", original_params.len());
                 Ok(optimized_gm)
             }
             Err(err) => {
