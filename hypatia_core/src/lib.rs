@@ -16,7 +16,7 @@ mod fx_bridge;  // ✅ YENİ: FX Graph bridge module
 use pyo3::prelude::*;
 
 #[pymodule]
-pub fn hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn _hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ✅ Task 2.4: Initialize logging system
     // Default to "info" level, can be overridden with RUST_LOG environment variable
     // e.g., RUST_LOG=debug python script.py
@@ -44,7 +44,10 @@ pub fn hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<python_bindings::PySymbol>()?;
     m.add_class::<python_bindings::PyMultiVector2dSymbolic>()?;
     m.add_class::<python_bindings::PyMultiVector3dSymbolic>()?;
-    
+
+    // ✅ Görev 1.3: Compilation result class
+    m.add_class::<python_bindings::HypatiaCompileResult>()?;
+
     // --- Modül Fonksiyonları (Optimizasyon ve Ayrıştırma) ---
     m.add_function(wrap_pyfunction!(crate::python_bindings::optimize_ast, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::parse_expr, m)?)?;

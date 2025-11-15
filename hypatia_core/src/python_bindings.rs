@@ -283,6 +283,30 @@ impl PyMultiVector3dSymbolic {
 // Python Modül Fonksiyonları
 // ===============================
 
+/// ✅ Görev 1.3: Compilation result with structure_changed flag
+#[pyclass(name = "HypatiaCompileResult")]
+#[derive(Clone)]
+pub struct HypatiaCompileResult {
+    /// The optimized GraphModule
+    #[pyo3(get)]
+    pub optimized_gm: PyObject,
+
+    /// Whether the graph structure changed during optimization
+    /// (true = e-graph applied rewrites like fusion, false = only parameter/constant changes)
+    #[pyo3(get)]
+    pub structure_changed: bool,
+}
+
+#[pymethods]
+impl HypatiaCompileResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "HypatiaCompileResult(structure_changed={})",
+            self.structure_changed
+        )
+    }
+}
+
 /// Optimizasyon motorunu (v3.0) çalıştırır. (String -> String)
 #[pyfunction]
 pub fn optimize_ast(expr_str: String) -> PyResult<String> {
@@ -318,13 +342,14 @@ pub fn is_equivalent(expr1_str: String, expr2_str: String) -> PyResult<bool> {
 
 /// ✅ GÜNCELLENDİ: FX GRAPH COMPILATION (4 Argümanlı)
 /// Python'dan gelen 4 argümanlı çağrıya uyacak şekilde imza güncellendi.
+/// ✅ Görev 1.3: Returns HypatiaCompileResult with structure_changed flag
 #[pyfunction]
 pub fn compile_fx_graph(
     py_graph_module: PyObject,      // Arg 1: GraphModule (graph için)
     py_original_model: PyObject,    // Arg 2: ✅ YENİ: Orijinal model (parametreler için)
     _example_inputs: PyObject,      // Arg 3: example_inputs (List)
     module_info_map: &Bound<'_, PyDict>, // Arg 4: module_info_map
-) -> PyResult<Py<PyAny>> {
+) -> PyResult<Py<HypatiaCompileResult>> {
     Python::with_gil(|py| {
         let gm = py_graph_module.bind(py);
         let model_bound = py_original_model.bind(py); // ✅ Orijinal model parametreler için
@@ -351,7 +376,11 @@ pub fn compile_fx_graph(
             Ok(result) => result,
             Err(e) => {
                 log::warn!("FX graph parsing failed: {}. Falling back to original GraphModule.", e);
-                return Ok(gm.to_object(py)); // Fallback
+                // Fallback: return original model with structure_changed=false
+                return Ok(Py::new(py, HypatiaCompileResult {
+                    optimized_gm: gm.to_object(py),
+                    structure_changed: false,
+                })?);
             }
         };
 
@@ -365,7 +394,11 @@ pub fn compile_fx_graph(
             Ok(ast) => ast,
             Err(e) => {
                 log::warn!("E-graph optimization failed: {}. Falling back to original GraphModule.", e);
-                return Ok(gm.to_object(py)); // Fallback
+                // Fallback: return original model with structure_changed=false
+                return Ok(Py::new(py, HypatiaCompileResult {
+                    optimized_gm: gm.to_object(py),
+                    structure_changed: false,
+                })?);
             }
         };
         
@@ -400,14 +433,20 @@ pub fn compile_fx_graph(
                 if original_params.len() != optimized_params.len() {
                     log::error!("Parameter count mismatch during reconstruction: {} → {}. Falling back to original model.",
                                 original_params.len(), optimized_params.len());
-                    return Ok(gm.to_object(py));
+                    return Ok(Py::new(py, HypatiaCompileResult {
+                        optimized_gm: gm.to_object(py),
+                        structure_changed: false,
+                    })?);
                 }
 
                 // 3. Always check for empty model (critical structural validation)
                 if optimized_params.is_empty() && !original_params.is_empty() {
                     log::error!("Optimized model has no parameters (original had {}). Falling back to original model.",
                                 original_params.len());
-                    return Ok(gm.to_object(py));
+                    return Ok(Py::new(py, HypatiaCompileResult {
+                        optimized_gm: gm.to_object(py),
+                        structure_changed: false,
+                    })?);
                 }
 
                 // 4. Parametre checksum kontrolü (mode-dependent, structure-aware)
@@ -416,7 +455,10 @@ pub fn compile_fx_graph(
                         // Skip checksum validation entirely
                         log::info!("Checksum validation skipped (mode: Off). Accepting optimized model with {} params.",
                                    original_params.len());
-                        Ok(optimized_gm)
+                        Ok(Py::new(py, HypatiaCompileResult {
+                            optimized_gm,
+                            structure_changed,
+                        })?)
                     }
                     crate::fx_bridge::ChecksumMode::Soft => {
                         // Soft mode: Skip checksum if structure changed
@@ -426,7 +468,10 @@ pub fn compile_fx_graph(
                                  Accepting optimized model with {} params.",
                                 original_params.len()
                             );
-                            Ok(optimized_gm)
+                            Ok(Py::new(py, HypatiaCompileResult {
+                                optimized_gm,
+                                structure_changed,
+                            })?)
                         } else {
                             // No structural change → validate checksums
                             log::info!("ChecksumMode::Soft + no structural change → validating parameter checksums");
@@ -435,13 +480,19 @@ pub fn compile_fx_graph(
 
                             if orig_checksum == opt_checksum {
                                 log::info!("Parameter checksum matched: {:016x}. Accepting optimized model.", orig_checksum);
-                                Ok(optimized_gm)
+                                Ok(Py::new(py, HypatiaCompileResult {
+                                    optimized_gm,
+                                    structure_changed,
+                                })?)
                             } else {
                                 log::error!(
                                     "Parameter checksum mismatch: {:016x} vs {:016x}. Falling back to original model.",
                                     orig_checksum, opt_checksum
                                 );
-                                Ok(gm.to_object(py))
+                                Ok(Py::new(py, HypatiaCompileResult {
+                                    optimized_gm: gm.to_object(py),
+                                    structure_changed: false,
+                                })?)
                             }
                         }
                     }
@@ -454,20 +505,29 @@ pub fn compile_fx_graph(
 
                         if orig_checksum == opt_checksum {
                             log::info!("Parameter checksum matched: {:016x}. Accepting optimized model.", orig_checksum);
-                            Ok(optimized_gm)
+                            Ok(Py::new(py, HypatiaCompileResult {
+                                optimized_gm,
+                                structure_changed,
+                            })?)
                         } else {
                             log::error!(
                                 "Parameter checksum mismatch: {:016x} vs {:016x}. Falling back to original model.",
                                 orig_checksum, opt_checksum
                             );
-                            Ok(gm.to_object(py))
+                            Ok(Py::new(py, HypatiaCompileResult {
+                                optimized_gm: gm.to_object(py),
+                                structure_changed: false,
+                            })?)
                         }
                     }
                 }
             }
             Err(err) => {
                 log::error!("Graph reconstruction failed: {:?}. Falling back to original GraphModule.", err);
-                Ok(gm.to_object(py))
+                Ok(Py::new(py, HypatiaCompileResult {
+                    optimized_gm: gm.to_object(py),
+                    structure_changed: false,
+                })?)
             }
         }
     })
