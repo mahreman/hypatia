@@ -41,13 +41,21 @@ enum FxOp {
 }
 
 // ============================================================================
+// PHASE 2: CONVERSION RESULT
+// ============================================================================
+pub struct FxConversionResult {
+    pub sexpr: String,
+    pub param_var_map: HashMap<String, String>, // sanitized_var_name -> real_param_name
+}
+
+// ============================================================================
 // PHASE 2: MAIN PARSING FUNCTION (fx_graph_to_sexpr)
 // ============================================================================
 pub fn fx_graph_to_sexpr(
-    py: Python<'_>, 
+    py: Python<'_>,
     gm: &Bound<PyAny>,
     types_map: &HashMap<String, ModuleInfo>
-) -> PyResult<String> {
+) -> PyResult<FxConversionResult> {
     let graph = gm.getattr("graph")?;
     eprintln!("[fx_bridge::Phase2] Starting FX parse...");
     let nodes = parse_fx_nodes(py, &graph)?;
@@ -55,9 +63,12 @@ pub fn fx_graph_to_sexpr(
 
     // NOT: Varsayılan değerler (is_inference vb.)
     // python_bindings.rs'de ModuleInfo'nun FromPyObject implementasyonunda halledildi.
-    
-    let sexpr = build_sexpr_from_nodes(&nodes, types_map, gm)?;
-    Ok(sexpr)
+
+    let mut param_var_map = HashMap::new();
+    let sexpr = build_sexpr_from_nodes(&nodes, types_map, gm, &mut param_var_map)?;
+
+    eprintln!("[DEBUG] Parameter mapping created: {} entries", param_var_map.len());
+    Ok(FxConversionResult { sexpr, param_var_map })
 }
 
 // ============================================================================
@@ -68,6 +79,7 @@ pub fn sexpr_to_fx_graph(
     model: &Bound<PyAny>, // ✅ Orijinal model (gm), parametre erişimi için
     original_gm: &Bound<PyAny>, // Bu da GraphModule (gm), submodule eklemek için
     optimized_expr: RecExpr<HypatiaLang>,
+    param_var_map: &HashMap<String, String>, // ✅ YENİ: var_name -> real_param_name mapping
 ) -> PyResult<PyObject> {
     eprintln!("[fx_bridge::Phase3] Reconstructing graph from optimized AST...");
 
@@ -81,9 +93,10 @@ pub fn sexpr_to_fx_graph(
         model, // ✅ Parametreler için
         original_gm, // Submodule'ler için
         new_graph,
-        node_map: HashMap::new(), 
+        node_map: HashMap::new(),
         placeholder_map: HashMap::new(),
         param_map: HashMap::new(),
+        param_var_map, // ✅ YENİ: Parametre mapping'i ekle
     };
 
     let original_graph = original_gm.getattr("graph")?;
@@ -269,10 +282,11 @@ fn parse_node_kwargs(_py: Python<'_>, node: &Bound<PyAny>) -> PyResult<HashMap<S
 fn build_sexpr_from_nodes(
     nodes: &[FxNode],
     types_map: &HashMap<String, ModuleInfo>,
-    gm: &Bound<PyAny>
+    gm: &Bound<PyAny>,
+    param_var_map: &mut HashMap<String, String>
 ) -> PyResult<String> {
     let mut node_exprs: HashMap<String, String> = HashMap::new();
-    
+
     for node in nodes {
         let sexpr = match &node.op {
             FxOp::Placeholder => {
@@ -280,6 +294,19 @@ fn build_sexpr_from_nodes(
                 // Artık normalize/sanitize yok. Orijinal adı kullan.
                 // 'l_x_' -> 'l_x_'
                 // 'l_self_modules_fc1_parameters_weight_' -> 'l_self_modules_fc1_parameters_weight_'
+                //
+                // ✅ YENİ: Eğer bu bir parametre placeholder'ı ise mapping'e ekle
+                // Pattern: l_self_modules_<name>_parameters_<param>_
+                if node.name.starts_with("l_self_modules_") && node.name.contains("_parameters_") {
+                    // Extract real param name: l_self_modules_fc1_parameters_weight_ -> fc1.weight
+                    let after_modules = &node.name[15..]; // Skip "l_self_modules_"
+                    if let Some(params_idx) = after_modules.find("_parameters_") {
+                        let module_name = &after_modules[..params_idx]; // "fc1"
+                        let param_part = &after_modules[params_idx + 12..].trim_end_matches('_'); // "weight"
+                        let real_param_name = format!("{}.{}", module_name, param_part);
+                        param_var_map.insert(node.name.clone(), real_param_name);
+                    }
+                }
                 node.name.clone()
             },
             FxOp::Output => {
@@ -301,17 +328,16 @@ fn build_sexpr_from_nodes(
             FxOp::GetAttr { attr } => {
                 // ✅ DÜZELTME: (Kullanıcının isteği)
                 // Bu, 'get_attr' (örn: ResNet) kullanan modeller içindir.
-                // Artık sanitize yok. Orijinal adı kullan.
                 // Not: 'attr' burada 'target'ten gelir, 'name'den değil.
                 // FX grafiği `name='fc1_weight', op='get_attr', target='fc1.weight'` üretebilir.
                 // Bu durumda 'fc1.weight' kullanmalıyız.
-                // VEYA
-                // FX grafiği `name='l_self...', op='get_attr', target='l_self...'` üretebilir.
-                // Bu durumda 'l_self...' kullanmalıyız.
-                // `target`'i (attr) kullanmak en doğrusu.
-                
+
+                // ✅ YENİ: GetAttr için de mapping ekle
+                // GetAttr durumunda: node.name = sanitized, attr = real name
+                param_var_map.insert(node.name.clone(), attr.clone());
+
                 // ❌ ÖNCEKİ: sanitize_var_name(attr)
-                attr.clone()
+                node.name.clone() // AST'de sanitized ismi kullan
             }
         };
         
@@ -749,6 +775,7 @@ struct FxRebuilder<'a, 'py> {
     node_map: HashMap<Id, PyObject>,
     placeholder_map: HashMap<String, PyObject>, // Anahtar: 'l_x_' veya 'l_self_modules...'
     param_map: HashMap<String, PyObject>, // Fused modüller için
+    param_var_map: &'a HashMap<String, String>, // ✅ YENİ: var_name -> real_param_name
 }
 impl<'a, 'py> FxRebuilder<'a, 'py> {
 
@@ -1106,49 +1133,26 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_linear(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Orijinal parametreleri al - placeholder_map'ten Node alıp GraphModule'den tensöre eriş
+        // 1. Sanitized var name'i al
         let w_var_name = self.get_var_name(w_id, expr)?;
         let b_var_name = self.get_var_name(b_id, expr)?;
 
-        // placeholder_map'te olduğunu doğrula
-        if !self.placeholder_map.contains_key(&w_var_name) {
-            return Err(HypatiaError::new_err(format!("Weight parameter '{}' not in placeholder_map", w_var_name)));
-        }
+        // 2. param_var_map'ten gerçek parametre adını al
+        let w_real_name = self.param_var_map.get(&w_var_name)
+            .ok_or_else(|| HypatiaError::new_err(format!("Weight parameter '{}' not found in param_var_map", w_var_name)))?;
 
-        // Orijinal ismi geri çevir: l_self_modules_fc1_parameters_weight_ -> fc1.weight
-        // Pattern: l_self_modules_<module_name>_parameters_<param_name>_
-        let param_name = if w_var_name.starts_with("l_self_modules_") && w_var_name.contains("_parameters_") {
-            // l_self_modules_fc1_parameters_weight_ -> fc1.weight
-            let after_modules = &w_var_name[15..]; // "fc1_parameters_weight_"
-            let parts: Vec<&str> = after_modules.split("_parameters_").collect();
-            if parts.len() == 2 {
-                let module_name = parts[0]; // "fc1"
-                let param_part = parts[1].trim_end_matches('_'); // "weight"
-                format!("{}.{}", module_name, param_part)
-            } else {
-                w_var_name.clone()
-            }
-        } else {
-            w_var_name.clone()
-        };
-
-        // GraphModule'den tensöre eriş: placeholder_map'teki Node'dan target al
-        let w_node = self.placeholder_map.get(&w_var_name).unwrap();
-        let w_target = w_node.bind(self.py).getattr("target")?.extract::<String>()?;
-        eprintln!("[DEBUG] w_var_name='{}', w_target='{}' ", w_var_name, w_target);
-        let original_weight = self.model.getattr(&*w_target)
-            .map_err(|e| HypatiaError::new_err(format!("Weight parameter '{}' (target='{}') not found on GraphModule: {}", w_var_name, w_target, e)))?;
+        // 3. GraphModule.state_dict() ile tensöre eriş
+        let state_dict = self.model.call_method0("state_dict")?;
+        let original_weight = state_dict.get_item(w_real_name.as_str())
+            .map_err(|e| HypatiaError::new_err(format!("Weight parameter '{}' (real_name='{}') not found in state_dict: {}", w_var_name, w_real_name, e)))?;
 
         let has_bias = b_var_name != "none";
         let original_bias = if has_bias {
-            if !self.placeholder_map.contains_key(&b_var_name) {
-                return Err(HypatiaError::new_err(format!("Bias parameter '{}' not in placeholder_map", b_var_name)));
-            }
+            let b_real_name = self.param_var_map.get(&b_var_name)
+                .ok_or_else(|| HypatiaError::new_err(format!("Bias parameter '{}' not found in param_var_map", b_var_name)))?;
 
-            let b_node = self.placeholder_map.get(&b_var_name).unwrap();
-            let b_target = b_node.bind(self.py).getattr("target")?.extract::<String>()?;
-            let bias_tensor = self.model.getattr(&*b_target)
-                .map_err(|e| HypatiaError::new_err(format!("Bias parameter '{}' (target='{}') not found on GraphModule: {}", b_var_name, b_target, e)))?;
+            let bias_tensor = state_dict.get_item(b_real_name.as_str())
+                .map_err(|e| HypatiaError::new_err(format!("Bias parameter '{}' (real_name='{}') not found in state_dict: {}", b_var_name, b_real_name, e)))?;
             Some(bias_tensor)
         // 1. Parametre İSİMLERİNİ al (Node'ları değil)
         let w_full_name = self.get_var_name(w_id, expr)?;
