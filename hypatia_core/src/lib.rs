@@ -8,19 +8,13 @@ pub use multivector2d::MultiVector2D;
 pub use multivector3d::MultiVector3D;
 pub use symbolic::Symbol;
 
-#[cfg(feature = "python")]
 mod numpy_integration;
-#[cfg(feature = "python")]
 mod python_bindings;
-#[cfg(feature = "python")]
 mod egraph_optimizer;  // E-graph mod declare
-#[cfg(feature = "python")]
 mod fx_bridge;  // ✅ YENİ: FX Graph bridge module
 
-#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
-#[cfg(feature = "python")]
 #[pymodule]
 pub fn hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ✅ Task 2.4: Initialize logging system
