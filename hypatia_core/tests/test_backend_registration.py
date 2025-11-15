@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import hypatia_core  # Auto-registers 'hypatia' backend
 
 
 def test_backend_is_registered():
