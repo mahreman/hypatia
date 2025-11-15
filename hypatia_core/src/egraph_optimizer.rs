@@ -267,7 +267,7 @@ fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantF
             rewrite!("mlp-fusion-from-fused";
                 "(linear ?w2 ?b2 (linear-relu ?w1 ?b1 ?x))"
                 =>
-                "(fused-mlp ?w1 ?b1 ?w2 b2 ?x)"),
+                "(fused-mlp ?w1 ?b1 ?w2 ?b2 ?x)"),
             
             // BU KURAL ZATEN BN FOLDING YAPIYOR (CONV İÇİN)
             rewrite!("conv-bn-fusion";

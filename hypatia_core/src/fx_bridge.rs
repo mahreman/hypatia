@@ -890,23 +890,30 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             }
             
             HypatiaLang::FusedMLP(ids) => {
-                // ... (Bunu da yeni mantığa göre düzeltmemiz GEREKİR)
+                // ✅ DÜZELTME: placeholder_map + target kullanarak tensörleri al
 
                 let w1_id = ids[0]; let b1_id = ids[1];
                 let w2_id = ids[2]; let b2_id = ids[3];
                 let input_id = ids[4];
-                
-                // ✅ DÜZELTME: (Kullanıcının isteği)
-                let w1_full_name = self.get_var_name(w1_id, expr)?;
-                let b1_full_name = self.get_var_name(b1_id, expr)?;
-                let w2_full_name = self.get_var_name(w2_id, expr)?;
-                let b2_full_name = self.get_var_name(b2_id, expr)?;
-                
-                // ✅ DÜZELTME: &*String
-                let w1_tensor = self.model.getattr(&*w1_full_name)?;
-                let w2_tensor = self.model.getattr(&*w2_full_name)?;
-                let b1_has_bias = b1_full_name != "none";
-                let b2_has_bias = b2_full_name != "none";
+
+                let w1_var_name = self.get_var_name(w1_id, expr)?;
+                let b1_var_name = self.get_var_name(b1_id, expr)?;
+                let w2_var_name = self.get_var_name(w2_id, expr)?;
+                let b2_var_name = self.get_var_name(b2_id, expr)?;
+
+                // placeholder_map'ten Node alıp target ile tensöre eriş
+                let w1_node = self.placeholder_map.get(&w1_var_name)
+                    .ok_or_else(|| HypatiaError::new_err(format!("FusedMLP w1 parameter '{}' not in placeholder_map", w1_var_name)))?;
+                let w1_target = w1_node.bind(self.py).getattr("target")?.extract::<String>()?;
+                let w1_tensor = self.original_gm.getattr(&*w1_target)?;
+
+                let w2_node = self.placeholder_map.get(&w2_var_name)
+                    .ok_or_else(|| HypatiaError::new_err(format!("FusedMLP w2 parameter '{}' not in placeholder_map", w2_var_name)))?;
+                let w2_target = w2_node.bind(self.py).getattr("target")?.extract::<String>()?;
+                let w2_tensor = self.original_gm.getattr(&*w2_target)?;
+
+                let b1_has_bias = b1_var_name != "none";
+                let b2_has_bias = b2_var_name != "none";
                 
                 let input_obj = self.reconstruct_node(input_id, expr)?;
                 let nn = PyModule::import_bound(self.py, "torch.nn")?;
@@ -921,11 +928,12 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                     
                 let linear1 = nn.getattr("Linear")?.call1((in_features, hidden_size))?;
                 let param_class = nn.getattr("Parameter")?;
-                // ✅ DÜZELTME: E0382 (move) hatası için w1_tensor kullanıldı
                 linear1.setattr("weight", param_class.call1((w1_tensor,))?)?;
                 if b1_has_bias {
-                    // ✅ DÜZELTME: &*String
-                    let b1_tensor = self.model.getattr(&*b1_full_name)?;
+                    let b1_node = self.placeholder_map.get(&b1_var_name)
+                        .ok_or_else(|| HypatiaError::new_err(format!("FusedMLP b1 parameter '{}' not in placeholder_map", b1_var_name)))?;
+                    let b1_target = b1_node.bind(self.py).getattr("target")?.extract::<String>()?;
+                    let b1_tensor = self.original_gm.getattr(&*b1_target)?;
                     linear1.setattr("bias", param_class.call1((b1_tensor,))?)?;
                 }
                     
@@ -939,11 +947,12 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 let out_features = w2_shape.get_item(0)?.extract::<i64>()?;
                     
                 let linear2 = nn.getattr("Linear")?.call1((hidden_size, out_features))?;
-                // ✅ DÜZELTME: E0382 (move) hatası için w2_tensor kullanıldı
                 linear2.setattr("weight", param_class.call1((w2_tensor,))?)?;
                 if b2_has_bias {
-                    // ✅ DÜZELTME: &*String
-                    let b2_tensor = self.model.getattr(&*b2_full_name)?;
+                    let b2_node = self.placeholder_map.get(&b2_var_name)
+                        .ok_or_else(|| HypatiaError::new_err(format!("FusedMLP b2 parameter '{}' not in placeholder_map", b2_var_name)))?;
+                    let b2_target = b2_node.bind(self.py).getattr("target")?.extract::<String>()?;
+                    let b2_tensor = self.original_gm.getattr(&*b2_target)?;
                     linear2.setattr("bias", param_class.call1((b2_tensor,))?)?;
                 }
                     
@@ -1083,17 +1092,50 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_linear(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Orijinal parametreleri al
-        let w_full_name = self.get_var_name(w_id, expr)?;
-        let b_full_name = self.get_var_name(b_id, expr)?;
+        // 1. Orijinal parametreleri al - placeholder_map'ten Node alıp GraphModule'den tensöre eriş
+        let w_var_name = self.get_var_name(w_id, expr)?;
+        let b_var_name = self.get_var_name(b_id, expr)?;
 
-        let original_weight = self.model.getattr(&*w_full_name)
-            .map_err(|e| HypatiaError::new_err(format!("Weight '{}' not found: {}", w_full_name, e)))?;
+        // placeholder_map'te olduğunu doğrula
+        if !self.placeholder_map.contains_key(&w_var_name) {
+            return Err(HypatiaError::new_err(format!("Weight parameter '{}' not in placeholder_map", w_var_name)));
+        }
 
-        let has_bias = b_full_name != "none";
+        // Orijinal ismi geri çevir: l_self_modules_fc1_parameters_weight_ -> fc1.weight
+        // Pattern: l_self_modules_<module_name>_parameters_<param_name>_
+        let param_name = if w_var_name.starts_with("l_self_modules_") && w_var_name.contains("_parameters_") {
+            // l_self_modules_fc1_parameters_weight_ -> fc1.weight
+            let after_modules = &w_var_name[15..]; // "fc1_parameters_weight_"
+            let parts: Vec<&str> = after_modules.split("_parameters_").collect();
+            if parts.len() == 2 {
+                let module_name = parts[0]; // "fc1"
+                let param_part = parts[1].trim_end_matches('_'); // "weight"
+                format!("{}.{}", module_name, param_part)
+            } else {
+                w_var_name.clone()
+            }
+        } else {
+            w_var_name.clone()
+        };
+
+        // GraphModule'den tensöre eriş: placeholder_map'teki Node'dan target al
+        let w_node = self.placeholder_map.get(&w_var_name).unwrap();
+        let w_target = w_node.bind(self.py).getattr("target")?.extract::<String>()?;
+        eprintln!("[DEBUG] w_var_name='{}', w_target='{}' ", w_var_name, w_target);
+        let original_weight = self.model.getattr(&*w_target)
+            .map_err(|e| HypatiaError::new_err(format!("Weight parameter '{}' (target='{}') not found on GraphModule: {}", w_var_name, w_target, e)))?;
+
+        let has_bias = b_var_name != "none";
         let original_bias = if has_bias {
-            Some(self.model.getattr(&*b_full_name)
-                .map_err(|e| HypatiaError::new_err(format!("Bias '{}' not found: {}", b_full_name, e)))?)
+            if !self.placeholder_map.contains_key(&b_var_name) {
+                return Err(HypatiaError::new_err(format!("Bias parameter '{}' not in placeholder_map", b_var_name)));
+            }
+
+            let b_node = self.placeholder_map.get(&b_var_name).unwrap();
+            let b_target = b_node.bind(self.py).getattr("target")?.extract::<String>()?;
+            let bias_tensor = self.model.getattr(&*b_target)
+                .map_err(|e| HypatiaError::new_err(format!("Bias parameter '{}' (target='{}') not found on GraphModule: {}", b_var_name, b_target, e)))?;
+            Some(bias_tensor)
         } else {
             None
         };
@@ -1128,17 +1170,23 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_conv2d(&mut self, w_id: Id, b_id: Id, x_id: Id, s_id: Id, p_id: Id, d_id: Id, g_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Orijinal parametreleri al
-        let w_full_name = self.get_var_name(w_id, expr)?;
-        let b_full_name = self.get_var_name(b_id, expr)?;
+        // 1. Orijinal parametreleri al - placeholder_map'ten Node alıp target'ını kullan
+        let w_var_name = self.get_var_name(w_id, expr)?;
+        let b_var_name = self.get_var_name(b_id, expr)?;
 
-        let original_weight = self.model.getattr(&*w_full_name)
-            .map_err(|e| HypatiaError::new_err(format!("Weight '{}' not found: {}", w_full_name, e)))?;
+        let w_node = self.placeholder_map.get(&w_var_name)
+            .ok_or_else(|| HypatiaError::new_err(format!("Weight parameter '{}' not in placeholder_map", w_var_name)))?;
+        let w_target = w_node.bind(self.py).getattr("target")?.extract::<String>()?;
+        let original_weight = self.original_gm.getattr(&*w_target)
+            .map_err(|e| HypatiaError::new_err(format!("Conv2d weight parameter '{}' (target='{}') not found: {}", w_var_name, w_target, e)))?;
 
-        let has_bias = b_full_name != "none";
+        let has_bias = b_var_name != "none";
         let original_bias = if has_bias {
-            Some(self.model.getattr(&*b_full_name)
-                .map_err(|e| HypatiaError::new_err(format!("Bias '{}' not found: {}", b_full_name, e)))?)
+            let b_node = self.placeholder_map.get(&b_var_name)
+                .ok_or_else(|| HypatiaError::new_err(format!("Bias parameter '{}' not in placeholder_map", b_var_name)))?;
+            let b_target = b_node.bind(self.py).getattr("target")?.extract::<String>()?;
+            Some(self.original_gm.getattr(&*b_target)
+                .map_err(|e| HypatiaError::new_err(format!("Conv2d bias parameter '{}' (target='{}') not found: {}", b_var_name, b_target, e)))?)
         } else {
             None
         };
@@ -1231,23 +1279,29 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_layernorm(&mut self, w_id: Id, b_id: Id, x_id: Id, eps_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Orijinal parametreleri al
-        let w_full_name = self.get_var_name(w_id, expr)?;
-        let b_full_name = self.get_var_name(b_id, expr)?;
+        // 1. Orijinal parametreleri al - placeholder_map'ten Node alıp target'ını kullan
+        let w_var_name = self.get_var_name(w_id, expr)?;
+        let b_var_name = self.get_var_name(b_id, expr)?;
 
-        let has_weight = w_full_name != "none";
-        let has_bias = b_full_name != "none";
+        let has_weight = w_var_name != "none";
+        let has_bias = b_var_name != "none";
 
         let original_weight = if has_weight {
-            Some(self.model.getattr(&*w_full_name)
-                .map_err(|e| HypatiaError::new_err(format!("LayerNorm weight '{}' not found: {}", w_full_name, e)))?)
+            let w_node = self.placeholder_map.get(&w_var_name)
+                .ok_or_else(|| HypatiaError::new_err(format!("LayerNorm weight parameter '{}' not in placeholder_map", w_var_name)))?;
+            let w_target = w_node.bind(self.py).getattr("target")?.extract::<String>()?;
+            Some(self.original_gm.getattr(&*w_target)
+                .map_err(|e| HypatiaError::new_err(format!("LayerNorm weight parameter '{}' (target='{}') not found: {}", w_var_name, w_target, e)))?)
         } else {
             None
         };
 
         let original_bias = if has_bias {
-            Some(self.model.getattr(&*b_full_name)
-                .map_err(|e| HypatiaError::new_err(format!("LayerNorm bias '{}' not found: {}", b_full_name, e)))?)
+            let b_node = self.placeholder_map.get(&b_var_name)
+                .ok_or_else(|| HypatiaError::new_err(format!("LayerNorm bias parameter '{}' not in placeholder_map", b_var_name)))?;
+            let b_target = b_node.bind(self.py).getattr("target")?.extract::<String>()?;
+            Some(self.original_gm.getattr(&*b_target)
+                .map_err(|e| HypatiaError::new_err(format!("LayerNorm bias parameter '{}' (target='{}') not found: {}", b_var_name, b_target, e)))?)
         } else {
             None
         };

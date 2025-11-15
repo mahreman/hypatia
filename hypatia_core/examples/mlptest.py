@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch._dynamo as dynamo
 import time
-import _hypatia_core  # Rust modülünüz
+import hypatia_core  # Rust modülünüz
 
 # --- HYPATIA BACKEND KAYDI ---
 print("--- 'hypatia' backend'i PyTorch Dynamo'ya kaydediliyor... ---")
@@ -31,15 +31,19 @@ def hypatia(gm: torch.fx.GraphModule, example_inputs: list):
 
     # Hazırlanan argümanlarla asıl Rust fonksiyonunu çağırın
     try:
-        compiled_gm = _hypatia_core.compile_fx_graph(
-            gm, 
-            example_inputs, 
+        print(f"[Hypatia] GraphModule attributes: {[x for x in dir(gm) if not x.startswith('__')][:20]}")
+        print(f"[Hypatia] Has _orig_mod: {hasattr(gm, '_orig_mod')}")
+        compiled_gm = hypatia_core.compile_fx_graph(
+            gm,
+            example_inputs,
             module_info_map
         )
         print("[Hypatia] Rust (compile_fx_graph) başarıyla tamamlandı.")
         return compiled_gm
     except Exception as e:
+        import traceback
         print(f"[Hypatia] Rust (compile_fx_graph) Hatası: {e}")
+        traceback.print_exc()
         return gm # Hata durumunda optimize edilmemiş orijinal grafiği geri döndür
 
 print("--- Kayıt başarılı. ---")
