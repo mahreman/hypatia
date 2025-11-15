@@ -287,6 +287,35 @@ fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantF
         ]);
     }
 
+    // ✅ DÜZELTME: Fusion kuralları artık her zaman aktif (training ve inference modda)
+    // Bu kurallar güvenlidir çünkü sadece hesaplama grafiğini optimize eder,
+    // parametreleri değiştirmez.
+    rules.extend(vec![
+        // 🟢 KURAL 1: Linear-ReLU Fusion
+        rewrite!("linear-relu-fusion";
+            "(relu (linear ?w ?b ?x))"
+            =>
+            "(linear-relu ?w ?b ?x)"),
+
+        // 🟢 KURAL 2: MLP Fusion (Linear-ReLU + Linear)
+        rewrite!("mlp-fusion-from-fused";
+            "(linear ?w2 ?b2 (linear-relu ?w1 ?b1 ?x))"
+            =>
+            "(fused-mlp ?w1 ?b1 ?w2 ?b2 ?x)"),
+
+        // 🟢 KURAL 3: Conv2d-BatchNorm Fusion
+        rewrite!("conv-bn-fusion";
+            "(batchnorm ?w_bn ?b_bn ?m ?v (conv2d ?w_c ?b_c ?x ?s ?p ?d ?g) ?eps)"
+            =>
+            "(fused_conv_bn ?w_c ?b_c ?w_bn ?b_bn ?m ?v ?x ?eps ?s ?p ?d ?g)"),
+
+        // 🟢 KURAL 4: Linear Chain (W2(W1*x + b1) + b2 -> (W2*W1)*x + (W2*b1 + b2))
+        rewrite!("linear-chain";
+            "(linear ?w2 ?b2 (linear ?w1 ?b1 ?x))"
+            =>
+            "(linear (matmul ?w2 ?w1) (add (matmul ?w2 ?b1) ?b2) ?x)"),
+    ]);
+
     // --- YENİ EKLENEN KURALLAR (SNIPPET 3) ---
     // --- Modern Aktivasyon Optimizasyonları ---
     rules.extend(vec![

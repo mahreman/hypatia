@@ -9,7 +9,7 @@ repository = "https://github.com/mahreman/hypatia"
 readme = "README.md"
 
 [lib]
-name = "hypatia_core"
+name = "_hypatia_core"
 crate-type = ["cdylib", "rlib"]
 
 [features]
