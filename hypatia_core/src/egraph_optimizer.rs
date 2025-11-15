@@ -5,9 +5,12 @@ use egg::{
 use ordered_float::NotNan;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
-use crate::symbolic::Symbol; 
+use crate::symbolic::Symbol;
 use crate::python_bindings::ModuleInfo; // ModuleInfo'yu kullanmak için import
 // `HashMap` kullanılmıyor, uyarıyı önlemek için kaldırıldı
+
+// ✅ Task 2.4: Verbose Logging
+use log::{info, debug, warn, error};
 
 // ============================================================================
 // HYPATIA LANGUAGE DEFINITION
@@ -369,40 +372,82 @@ pub fn optimize_to_ast_with_info(expr_str: &str, info: &ModuleInfo) -> Result<Re
 }
 
 // 🟢 ADIM 3: Asıl işin yapıldığı yer burasıdır.
-fn optimize_to_ast_internal(expr_str: &str, info: &ModuleInfo) -> Result<RecExpr<HypatiaLang>, String> { 
+fn optimize_to_ast_internal(expr_str: &str, info: &ModuleInfo) -> Result<RecExpr<HypatiaLang>, String> {
+    // ✅ Task 2.4: Logging başlangıcı
+    info!("=== E-graph Optimization Started ===");
+    debug!("Input S-expr: {}", expr_str);
+    debug!("ModuleInfo: is_inference={}, has_bias={}, module_type={}",
+           info.is_inference, info.has_bias, info.module_type);
+
     // ✅ DÜZELTME: info.is_inference zaten bool (manuel FromPyObject sayesinde)
-    let is_inference_mode_flag = info.is_inference; 
-    
+    let is_inference_mode_flag = info.is_inference;
+
     let res = catch_unwind(AssertUnwindSafe(|| {
         let start_expr: RecExpr<HypatiaLang> = match expr_str.parse() {
-            Ok(expr) => expr,
-            Err(e) => return Err(format!("(error \"Parse Error: {}\")", e)),
+            Ok(expr) => {
+                debug!("Parse successful, expression has {} nodes", expr.as_ref().len());
+                expr
+            },
+            Err(e) => {
+                error!("Parse error: {}", e);
+                return Err(format!("(error \"Parse Error: {}\")", e));
+            }
         };
-        
+
         // 🟢 ADIM 3: Kurallar burada `get_rules` (senin `build_rewrite_rules` dediğin)
         // fonksiyonundan çağrılıyor.
         let rules = get_rules(is_inference_mode_flag);
-        
+        info!("Using {} rewrite rules (inference_mode={})", rules.len(), is_inference_mode_flag);
+
         // Gelişmiş maliyet modelini kullan
-        let cost_function = HardwareAwareCost { 
-            is_inference: is_inference_mode_flag 
+        let cost_function = HardwareAwareCost {
+            is_inference: is_inference_mode_flag
         };
-        
+
+        debug!("Starting e-graph saturation (node_limit=20000, iter_limit=30, time_limit=150ms)");
         let runner = Runner::default()
             .with_egraph(egg::EGraph::new(ConstantFoldingAnalysis))
             .with_node_limit(20_000).with_iter_limit(30)
             .with_time_limit(Duration::from_millis(150))
             // 🟢 ADIM 3: Kurallar burada Runner'a besleniyor ve çalıştırılıyor.
             .with_expr(&start_expr).run(&rules);
-            
+
+        // ✅ Task 2.4: E-graph saturation sonuçlarını logla
+        info!("E-graph saturation complete:");
+        info!("  - Iterations: {}", runner.iterations.len());
+        info!("  - Total nodes: {}", runner.egraph.total_size());
+        info!("  - Total classes: {}", runner.egraph.number_of_classes());
+        info!("  - Stop reason: {:?}", runner.stop_reason);
+
+        if let Some(last_iter) = runner.iterations.last() {
+            debug!("Last iteration stats:");
+            debug!("  - Applied: {}", last_iter.applied.len());
+            debug!("  - E-graph size: {}", last_iter.egraph_nodes);
+            debug!("  - E-classes: {}", last_iter.egraph_classes);
+        }
+
+        debug!("Extracting best expression using HardwareAwareCost");
         let extractor = Extractor::new(&runner.egraph, cost_function);
-        let (_best_cost, best_expr) = extractor.find_best(runner.roots[0]);
+        let (best_cost, best_expr) = extractor.find_best(runner.roots[0]);
+        info!("Best expression found with cost: {}", best_cost);
+        debug!("Best expression has {} nodes", best_expr.as_ref().len());
+
         Ok(best_expr)
     }));
+
     match res {
-        Ok(Ok(expr)) => Ok(expr),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err("(error \"optimizer panic caught\")".to_string()),
+        Ok(Ok(expr)) => {
+            info!("=== E-graph Optimization Successful ===");
+            Ok(expr)
+        },
+        Ok(Err(e)) => {
+            error!("Optimization failed: {}", e);
+            Err(e)
+        },
+        Err(_) => {
+            error!("Optimizer panic caught during optimization");
+            Err("(error \"optimizer panic caught\")".to_string())
+        }
     }
 }
 

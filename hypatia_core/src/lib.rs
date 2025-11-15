@@ -23,6 +23,13 @@ use pyo3::prelude::*;
 #[cfg(feature = "python")]
 #[pymodule]
 pub fn hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // ✅ Task 2.4: Initialize logging system
+    // Default to "info" level, can be overridden with RUST_LOG environment variable
+    // e.g., RUST_LOG=debug python script.py
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init()
+        .ok(); // Ignore error if already initialized
+
     // --- Sayısal sınıflar ---
     m.add_class::<python_bindings::PyMultiVector2D>()?;
     m.add_class::<python_bindings::PyMultiVector3D>()?;
