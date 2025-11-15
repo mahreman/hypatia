@@ -806,6 +806,50 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         }
     }
 
+    /// ✅ YENİ: Parameter tensor'unu al (model.get_submodule + getattr kullanarak)
+    /// canonical_name: "fc1.weight" veya "l_x_" (placeholder)
+    fn get_param_tensor(&self, canonical_name: &str) -> PyResult<Bound<'py, PyAny>> {
+        // Eğer '.' yoksa, bu büyük ihtimalle girdi/placeholder'dır
+        if !canonical_name.contains('.') {
+            if let Some(t) = self.placeholder_map.get(canonical_name) {
+                return Ok(t.bind(self.py).clone());
+            } else {
+                // Hata: ne param ne placeholder
+                return Err(pyo3::exceptions::PyKeyError::new_err(
+                    format!("Unknown tensor name: {}", canonical_name)
+                ));
+            }
+        }
+
+        // Parametre ismi: "fc1.weight" veya "layer1.0.conv1.weight"
+        let mut parts: Vec<&str> = canonical_name.split('.').collect();
+        let field = parts.pop().unwrap(); // "weight" veya "bias"
+
+        let module_path = parts.join("."); // "fc1" veya "layer1.0.conv1"
+
+        // model: Orijinal model (pre-compile)
+        let submodule = self
+            .model
+            .call_method1("get_submodule", (module_path.clone(),))
+            .map_err(|e| {
+                e.print(self.py);
+                pyo3::exceptions::PyAttributeError::new_err(format!(
+                    "get_submodule('{}') failed", module_path
+                ))
+            })?;
+
+        let tensor = submodule
+            .getattr(field)
+            .map_err(|e| {
+                e.print(self.py);
+                pyo3::exceptions::PyAttributeError::new_err(format!(
+                    "submodule '{}' has no attr '{}'", module_path, field
+                ))
+            })?;
+
+        Ok(tensor)
+    }
+
     fn reconstruct_node(
         &mut self,
         node_id: Id,
@@ -938,21 +982,18 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 let w2_id = ids[2]; let b2_id = ids[3];
                 let input_id = ids[4];
 
-                // Get canonical param names
+                // Get canonical param names and tensors
                 let b1_name = self.get_var_name(b1_id, expr)?;
                 let b2_name = self.get_var_name(b2_id, expr)?;
 
                 let b1_has_bias = b1_name != "none";
                 let b2_has_bias = b2_name != "none";
 
-                // Access tensors via state_dict()
-                let state_dict = self.model.call_method0("state_dict")?;
-
                 let w1_real_name = self.get_canonical_param_name(w1_id, expr)?;
-                let w1_tensor = state_dict.get_item(w1_real_name.as_str())?;
+                let w1_tensor = self.get_param_tensor(&w1_real_name)?;
 
                 let w2_real_name = self.get_canonical_param_name(w2_id, expr)?;
-                let w2_tensor = state_dict.get_item(w2_real_name.as_str())?;
+                let w2_tensor = self.get_param_tensor(&w2_real_name)?;
 
                 let input_obj = self.reconstruct_node(input_id, expr)?;
                 let nn = PyModule::import_bound(self.py, "torch.nn")?;
@@ -967,7 +1008,7 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 linear1.setattr("weight", param_class.call1((w1_tensor,))?)?;
                 if b1_has_bias {
                     let b1_real_name = self.get_canonical_param_name(b1_id, expr)?;
-                    let b1_tensor = state_dict.get_item(b1_real_name.as_str())?;
+                    let b1_tensor = self.get_param_tensor(&b1_real_name)?;
                     linear1.setattr("bias", param_class.call1((b1_tensor,))?)?;
                 }
 
@@ -981,7 +1022,7 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 linear2.setattr("weight", param_class.call1((w2_tensor,))?)?;
                 if b2_has_bias {
                     let b2_real_name = self.get_canonical_param_name(b2_id, expr)?;
-                    let b2_tensor = state_dict.get_item(b2_real_name.as_str())?;
+                    let b2_tensor = self.get_param_tensor(&b2_real_name)?;
                     linear2.setattr("bias", param_class.call1((b2_tensor,))?)?;
                 }
 
@@ -1121,21 +1162,15 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_linear(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. ✅ Canonical param name al (real name: "fc1.weight")
+        // 1. Get canonical param name and tensor
         let w_real_name = self.get_canonical_param_name(w_id, expr)?;
-        let b_name = self.get_var_name(b_id, expr)?; // Bias için var name yeterli (none check için)
+        let original_weight = self.get_param_tensor(&w_real_name)?;
 
-        // 2. GraphModule.state_dict() ile tensöre eriş
-        let state_dict = self.model.call_method0("state_dict")?;
-        let original_weight = state_dict.get_item(w_real_name.as_str())
-            .map_err(|e| HypatiaError::new_err(format!("Weight parameter '{}' not found in state_dict: {}", w_real_name, e)))?;
-
+        let b_name = self.get_var_name(b_id, expr)?;
         let has_bias = b_name != "none";
         let original_bias = if has_bias {
             let b_real_name = self.get_canonical_param_name(b_id, expr)?;
-            let bias_tensor = state_dict.get_item(b_real_name.as_str())
-                .map_err(|e| HypatiaError::new_err(format!("Bias parameter '{}' not found in state_dict: {}", b_real_name, e)))?;
-            Some(bias_tensor)
+            Some(self.get_param_tensor(&b_real_name)?)
         } else {
             None
         };
@@ -1170,19 +1205,15 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_conv2d(&mut self, w_id: Id, b_id: Id, x_id: Id, s_id: Id, p_id: Id, d_id: Id, g_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Get canonical param name (real name: "conv1.weight")
+        // 1. Get canonical param name and tensor
         let w_real_name = self.get_canonical_param_name(w_id, expr)?;
+        let original_weight = self.get_param_tensor(&w_real_name)?;
+
         let b_name = self.get_var_name(b_id, expr)?;
-
-        // 2. Access tensor via state_dict()
-        let state_dict = self.model.call_method0("state_dict")?;
-        let original_weight = state_dict.get_item(w_real_name.as_str())?;
-
         let has_bias = b_name != "none";
         let original_bias = if has_bias {
             let b_real_name = self.get_canonical_param_name(b_id, expr)?;
-            let bias_tensor = state_dict.get_item(b_real_name.as_str())?;
-            Some(bias_tensor)
+            Some(self.get_param_tensor(&b_real_name)?)
         } else {
             None
         };
@@ -1275,26 +1306,23 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_layernorm(&mut self, w_id: Id, b_id: Id, x_id: Id, eps_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Get canonical param names
+        // 1. Get canonical param names and tensors
         let w_name = self.get_var_name(w_id, expr)?;
         let b_name = self.get_var_name(b_id, expr)?;
 
         let has_weight = w_name != "none";
         let has_bias = b_name != "none";
 
-        // 2. Access tensors via state_dict()
-        let state_dict = self.model.call_method0("state_dict")?;
-
         let original_weight = if has_weight {
             let w_real_name = self.get_canonical_param_name(w_id, expr)?;
-            Some(state_dict.get_item(w_real_name.as_str())?)
+            Some(self.get_param_tensor(&w_real_name)?)
         } else {
             None
         };
 
         let original_bias = if has_bias {
             let b_real_name = self.get_canonical_param_name(b_id, expr)?;
-            Some(state_dict.get_item(b_real_name.as_str())?)
+            Some(self.get_param_tensor(&b_real_name)?)
         } else {
             None
         };
