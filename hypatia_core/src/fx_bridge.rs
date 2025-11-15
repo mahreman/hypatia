@@ -792,6 +792,20 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         }
     }
 
+    /// ✅ YENİ: Canonical parameter name al
+    /// Eğer bu bir parametre ise param_var_map'ten real name döner ("fc1.weight")
+    /// Değilse sanitized var name döner ("l_x_")
+    fn get_canonical_param_name(&self, node_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<String> {
+        let var_name = self.get_var_name(node_id, expr)?; // "l_self_modules_fc1_parameters_weight_"
+
+        // Eğer param_var_map'te varsa, real name döndür
+        if let Some(real_name) = self.param_var_map.get(&var_name) {
+            Ok(real_name.clone()) // "fc1.weight"
+        } else {
+            Ok(var_name) // Girdi placeholder için ("l_x_")
+        }
+    }
+
     fn reconstruct_node(
         &mut self,
         node_id: Id,
@@ -924,39 +938,21 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 let w2_id = ids[2]; let b2_id = ids[3];
                 let input_id = ids[4];
 
-                let w1_var_name = self.get_var_name(w1_id, expr)?;
-                let b1_var_name = self.get_var_name(b1_id, expr)?;
-                let w2_var_name = self.get_var_name(w2_id, expr)?;
-                let b2_var_name = self.get_var_name(b2_id, expr)?;
-
-                // placeholder_map'ten Node alıp target ile tensöre eriş
-                let w1_node = self.placeholder_map.get(&w1_var_name)
-                    .ok_or_else(|| HypatiaError::new_err(format!("FusedMLP w1 parameter '{}' not in placeholder_map", w1_var_name)))?;
-                let w1_target = w1_node.bind(self.py).getattr("target")?.extract::<String>()?;
-                let w1_tensor = self.original_gm.getattr(&*w1_target)?;
-
-                let w2_node = self.placeholder_map.get(&w2_var_name)
-                    .ok_or_else(|| HypatiaError::new_err(format!("FusedMLP w2 parameter '{}' not in placeholder_map", w2_var_name)))?;
-                let w2_target = w2_node.bind(self.py).getattr("target")?.extract::<String>()?;
-                let w2_tensor = self.original_gm.getattr(&*w2_target)?;
-
-                let b1_has_bias = b1_var_name != "none";
-                let b2_has_bias = b2_var_name != "none";
-                
-                // Parametre İSİMLERİNİ al
-                let w1_name = self.get_var_name(w1_id, expr)?;
-                let w2_name = self.get_var_name(w2_id, expr)?;
+                // Get canonical param names
                 let b1_name = self.get_var_name(b1_id, expr)?;
                 let b2_name = self.get_var_name(b2_id, expr)?;
 
                 let b1_has_bias = b1_name != "none";
                 let b2_has_bias = b2_name != "none";
 
-                // İsimleri kullanarak orijinal modelden ASIL TENSÖRLERİ al
-                let w1_tensor = self.model.getattr(&*w1_name)
-                    .map_err(|e| HypatiaError::new_err(format!("FusedMLP w1 '{}' tensor get failed: {}", w1_name, e)))?;
-                let w2_tensor = self.model.getattr(&*w2_name)
-                    .map_err(|e| HypatiaError::new_err(format!("FusedMLP w2 '{}' tensor get failed: {}", w2_name, e)))?;
+                // Access tensors via state_dict()
+                let state_dict = self.model.call_method0("state_dict")?;
+
+                let w1_real_name = self.get_canonical_param_name(w1_id, expr)?;
+                let w1_tensor = state_dict.get_item(w1_real_name.as_str())?;
+
+                let w2_real_name = self.get_canonical_param_name(w2_id, expr)?;
+                let w2_tensor = state_dict.get_item(w2_real_name.as_str())?;
 
                 let input_obj = self.reconstruct_node(input_id, expr)?;
                 let nn = PyModule::import_bound(self.py, "torch.nn")?;
@@ -970,12 +966,8 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 let param_class = nn.getattr("Parameter")?;
                 linear1.setattr("weight", param_class.call1((w1_tensor,))?)?;
                 if b1_has_bias {
-                    let b1_node = self.placeholder_map.get(&b1_var_name)
-                        .ok_or_else(|| HypatiaError::new_err(format!("FusedMLP b1 parameter '{}' not in placeholder_map", b1_var_name)))?;
-                    let b1_target = b1_node.bind(self.py).getattr("target")?.extract::<String>()?;
-                    let b1_tensor = self.original_gm.getattr(&*b1_target)?;
-                    let b1_tensor = self.model.getattr(&*b1_name)
-                        .map_err(|e| HypatiaError::new_err(format!("FusedMLP b1 '{}' tensor get failed: {}", b1_name, e)))?;
+                    let b1_real_name = self.get_canonical_param_name(b1_id, expr)?;
+                    let b1_tensor = state_dict.get_item(b1_real_name.as_str())?;
                     linear1.setattr("bias", param_class.call1((b1_tensor,))?)?;
                 }
 
@@ -988,12 +980,8 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 let linear2 = nn.getattr("Linear")?.call1((hidden_size, out_features))?;
                 linear2.setattr("weight", param_class.call1((w2_tensor,))?)?;
                 if b2_has_bias {
-                    let b2_node = self.placeholder_map.get(&b2_var_name)
-                        .ok_or_else(|| HypatiaError::new_err(format!("FusedMLP b2 parameter '{}' not in placeholder_map", b2_var_name)))?;
-                    let b2_target = b2_node.bind(self.py).getattr("target")?.extract::<String>()?;
-                    let b2_tensor = self.original_gm.getattr(&*b2_target)?;
-                    let b2_tensor = self.model.getattr(&*b2_name)
-                        .map_err(|e| HypatiaError::new_err(format!("FusedMLP b2 '{}' tensor get failed: {}", b2_name, e)))?;
+                    let b2_real_name = self.get_canonical_param_name(b2_id, expr)?;
+                    let b2_tensor = state_dict.get_item(b2_real_name.as_str())?;
                     linear2.setattr("bias", param_class.call1((b2_tensor,))?)?;
                 }
 
@@ -1133,40 +1121,21 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_linear(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Sanitized var name'i al
-        let w_var_name = self.get_var_name(w_id, expr)?;
-        let b_var_name = self.get_var_name(b_id, expr)?;
+        // 1. ✅ Canonical param name al (real name: "fc1.weight")
+        let w_real_name = self.get_canonical_param_name(w_id, expr)?;
+        let b_name = self.get_var_name(b_id, expr)?; // Bias için var name yeterli (none check için)
 
-        // 2. param_var_map'ten gerçek parametre adını al
-        let w_real_name = self.param_var_map.get(&w_var_name)
-            .ok_or_else(|| HypatiaError::new_err(format!("Weight parameter '{}' not found in param_var_map", w_var_name)))?;
-
-        // 3. GraphModule.state_dict() ile tensöre eriş
+        // 2. GraphModule.state_dict() ile tensöre eriş
         let state_dict = self.model.call_method0("state_dict")?;
         let original_weight = state_dict.get_item(w_real_name.as_str())
-            .map_err(|e| HypatiaError::new_err(format!("Weight parameter '{}' (real_name='{}') not found in state_dict: {}", w_var_name, w_real_name, e)))?;
+            .map_err(|e| HypatiaError::new_err(format!("Weight parameter '{}' not found in state_dict: {}", w_real_name, e)))?;
 
-        let has_bias = b_var_name != "none";
-        let original_bias = if has_bias {
-            let b_real_name = self.param_var_map.get(&b_var_name)
-                .ok_or_else(|| HypatiaError::new_err(format!("Bias parameter '{}' not found in param_var_map", b_var_name)))?;
-
-            let bias_tensor = state_dict.get_item(b_real_name.as_str())
-                .map_err(|e| HypatiaError::new_err(format!("Bias parameter '{}' (real_name='{}') not found in state_dict: {}", b_var_name, b_real_name, e)))?;
-            Some(bias_tensor)
-        // 1. Parametre İSİMLERİNİ al (Node'ları değil)
-        let w_full_name = self.get_var_name(w_id, expr)?;
-        let b_name = self.get_var_name(b_id, expr)?;
         let has_bias = b_name != "none";
-
-        // 2. İsimleri kullanarak orijinal modelden ASIL TENSÖRLERİ al
-        // placeholder_map'teki Node'lar değil, model'deki gerçek tensörler
-        let original_weight = self.model.getattr(&*w_full_name)
-            .map_err(|e| HypatiaError::new_err(format!("Linear weight '{}' tensor get failed: {}", w_full_name, e)))?;
-
         let original_bias = if has_bias {
-            Some(self.model.getattr(&*b_name)
-                .map_err(|e| HypatiaError::new_err(format!("Linear bias '{}' tensor get failed: {}", b_name, e)))?)
+            let b_real_name = self.get_canonical_param_name(b_id, expr)?;
+            let bias_tensor = state_dict.get_item(b_real_name.as_str())
+                .map_err(|e| HypatiaError::new_err(format!("Bias parameter '{}' not found in state_dict: {}", b_real_name, e)))?;
+            Some(bias_tensor)
         } else {
             None
         };
@@ -1201,35 +1170,19 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_conv2d(&mut self, w_id: Id, b_id: Id, x_id: Id, s_id: Id, p_id: Id, d_id: Id, g_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Orijinal parametreleri al - placeholder_map'ten Node alıp target'ını kullan
-        let w_var_name = self.get_var_name(w_id, expr)?;
-        let b_var_name = self.get_var_name(b_id, expr)?;
-
-        let w_node = self.placeholder_map.get(&w_var_name)
-            .ok_or_else(|| HypatiaError::new_err(format!("Weight parameter '{}' not in placeholder_map", w_var_name)))?;
-        let w_target = w_node.bind(self.py).getattr("target")?.extract::<String>()?;
-        let original_weight = self.original_gm.getattr(&*w_target)
-            .map_err(|e| HypatiaError::new_err(format!("Conv2d weight parameter '{}' (target='{}') not found: {}", w_var_name, w_target, e)))?;
-
-        let has_bias = b_var_name != "none";
-        let original_bias = if has_bias {
-            let b_node = self.placeholder_map.get(&b_var_name)
-                .ok_or_else(|| HypatiaError::new_err(format!("Bias parameter '{}' not in placeholder_map", b_var_name)))?;
-            let b_target = b_node.bind(self.py).getattr("target")?.extract::<String>()?;
-            Some(self.original_gm.getattr(&*b_target)
-                .map_err(|e| HypatiaError::new_err(format!("Conv2d bias parameter '{}' (target='{}') not found: {}", b_var_name, b_target, e)))?)
-        // 1. Parametre İSİMLERİNİ al
-        let w_full_name = self.get_var_name(w_id, expr)?;
+        // 1. Get canonical param name (real name: "conv1.weight")
+        let w_real_name = self.get_canonical_param_name(w_id, expr)?;
         let b_name = self.get_var_name(b_id, expr)?;
+
+        // 2. Access tensor via state_dict()
+        let state_dict = self.model.call_method0("state_dict")?;
+        let original_weight = state_dict.get_item(w_real_name.as_str())?;
+
         let has_bias = b_name != "none";
-
-        // 2. İsimleri kullanarak orijinal modelden ASIL TENSÖRLERİ al
-        let original_weight = self.model.getattr(&*w_full_name)
-            .map_err(|e| HypatiaError::new_err(format!("Conv2d weight '{}' tensor get failed: {}", w_full_name, e)))?;
-
         let original_bias = if has_bias {
-            Some(self.model.getattr(&*b_name)
-                .map_err(|e| HypatiaError::new_err(format!("Conv2d bias '{}' tensor get failed: {}", b_name, e)))?)
+            let b_real_name = self.get_canonical_param_name(b_id, expr)?;
+            let bias_tensor = state_dict.get_item(b_real_name.as_str())?;
+            Some(bias_tensor)
         } else {
             None
         };
@@ -1322,40 +1275,26 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_layernorm(&mut self, w_id: Id, b_id: Id, x_id: Id, eps_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Orijinal parametreleri al - placeholder_map'ten Node alıp target'ını kullan
-        let w_var_name = self.get_var_name(w_id, expr)?;
-        let b_var_name = self.get_var_name(b_id, expr)?;
-
-        let has_weight = w_var_name != "none";
-        let has_bias = b_var_name != "none";
-        // 1. Parametre İSİMLERİNİ al
+        // 1. Get canonical param names
         let w_name = self.get_var_name(w_id, expr)?;
         let b_name = self.get_var_name(b_id, expr)?;
 
         let has_weight = w_name != "none";
         let has_bias = b_name != "none";
 
-        // 2. İsimleri kullanarak orijinal modelden ASIL TENSÖRLERİ al
+        // 2. Access tensors via state_dict()
+        let state_dict = self.model.call_method0("state_dict")?;
+
         let original_weight = if has_weight {
-            let w_node = self.placeholder_map.get(&w_var_name)
-                .ok_or_else(|| HypatiaError::new_err(format!("LayerNorm weight parameter '{}' not in placeholder_map", w_var_name)))?;
-            let w_target = w_node.bind(self.py).getattr("target")?.extract::<String>()?;
-            Some(self.original_gm.getattr(&*w_target)
-                .map_err(|e| HypatiaError::new_err(format!("LayerNorm weight parameter '{}' (target='{}') not found: {}", w_var_name, w_target, e)))?)
-            Some(self.model.getattr(&*w_name)
-                .map_err(|e| HypatiaError::new_err(format!("LayerNorm weight '{}' tensor get failed: {}", w_name, e)))?)
+            let w_real_name = self.get_canonical_param_name(w_id, expr)?;
+            Some(state_dict.get_item(w_real_name.as_str())?)
         } else {
             None
         };
 
         let original_bias = if has_bias {
-            let b_node = self.placeholder_map.get(&b_var_name)
-                .ok_or_else(|| HypatiaError::new_err(format!("LayerNorm bias parameter '{}' not in placeholder_map", b_var_name)))?;
-            let b_target = b_node.bind(self.py).getattr("target")?.extract::<String>()?;
-            Some(self.original_gm.getattr(&*b_target)
-                .map_err(|e| HypatiaError::new_err(format!("LayerNorm bias parameter '{}' (target='{}') not found: {}", b_var_name, b_target, e)))?)
-            Some(self.model.getattr(&*b_name)
-                .map_err(|e| HypatiaError::new_err(format!("LayerNorm bias '{}' tensor get failed: {}", b_name, e)))?)
+            let b_real_name = self.get_canonical_param_name(b_id, expr)?;
+            Some(state_dict.get_item(b_real_name.as_str())?)
         } else {
             None
         };
