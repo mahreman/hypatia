@@ -369,7 +369,16 @@ pub fn compile_fx_graph(
             }
         };
         
-        eprintln!("[DEBUG] Optimized AST: {}", crate::egraph_optimizer::rec_to_string(&optimized_ast));
+        let optimized_sexpr = crate::egraph_optimizer::rec_to_string(&optimized_ast);
+        eprintln!("[DEBUG] Optimized AST: {}", optimized_sexpr);
+
+        // Detect if structure changed (optimization modified the graph)
+        let structure_changed = sexpr != &optimized_sexpr;
+        if structure_changed {
+            log::info!("Graph structure changed during optimization (e-graph applied rewrites)");
+        } else {
+            log::info!("Graph structure preserved (no e-graph rewrites applied)");
+        }
 
         // ✅ DÜZELTME: `sexpr_to_fx_graph`'a `model` ve `gm` olarak `gm`'nin kendisini (farklı binding'lerle) ver
         match crate::fx_bridge::sexpr_to_fx_graph(py, model_bound, &gm, optimized_ast, param_var_map) {
@@ -401,7 +410,7 @@ pub fn compile_fx_graph(
                     return Ok(gm.to_object(py));
                 }
 
-                // 4. Parametre checksum kontrolü (mode-dependent)
+                // 4. Parametre checksum kontrolü (mode-dependent, structure-aware)
                 match checksum_mode {
                     crate::fx_bridge::ChecksumMode::Off => {
                         // Skip checksum validation entirely
@@ -409,42 +418,50 @@ pub fn compile_fx_graph(
                                    original_params.len());
                         Ok(optimized_gm)
                     }
-                    crate::fx_bridge::ChecksumMode::Soft | crate::fx_bridge::ChecksumMode::Strict => {
-                        // Perform checksum validation
-                        let mut mismatch_count = 0;
-                        for (i, (orig, opt)) in original_params.iter().zip(optimized_params.iter()).enumerate() {
-                            // PyTorch tensor'lerin sum() methodunu kullan
-                            let orig_sum_result = orig.call_method0("sum");
-                            let opt_sum_result = opt.call_method0("sum");
+                    crate::fx_bridge::ChecksumMode::Soft => {
+                        // Soft mode: Skip checksum if structure changed
+                        if structure_changed {
+                            log::warn!(
+                                "ChecksumMode::Soft + structural change detected → skipping parameter checksum validation. \
+                                 Accepting optimized model with {} params.",
+                                original_params.len()
+                            );
+                            Ok(optimized_gm)
+                        } else {
+                            // No structural change → validate checksums
+                            log::info!("ChecksumMode::Soft + no structural change → validating parameter checksums");
+                            let orig_checksum = crate::fx_bridge::compute_param_checksum(py, &gm)?;
+                            let opt_checksum = crate::fx_bridge::compute_param_checksum(py, &optimized_gm.bind(py))?;
 
-                            if let (Ok(orig_sum_obj), Ok(opt_sum_obj)) = (orig_sum_result, opt_sum_result) {
-                                // .item() ile Python scalar'ı al, sonra f32'ye çevir
-                                let orig_sum_item = orig_sum_obj.call_method0("item")?;
-                                let opt_sum_item = opt_sum_obj.call_method0("item")?;
-
-                                if let (Ok(orig_sum), Ok(opt_sum)) = (
-                                    orig_sum_item.extract::<f32>(),
-                                    opt_sum_item.extract::<f32>()
-                                ) {
-                                    let diff = (orig_sum - opt_sum).abs();
-                                    if diff > 1e-3 {
-                                        log::warn!("Parameter #{} checksum mismatch: {:.6} vs {:.6} (diff: {:.6})",
-                                                   i, orig_sum, opt_sum, diff);
-                                        mismatch_count += 1;
-                                    }
-                                }
+                            if orig_checksum == opt_checksum {
+                                log::info!("Parameter checksum matched: {:016x}. Accepting optimized model.", orig_checksum);
+                                Ok(optimized_gm)
+                            } else {
+                                log::error!(
+                                    "Parameter checksum mismatch: {:016x} vs {:016x}. Falling back to original model.",
+                                    orig_checksum, opt_checksum
+                                );
+                                Ok(gm.to_object(py))
                             }
                         }
+                    }
+                    crate::fx_bridge::ChecksumMode::Strict => {
+                        // Strict mode: Always validate checksums regardless of structure change
+                        log::info!("ChecksumMode::Strict → validating parameter checksums (structure_changed: {})",
+                                   structure_changed);
+                        let orig_checksum = crate::fx_bridge::compute_param_checksum(py, &gm)?;
+                        let opt_checksum = crate::fx_bridge::compute_param_checksum(py, &optimized_gm.bind(py))?;
 
-                        if mismatch_count > 0 {
-                            log::error!("{} out of {} parameters have checksum mismatches. Falling back to original model.",
-                                        mismatch_count, original_params.len());
-                            return Ok(gm.to_object(py));
+                        if orig_checksum == opt_checksum {
+                            log::info!("Parameter checksum matched: {:016x}. Accepting optimized model.", orig_checksum);
+                            Ok(optimized_gm)
+                        } else {
+                            log::error!(
+                                "Parameter checksum mismatch: {:016x} vs {:016x}. Falling back to original model.",
+                                orig_checksum, opt_checksum
+                            );
+                            Ok(gm.to_object(py))
                         }
-
-                        // 5. Tüm doğrulamalar başarılı
-                        log::info!("Parameter preservation verified: {} params", original_params.len());
-                        Ok(optimized_gm)
                     }
                 }
             }

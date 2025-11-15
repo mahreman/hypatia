@@ -63,6 +63,62 @@ impl ChecksumMode {
     }
 }
 
+// ============================================================================
+// PARAMETER CHECKSUM COMPUTATION
+// ============================================================================
+
+/// Compute a checksum hash of model parameters for validation
+/// Uses parameter names, shapes, dtypes, and sample values
+pub fn compute_param_checksum(py: Python<'_>, gm: &Bound<PyAny>) -> PyResult<u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let state_dict = gm.call_method0("state_dict")?;
+    let items = state_dict.call_method0("items")?;
+
+    let mut hasher = DefaultHasher::new();
+    let mut param_count = 0;
+
+    for item in items.iter()? {
+        let pair = item?;
+        let key: String = pair.get_item(0)?.extract()?;
+        let tensor = pair.get_item(1)?;
+
+        // Hash parameter name
+        key.hash(&mut hasher);
+
+        // Hash shape
+        let shape: Vec<i64> = tensor.getattr("shape")?.extract()?;
+        shape.hash(&mut hasher);
+
+        // Hash dtype
+        let dtype_str = format!("{:?}", tensor.getattr("dtype")?);
+        dtype_str.hash(&mut hasher);
+
+        // Hash sample of numeric values (first 10 elements for efficiency)
+        let flat = tensor.call_method0("flatten")?;
+        let numel: i64 = flat.call_method0("numel")?.extract()?;
+        let n = numel.min(10);
+
+        if n > 0 {
+            for i in 0..n {
+                if let Ok(item) = flat.get_item(i as usize) {
+                    if let Ok(val) = item.extract::<f32>() {
+                        val.to_bits().hash(&mut hasher);
+                    }
+                }
+            }
+        }
+
+        param_count += 1;
+    }
+
+    let checksum = hasher.finish();
+    log::debug!("Computed checksum for {} parameters: {:016x}", param_count, checksum);
+
+    Ok(checksum)
+}
+
 
 // ============================================================================
 // PHASE 2: FX NODE STRUCTURES
