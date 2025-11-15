@@ -28,9 +28,11 @@ def hypatia_backend(gm, example_inputs):
     """Hypatia compiler backend for torch.compile()"""
     module_info_map = {}
     print(f"[Hypatia] Compiling graph with {len(list(gm.graph.nodes))} nodes")
-    
+
     try:
-        optimized_gm = compile_fx_graph(gm, example_inputs, module_info_map)
+        # ✅ FIX: Pass gm as both graph and model (gm is GraphModule which has get_submodule)
+        # Signature: compile_fx_graph(gm, original_model, example_inputs, module_info_map)
+        optimized_gm = compile_fx_graph(gm, gm, example_inputs, module_info_map)
         
         if optimized_gm is gm:
             print("[Hypatia] Optimization failed or skipped, using original model")
