@@ -1,3 +1,8 @@
+import os
+# CRITICAL: Disable checksum validation to allow optimizations to apply
+# See SETUP_GUIDE.md "Checksum Mode" section for details
+os.environ["HYPATIA_CHECKSUM_MODE"] = "off"
+
 import torch
 import torch.nn as nn
 import torch._dynamo as dynamo

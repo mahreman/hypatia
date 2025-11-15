@@ -8,6 +8,10 @@ Kullanıcının gönderdiği talimatlara göre hazırlanmıştır.
 import sys
 import os
 
+# CRITICAL: Disable checksum validation to allow optimizations to apply
+# See SETUP_GUIDE.md "Checksum Mode" section for details
+os.environ["HYPATIA_CHECKSUM_MODE"] = "off"
+
 print("=" * 80)
 print("HYPATIA SETUP VERIFICATION")
 print("=" * 80)

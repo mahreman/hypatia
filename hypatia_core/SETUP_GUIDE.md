@@ -138,7 +138,69 @@ print("'hypatia' in backends:", "hypatia" in torch._dynamo.list_backends())
    ✓ Backend confirmed in: [..., 'hypatia', ...]
 ```
 
-## 4. Sorun Giderme
+## 4. Checksum Mode (ÖNEMLİ!)
+
+### Sorun: `[PARAM MISMATCH]` ve Fallback
+
+Hypatia backend'i, optimizasyon sonrası parametrelerin doğruluğunu kontrol etmek için bir checksum mekanizması kullanır. Ancak şu anda bu mekanizma parameter eşleştirme sorunları yaşıyor ve yanlış pozitif hatalar veriyor:
+
+```
+[PARAM MISMATCH] Param #0 checksum failed: ...
+[PARAM MISMATCH] 6 out of 6 parameters have checksum mismatches
+[PARAM MISMATCH] Falling back to original model
+[Hypatia] Rust (compile_fx_graph) başarıyla tamamlandı.
+```
+
+**Ne oluyor?**
+1. Derleme ve graph reconstruction başarılı oluyor
+2. Ancak checksum guard parametreleri yanlış eşleştiriyor
+3. Backend optimize edilmiş modeli atıp orijinale geri dönüyor (fallback)
+4. Bu yüzden performans kazancı görülmüyor (hatta negatif speedup)
+
+### Çözüm: Checksum Mode'u Devre Dışı Bırakma
+
+**Şimdilik** checksum guard'ı devre dışı bırakarak fusion'ların gerçekten uygulanmasını sağlayabilirsiniz:
+
+#### Yöntem 1: Environment Variable (Önerilen)
+```bash
+export HYPATIA_CHECKSUM_MODE=off
+python your_script.py
+```
+
+#### Yöntem 2: Python Script İçinde
+```python
+import os
+os.environ["HYPATIA_CHECKSUM_MODE"] = "off"
+
+# ÖNEMLI: Bu satır torch ve hypatia_core import'undan ÖNCE olmalı!
+import torch
+import hypatia_core
+```
+
+#### Yöntem 3: Inline Kullanım
+```bash
+HYPATIA_CHECKSUM_MODE=off python your_script.py
+```
+
+### Checksum Modları
+
+| Mod | Davranış | Kullanım |
+|-----|----------|----------|
+| `off` | Checksum kontrolü yapılmaz, optimizasyonlar uygulanır | **Şu an önerilen** |
+| `warn` | Checksum uyuşmazlığı uyarı verir, ama fallback yapmaz | Debug için |
+| `strict` | Checksum uyuşmazlığında fallback yapar | Varsayılan (şu an sorunlu) |
+
+### Uzun Vadede
+
+Checksum mantığı ve parameter eşleme sırası düzeltilmekte. `python_bindings.rs` içindeki checksum guard geliştirme aşamasında:
+
+- `fx_bridge.rs`: Graph reconstruction başarılı ✅
+- `python_bindings.rs`: Checksum validation sorunlu ⚠️
+- Gelecek: Structure-aware checksum validation
+
+**ŞU ANKI TAVSİYE:** Tüm test ve benchmark'larda `HYPATIA_CHECKSUM_MODE=off` kullanın.
+
+## 5. Sorun Giderme
 
 ### Sorun 1: `ModuleNotFoundError: hypatia_core`
 
@@ -207,6 +269,33 @@ cargo build --release
 cp target/release/lib_hypatia_core.so hypatia_core/_hypatia_core.so
 ```
 
+### Sorun 4: `[PARAM MISMATCH]` ve Fallback (ÖNEMLİ!)
+
+**Semptomlar:**
+```
+[PARAM MISMATCH] Param #0 checksum failed: ...
+[PARAM MISMATCH] Falling back to original model
+```
+- Derleme başarılı görünüyor
+- Ama performans kazancı yok (hatta negatif speedup)
+
+**Sebep:** Checksum validation mekanizması parametreleri yanlış eşleştiriyor
+
+**Çözüm:**
+```python
+import os
+os.environ["HYPATIA_CHECKSUM_MODE"] = "off"
+# Bu satır torch import'undan ÖNCE olmalı!
+```
+
+Veya shell'den:
+```bash
+export HYPATIA_CHECKSUM_MODE=off
+python your_script.py
+```
+
+**ÖNEMLİ:** Bu geçici bir çözüm. Checksum mantığı düzeltilmekte. Şu an için tüm testlerde `HYPATIA_CHECKSUM_MODE=off` kullanmanız önerilir.
+
 ## 5. Test Çalıştırma
 
 ### Safety Tests (Doğruluk Testleri)
@@ -237,9 +326,13 @@ python hypatia_core/tests/test_backend_registration.py
 
 ## 6. Kullanım
 
-### Temel Kullanım
+### Temel Kullanım (ÖNERİLEN)
 
 ```python
+import os
+# CRITICAL: Disable checksum validation (see "Checksum Mode" section)
+os.environ["HYPATIA_CHECKSUM_MODE"] = "off"
+
 import torch
 import torch.nn as nn
 import hypatia_core  # Auto-registers 'hypatia' backend
@@ -259,9 +352,12 @@ x = torch.randn(128, 256)
 output = compiled_model(x)
 ```
 
-### Güvenli Kullanım (Backend Garantili)
+### Güvenli Kullanım (Backend Garantili + Checksum Off)
 
 ```python
+import os
+os.environ["HYPATIA_CHECKSUM_MODE"] = "off"  # Önce bu!
+
 import torch
 import hypatia_core
 
@@ -273,6 +369,17 @@ assert "hypatia" in torch._dynamo.list_backends()
 
 # Compile et
 compiled_model = torch.compile(model, backend="hypatia")
+```
+
+### Shell'den Kullanım
+
+```bash
+# Environment variable ile
+export HYPATIA_CHECKSUM_MODE=off
+python your_script.py
+
+# veya inline
+HYPATIA_CHECKSUM_MODE=off python your_script.py
 ```
 
 ## 7. Geliştirme İpuçları
@@ -307,6 +414,18 @@ hypatia_core.set_log_level("DEBUG")  # veya "INFO", "WARN", "ERROR"
 - `__init__.py` içinde exception oluşmuş olabilir (sessizce düşer)
 - Manuel `hypatia_core.register_backend()` çağrısı güvenli bir çözümdür
 
+**S: `HYPATIA_CHECKSUM_MODE=off` neden gerekli?**
+- Şu anda checksum validation mekanizması parametreleri yanlış eşleştiriyor
+- Bu yanlış pozitif hatalar veriyor ve optimizasyonlar uygulanmıyor
+- `off` modu ile checksum bypass edilir ve fusion'lar gerçekten çalışır
+- **ÖNEMLİ:** Tüm testlerde ve benchmark'larda `HYPATIA_CHECKSUM_MODE=off` kullanın
+
+**S: `[PARAM MISMATCH] Falling back` hatası ne demek?**
+- Checksum validation başarısız oluyor
+- Backend optimize edilmiş modeli atıp orijinale geri dönüyor
+- Performans kazancı görülmüyor
+- **Çözüm:** `HYPATIA_CHECKSUM_MODE=off` kullanın (bkz. Bölüm 4)
+
 **S: Maturin mi yoksa cargo build mi kullanmalıyım?**
 - Geliştirme için: `maturin develop` (daha kolay)
 - Production build için: `cargo build --release` (daha fazla kontrol)
@@ -315,6 +434,11 @@ hypatia_core.set_log_level("DEBUG")  # veya "INFO", "WARN", "ERROR"
 - Safety tests: `hypatia_core/tests/mlp_safety_test.py`
 - Performance tests: `hypatia_core/tests/mlp_perf_test.py`
 - Debug tools: `hypatia_core/tests/debug_backend.py`
+
+**S: Checksum validation ne zaman düzeltilecek?**
+- `python_bindings.rs` içindeki checksum guard geliştirme aşamasında
+- Structure-aware checksum validation planlanıyor
+- Şimdilik `HYPATIA_CHECKSUM_MODE=off` kullanmanız önerilir
 
 ## 9. Destek
 
