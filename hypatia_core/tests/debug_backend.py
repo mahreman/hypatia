@@ -19,16 +19,16 @@ for path in sys.path[:5]:
 # 2. hypatia_core modülünü import etmeyi dene
 print("\n2. Importing hypatia_core...")
 try:
-    import _hypatia_core
+    import hypatia_core
     print("   ✅ hypatia_core imported successfully")
-    
+
     # Module path
-    if hasattr(_hypatia_core, '__file__'):
-        print(f"   Module location: {_hypatia_core.__file__}")
-    
+    if hasattr(hypatia_core, '__file__'):
+        print(f"   Module location: {hypatia_core.__file__}")
+
     # Version
-    if hasattr(_hypatia_core, '__version__'):
-        print(f"   Version: {_hypatia_core.__version__}")
+    if hasattr(hypatia_core, '__version__'):
+        print(f"   Version: {hypatia_core.__version__}")
     
 except ImportError as e:
     print(f"   ❌ Import failed: {e}")
@@ -68,7 +68,7 @@ except ImportError as e:
 
 # 4. hypatia_backend fonksiyonunu kontrol et
 print("\n4. Checking hypatia_backend function...")
-if hasattr(_hypatia_core, 'hypatia_backend'):
+if hasattr(hypatia_core, 'hypatia_backend'):
     print("   ✅ hypatia_backend function exists")
 else:
     print("   ❌ hypatia_backend function NOT FOUND")
@@ -77,12 +77,12 @@ else:
 # 5. Manuel registration denemesi
 print("\n5. Attempting manual registration...")
 try:
-    if hasattr(_hypatia_core, 'register_backend'):
+    if hasattr(hypatia_core, 'register_backend'):
         print("   Calling hypatia_core.register_backend()...")
-        _hypatia_core.register_backend()
-    elif hasattr(_hypatia_core, 'hypatia_backend'):
+        hypatia_core.register_backend()
+    elif hasattr(hypatia_core, 'hypatia_backend'):
         print("   Calling torch._dynamo.register_backend manually...")
-        torch._dynamo.register_backend(name="hypatia", compiler_fn=_hypatia_core.hypatia_backend)
+        torch._dynamo.register_backend(name="hypatia", compiler_fn=hypatia_core.hypatia_backend)
         print("   ✅ Manual registration successful")
     else:
         print("   ❌ Cannot register - no backend function found")
@@ -102,13 +102,13 @@ except Exception as e:
 # 6. __init__.py dosyasını bul
 print("\n6. Locating __init__.py...")
 hypatia_init = None
-if hasattr(_hypatia_core, '__file__'):
-    module_dir = os.path.dirname(_hypatia_core.__file__)
+if hasattr(hypatia_core, '__file__'):
+    module_dir = os.path.dirname(hypatia_core.__file__)
     init_path = os.path.join(module_dir, '__init__.py')
     if os.path.exists(init_path):
         print(f"   ✅ Found: {init_path}")
         hypatia_init = init_path
-        
+
         # İlk 20 satırı göster
         print("\n   First 20 lines:")
         with open(init_path, 'r') as f:
