@@ -1608,24 +1608,84 @@ fn sanitize_tuple_to_string(tuple: &Bound<PyAny>) -> PyResult<String> {
     }
 }
 
-// ✅✅✅ YENİ FONKSİYON (Adım 0.2): Desteklenen düğümleri belirlemek için
-// `reconstruct_node` tarafından kullanılır.
+// ============================================================================
+// NODE SUPPORT CHECKER
+// ============================================================================
+// Desteklenen düğümleri kategorize ederek kontrol eder ve desteklenmeyen
+// operasyonlar için uyarı mesajları verir.
 fn is_supported_node(node: &HypatiaLang) -> bool {
     match node {
-        HypatiaLang::Add(_) | HypatiaLang::Mul(_) | HypatiaLang::MatMul(_) |
-        HypatiaLang::ReLU(_) | HypatiaLang::Flatten(_) |
-        HypatiaLang::Linear(_) | HypatiaLang::LinearReLU(_) |
-        HypatiaLang::FusedMLP(_) | HypatiaLang::FusedConvBN(_) |
-        HypatiaLang::Conv2d(_) | HypatiaLang::BatchNorm(_) |
-        HypatiaLang::MaxPool2d(_) | HypatiaLang::AdaptiveAvgPool2d(_) |
-        HypatiaLang::Embedding(_) | HypatiaLang::TransformerEncoder(_) |
-        HypatiaLang::Var(_) | HypatiaLang::Constant(_) |
-        HypatiaLang::Mean(_) | // ✅ Adım 0.2: Mean eklendi
-        HypatiaLang::GELU(_) | HypatiaLang::SiLU(_) | HypatiaLang::LayerNorm(_) => true, // ✅ Task 1.4: GELU, SiLU, LayerNorm eklendi
+        // ========== Aritmetik Operatörler ==========
+        HypatiaLang::Add(_) | HypatiaLang::Mul(_) => true,
+        HypatiaLang::Sub(_) | HypatiaLang::Div(_) | HypatiaLang::Neg(_) => {
+            eprintln!("[WARN] Arithmetic op {:?} not fully implemented in reconstruction", node);
+            false
+        }
+        HypatiaLang::Exp(_) | HypatiaLang::Log(_) | HypatiaLang::Sqrt(_) | HypatiaLang::Pow(_) => {
+            eprintln!("[WARN] Advanced math op {:?} not supported", node);
+            false
+        }
 
-        // Desteklenmeyenler (şimdilik):
-        // BatchNorm1d, Dropout, vb.
-        _ => false,
+        // ========== Aktivasyon Fonksiyonları ==========
+        HypatiaLang::ReLU(_) | HypatiaLang::GELU(_) | HypatiaLang::SiLU(_) => true,
+        HypatiaLang::Sigmoid(_) | HypatiaLang::Tanh(_) | HypatiaLang::Softmax(_) => {
+            eprintln!("[WARN] Activation {:?} not implemented in reconstruction (may work via fallback)", node);
+            false
+        }
+        HypatiaLang::ReLUGrad(_) | HypatiaLang::LeakyReLU(_) | HypatiaLang::ELU(_) => {
+            eprintln!("[WARN] Activation {:?} not supported", node);
+            false
+        }
+
+        // ========== NN Layers ==========
+        HypatiaLang::Linear(_) | HypatiaLang::Conv2d(_) | HypatiaLang::MatMul(_) => true,
+        HypatiaLang::Embedding(_) | HypatiaLang::TransformerEncoder(_) => true,
+        HypatiaLang::Attention(_) => {
+            eprintln!("[WARN] Attention layer reconstruction not implemented");
+            false
+        }
+
+        // ========== Normalization Layers ==========
+        HypatiaLang::BatchNorm(_) | HypatiaLang::LayerNorm(_) => true,
+        HypatiaLang::BatchNorm1d(_) | HypatiaLang::GroupNorm(_) => {
+            eprintln!("[WARN] Normalization layer {:?} not implemented", node);
+            false
+        }
+
+        // ========== Pooling Layers ==========
+        HypatiaLang::MaxPool2d(_) | HypatiaLang::AdaptiveAvgPool2d(_) => true,
+        HypatiaLang::AvgPool2d(_) => {
+            eprintln!("[WARN] AvgPool2d reconstruction not implemented");
+            false
+        }
+
+        // ========== Fusion Operations ==========
+        HypatiaLang::LinearReLU(_) | HypatiaLang::FusedMLP(_) | HypatiaLang::FusedConvBN(_) => true,
+
+        // ========== Statistical Operations ==========
+        HypatiaLang::Mean(_) => true,
+        HypatiaLang::Variance(_) | HypatiaLang::Max(_) | HypatiaLang::Min(_) => {
+            eprintln!("[WARN] Statistical op {:?} not supported", node);
+            false
+        }
+
+        // ========== Shape Operations ==========
+        HypatiaLang::Flatten(_) => true,
+
+        // ========== Regularization ==========
+        HypatiaLang::Dropout(_) => {
+            eprintln!("[WARN] Dropout reconstruction not implemented (inference mode may pass through)");
+            false
+        }
+
+        // ========== Primitives ==========
+        HypatiaLang::Var(_) | HypatiaLang::Constant(_) => true,
+
+        // ========== Catch-all for Unknown ==========
+        _ => {
+            eprintln!("[ERROR] Unknown/unsupported node type: {:?}", node);
+            false
+        }
     }
 }
 
