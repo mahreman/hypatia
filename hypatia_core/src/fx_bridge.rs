@@ -176,7 +176,13 @@ pub fn fx_graph_to_sexpr<'py>(
                 )));
             }
             let tensor = example_inputs[next_input_index].clone();
-            eprintln!("[DEBUG] Placeholder '{}' → example_inputs[{}]", node.name, next_input_index);
+            // Enhanced debug: show tensor shape and device
+            let shape = tensor.getattr("shape").ok().and_then(|s| s.extract::<Vec<i64>>().ok());
+            let device = tensor.getattr("device").ok().and_then(|d| d.str().ok()).map(|s| s.to_string());
+            eprintln!(
+                "[DEBUG] Placeholder '{}' → example_inputs[{}] (shape={:?}, device={:?})",
+                node.name, next_input_index, shape, device
+            );
             placeholder_map.insert(node.name.clone(), tensor);
             next_input_index += 1;
         }
@@ -1299,6 +1305,10 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let weight_tensor = self.get_tensor(&w_name)?;
 
         let b_name = self.get_var_name(b_id, expr)?;
+        let x_name = self.get_var_name(x_id, expr)?;
+
+        // DEBUG: Log linear node arguments
+        eprintln!("[DEBUG] Linear node args: w='{}', b='{}', x='{}'", w_name, b_name, x_name);
         let has_bias = b_name != "none";
         let bias_tensor = if has_bias {
             Some(self.get_tensor(&b_name)?)

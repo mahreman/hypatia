@@ -37,6 +37,14 @@ def hypatia_backend(gm, example_inputs):
     """
     print(f"[Hypatia] Compiling graph with {len(list(gm.graph.nodes))} nodes")
 
+    # DEBUG: Log example_inputs order
+    print("\n[DEBUG] example_inputs types / shapes:")
+    for i, t in enumerate(example_inputs):
+        try:
+            print(f"  [{i}] shape={tuple(t.shape)}, device={t.device}, requires_grad={t.requires_grad}")
+        except Exception:
+            print(f"  [{i}] non-tensor: {type(t)}")
+
     # Build module_info_map from GraphModule's named_modules
     module_info_map = {}
     for name, module in gm.named_modules():
