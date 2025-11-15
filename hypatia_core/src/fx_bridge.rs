@@ -906,64 +906,56 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     }
 
     /// ✅ Get parameter/buffer tensor from GraphModule
+    /// Uses state_dict() for actual parameter tensors
     /// Handles both sanitized names ("l_self_modules_conv_parameters_weight_")
     /// and canonical names ("conv.weight")
     fn get_param_tensor(&self, name: &str) -> PyResult<Bound<'py, PyAny>> {
-        let state_dict = self.model.call_method0("state_dict")?;
+        // Check if it's an input placeholder first (not a parameter)
+        if !name.contains('.') && self.placeholder_map.contains_key(name) {
+            let placeholder_node = self.placeholder_map.get(name).unwrap();
+            return Ok(placeholder_node.bind(self.py).clone());
+        }
 
-        // If name doesn't contain '.', it's sanitized (from AST)
-        if !name.contains('.') {
-            // Try to get canonical name from param_var_map (for parameters)
+        // Determine the canonical parameter name
+        let canonical_name = if !name.contains('.') {
+            // Check if it's a parameter (in param_var_map)
             if let Some(canonical) = self.param_var_map.get(name) {
-                return state_dict.get_item(canonical)
-                    .map_err(|e| {
-                        log::error!("Parameter '{}' (canonical: '{}') not found in state_dict", name, canonical);
-                        e
-                    });
-            }
-
-            // Try to desanitize buffers: "l_self_modules_bn_buffers_running_mean_" → "bn.running_mean"
-            if name.starts_with("l_self_modules_") && name.contains("_buffers_") {
+                canonical.clone()
+            } else if name.starts_with("l_self_modules_") && name.contains("_buffers_") {
+                // Desanitize buffers: "l_self_modules_bn_buffers_running_mean_" → "bn.running_mean"
                 let after_prefix = name.strip_prefix("l_self_modules_").unwrap();
 
                 if let Some(buffers_idx) = after_prefix.find("_buffers_") {
-                    // Split at "_buffers_": "bn_buffers_running_mean_" → ["bn", "running_mean_"]
                     let module_part = &after_prefix[..buffers_idx];
-                    let buffer_part = &after_prefix[buffers_idx + 9..]; // Skip "_buffers_"
+                    let buffer_part = &after_prefix[buffers_idx + 9..];
 
-                    // Convert module path: "bn" or "layer1_0" → "bn" or "layer1.0"
                     let module_canonical = module_part.replace("_", ".");
-
-                    // Convert buffer name: "running_mean_" → "running_mean"
                     let buffer_canonical = buffer_part.strip_suffix("_").unwrap_or(buffer_part);
 
-                    let desanitized = format!("{}.{}", module_canonical, buffer_canonical);
-
-                    if let Ok(tensor) = state_dict.get_item(&desanitized) {
-                        return Ok(tensor);
-                    }
-
-                    log::warn!("Buffer '{}' desanitized to '{}' but not found in state_dict", name, desanitized);
+                    format!("{}.{}", module_canonical, buffer_canonical)
+                } else {
+                    log::error!("Invalid buffer name: '{}'", name);
+                    return Err(pyo3::exceptions::PyKeyError::new_err(
+                        format!("Invalid buffer name: {}", name)
+                    ));
                 }
+            } else {
+                log::error!("Unknown tensor name '{}': not in param_var_map or buffers", name);
+                return Err(pyo3::exceptions::PyKeyError::new_err(
+                    format!("Unknown tensor name: {}", name)
+                ));
             }
+        } else {
+            // Name already contains '.', it's canonical
+            name.to_string()
+        };
 
-            // Fallback: check placeholder_map (for input tensors like "l_x_")
-            if let Some(placeholder_node) = self.placeholder_map.get(name) {
-                // This is an input placeholder (FX Node)
-                return Ok(placeholder_node.bind(self.py).clone());
-            }
-
-            // Not found
-            log::error!("Unknown tensor name '{}': not in param_var_map, buffers, or placeholder_map", name);
-            return Err(pyo3::exceptions::PyKeyError::new_err(
-                format!("Unknown tensor name: {}", name)
-            ));
-        }
-
-        // Name contains '.': it's already canonical, get directly from state_dict
-        state_dict.get_item(name)
+        // Get tensor from state_dict
+        let state_dict = self.model.call_method0("state_dict")?;
+        state_dict.get_item(&canonical_name)
             .map_err(|e| {
-                log::error!("Parameter '{}' not found in state_dict", name);
+                log::error!("Parameter '{}' not found in state_dict", canonical_name);
+                log::debug!("Available keys: {:?}", state_dict.call_method0("keys"));
                 e
             })
     }
