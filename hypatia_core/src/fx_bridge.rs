@@ -890,60 +890,56 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             }
             
             HypatiaLang::FusedMLP(ids) => {
-                // ... (Bunu da yeni mantığa göre düzeltmemiz GEREKİR)
+                // ✅ DÜZELTME: Parametre erişimini reconstruct_node ile yap
 
                 let w1_id = ids[0]; let b1_id = ids[1];
                 let w2_id = ids[2]; let b2_id = ids[3];
                 let input_id = ids[4];
-                
-                // ✅ DÜZELTME: (Kullanıcının isteği)
-                let w1_full_name = self.get_var_name(w1_id, expr)?;
-                let b1_full_name = self.get_var_name(b1_id, expr)?;
-                let w2_full_name = self.get_var_name(w2_id, expr)?;
-                let b2_full_name = self.get_var_name(b2_id, expr)?;
-                
-                // ✅ DÜZELTME: &*String
-                let w1_tensor = self.model.getattr(&*w1_full_name)?;
-                let w2_tensor = self.model.getattr(&*w2_full_name)?;
-                let b1_has_bias = b1_full_name != "none";
-                let b2_has_bias = b2_full_name != "none";
-                
+
+                // ✅ DÜZELTME: reconstruct_node ile parametrelere eriş (placeholder_map kullanır)
+                let w1_obj = self.reconstruct_node(w1_id, expr)?;
+                let w2_obj = self.reconstruct_node(w2_id, expr)?;
+
+                let b1_name = self.get_var_name(b1_id, expr)?;
+                let b2_name = self.get_var_name(b2_id, expr)?;
+                let b1_has_bias = b1_name != "none";
+                let b2_has_bias = b2_name != "none";
+
                 let input_obj = self.reconstruct_node(input_id, expr)?;
                 let nn = PyModule::import_bound(self.py, "torch.nn")?;
-                
-                // ✅ DÜZELTME: .bind(self.py) kaldırıldı -> .clone() eklendi
-                let w1 = w1_tensor.clone();
-                // ✅ DÜZELTME: .getattr(self.py, "shape")? -> .getattr("shape")?
-                let w1_shape = w1.getattr("shape")?;
+
+                // ✅ DÜZELTME: PyObject'i bind et
+                let w1_tensor = w1_obj.bind(self.py);
+                let w1_shape = w1_tensor.getattr("shape")?;
                 // ✅ DÜZELTME: .extract(self.py)? -> .extract()?
                 let hidden_size = w1_shape.get_item(0)?.extract::<i64>()?;
                 let in_features = w1_shape.get_item(1)?.extract::<i64>()?;
                     
                 let linear1 = nn.getattr("Linear")?.call1((in_features, hidden_size))?;
                 let param_class = nn.getattr("Parameter")?;
-                // ✅ DÜZELTME: E0382 (move) hatası için w1_tensor kullanıldı
+                // ✅ DÜZELTME: w1_tensor'ı kullan
                 linear1.setattr("weight", param_class.call1((w1_tensor,))?)?;
                 if b1_has_bias {
-                    // ✅ DÜZELTME: &*String
-                    let b1_tensor = self.model.getattr(&*b1_full_name)?;
+                    // ✅ DÜZELTME: reconstruct_node ile bias'a eriş
+                    let b1_obj = self.reconstruct_node(b1_id, expr)?;
+                    let b1_tensor = b1_obj.bind(self.py);
                     linear1.setattr("bias", param_class.call1((b1_tensor,))?)?;
                 }
-                    
+
                 let relu = nn.getattr("ReLU")?.call0()?;
-                
-                // ✅ DÜZELTME: .bind(self.py) kaldırıldı -> .clone() eklendi
-                let w2 = w2_tensor.clone();
-                // ✅ DÜZELTME: .getattr(self.py, "shape")? -> .getattr("shape")?
-                let w2_shape = w2.getattr("shape")?;
-                // ✅ DÜZELTME: .extract(self.py)? -> .extract()?
+
+                // ✅ DÜZELTME: w2 için de aynı mantık
+                let w2_tensor = w2_obj.bind(self.py);
+                let w2_shape = w2_tensor.getattr("shape")?;
                 let out_features = w2_shape.get_item(0)?.extract::<i64>()?;
-                    
+
                 let linear2 = nn.getattr("Linear")?.call1((hidden_size, out_features))?;
-                // ✅ DÜZELTME: E0382 (move) hatası için w2_tensor kullanıldı
+                // ✅ DÜZELTME: w2_tensor'ı kullan
                 linear2.setattr("weight", param_class.call1((w2_tensor,))?)?;
                 if b2_has_bias {
-                    // ✅ DÜZELTME: &*String
-                    let b2_tensor = self.model.getattr(&*b2_full_name)?;
+                    // ✅ DÜZELTME: reconstruct_node ile bias'a eriş
+                    let b2_obj = self.reconstruct_node(b2_id, expr)?;
+                    let b2_tensor = b2_obj.bind(self.py);
                     linear2.setattr("bias", param_class.call1((b2_tensor,))?)?;
                 }
                     
@@ -1083,17 +1079,16 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_linear(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Orijinal parametreleri al
-        let w_full_name = self.get_var_name(w_id, expr)?;
-        let b_full_name = self.get_var_name(b_id, expr)?;
+        // 1. ✅ DÜZELTME: Parametreleri reconstruct_node ile al (placeholder_map kullanır)
+        // Direkt getattr() yerine reconstruct_node kullanarak placeholder_map'ten erişiyoruz
+        let weight_obj = self.reconstruct_node(w_id, expr)?;
+        let original_weight = weight_obj.bind(self.py);
 
-        let original_weight = self.model.getattr(&*w_full_name)
-            .map_err(|e| HypatiaError::new_err(format!("Weight '{}' not found: {}", w_full_name, e)))?;
-
-        let has_bias = b_full_name != "none";
-        let original_bias = if has_bias {
-            Some(self.model.getattr(&*b_full_name)
-                .map_err(|e| HypatiaError::new_err(format!("Bias '{}' not found: {}", b_full_name, e)))?)
+        // Bias kontrolü
+        let b_name = self.get_var_name(b_id, expr)?;
+        let has_bias = b_name != "none";
+        let original_bias_obj = if has_bias {
+            Some(self.reconstruct_node(b_id, expr)?)
         } else {
             None
         };
@@ -1109,7 +1104,8 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
 
         // 4. ✅ PARAMETRELERİ KOPYALA
         linear_module.getattr("weight")?.call_method1("copy_", (original_weight,))?;
-        if let Some(bias_tensor) = original_bias {
+        if let Some(bias_obj) = original_bias_obj {
+            let bias_tensor = bias_obj.bind(self.py);
             linear_module.getattr("bias")?.call_method1("copy_", (bias_tensor,))?;
         }
 
@@ -1128,17 +1124,15 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_conv2d(&mut self, w_id: Id, b_id: Id, x_id: Id, s_id: Id, p_id: Id, d_id: Id, g_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Orijinal parametreleri al
-        let w_full_name = self.get_var_name(w_id, expr)?;
-        let b_full_name = self.get_var_name(b_id, expr)?;
+        // 1. ✅ DÜZELTME: Parametreleri reconstruct_node ile al (placeholder_map kullanır)
+        let weight_obj = self.reconstruct_node(w_id, expr)?;
+        let original_weight = weight_obj.bind(self.py);
 
-        let original_weight = self.model.getattr(&*w_full_name)
-            .map_err(|e| HypatiaError::new_err(format!("Weight '{}' not found: {}", w_full_name, e)))?;
-
-        let has_bias = b_full_name != "none";
-        let original_bias = if has_bias {
-            Some(self.model.getattr(&*b_full_name)
-                .map_err(|e| HypatiaError::new_err(format!("Bias '{}' not found: {}", b_full_name, e)))?)
+        // Bias kontrolü
+        let b_name = self.get_var_name(b_id, expr)?;
+        let has_bias = b_name != "none";
+        let original_bias_obj = if has_bias {
+            Some(self.reconstruct_node(b_id, expr)?)
         } else {
             None
         };
@@ -1174,7 +1168,8 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
 
         // 4. ✅ PARAMETRELERİ KOPYALA
         conv_module.getattr("weight")?.call_method1("copy_", (original_weight,))?;
-        if let Some(bias_tensor) = original_bias {
+        if let Some(bias_obj) = original_bias_obj {
+            let bias_tensor = bias_obj.bind(self.py);
             conv_module.getattr("bias")?.call_method1("copy_", (bias_tensor,))?;
         }
 
@@ -1231,32 +1226,32 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_layernorm(&mut self, w_id: Id, b_id: Id, x_id: Id, eps_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Orijinal parametreleri al
-        let w_full_name = self.get_var_name(w_id, expr)?;
-        let b_full_name = self.get_var_name(b_id, expr)?;
+        // 1. ✅ DÜZELTME: Parametreleri reconstruct_node ile al (placeholder_map kullanır)
+        let w_name = self.get_var_name(w_id, expr)?;
+        let b_name = self.get_var_name(b_id, expr)?;
 
-        let has_weight = w_full_name != "none";
-        let has_bias = b_full_name != "none";
+        let has_weight = w_name != "none";
+        let has_bias = b_name != "none";
 
-        let original_weight = if has_weight {
-            Some(self.model.getattr(&*w_full_name)
-                .map_err(|e| HypatiaError::new_err(format!("LayerNorm weight '{}' not found: {}", w_full_name, e)))?)
+        let original_weight_obj = if has_weight {
+            Some(self.reconstruct_node(w_id, expr)?)
         } else {
             None
         };
 
-        let original_bias = if has_bias {
-            Some(self.model.getattr(&*b_full_name)
-                .map_err(|e| HypatiaError::new_err(format!("LayerNorm bias '{}' not found: {}", b_full_name, e)))?)
+        let original_bias_obj = if has_bias {
+            Some(self.reconstruct_node(b_id, expr)?)
         } else {
             None
         };
 
         // 2. Shape'ten normalized_shape çıkar
-        let normalized_shape = if let Some(ref weight) = original_weight {
+        let normalized_shape = if let Some(ref weight_obj) = original_weight_obj {
+            let weight = weight_obj.bind(self.py);
             let w_shape = weight.getattr("shape")?;
             w_shape.extract::<Vec<i64>>()?
-        } else if let Some(ref bias) = original_bias {
+        } else if let Some(ref bias_obj) = original_bias_obj {
+            let bias = bias_obj.bind(self.py);
             let b_shape = bias.getattr("shape")?;
             b_shape.extract::<Vec<i64>>()?
         } else {
@@ -1279,10 +1274,12 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         )?;
 
         // 5. ✅ PARAMETRELERİ KOPYALA
-        if let Some(weight_tensor) = original_weight {
+        if let Some(weight_obj) = original_weight_obj {
+            let weight_tensor = weight_obj.bind(self.py);
             ln_module.getattr("weight")?.call_method1("copy_", (weight_tensor,))?;
         }
-        if let Some(bias_tensor) = original_bias {
+        if let Some(bias_obj) = original_bias_obj {
+            let bias_tensor = bias_obj.bind(self.py);
             ln_module.getattr("bias")?.call_method1("copy_", (bias_tensor,))?;
         }
 
