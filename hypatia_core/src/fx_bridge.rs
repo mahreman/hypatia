@@ -7,7 +7,7 @@ use pyo3::types::{PyAny, PyTuple, PyDict, PyModule};
 use crate::python_bindings::{HypatiaError, ModuleInfo};
 use std::collections::HashMap;
 
-use egg::{RecExpr, Id, Language}; // `Language` trait'i eklendi (E0599)
+use egg::{RecExpr, Id};
 use crate::egraph_optimizer::HypatiaLang;
 
 // ❌ KALDIRILDI: Regex bağımlılıkları (Artık kullanılmıyor)

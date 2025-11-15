@@ -10,7 +10,7 @@ use crate::python_bindings::ModuleInfo; // ModuleInfo'yu kullanmak için import
 // `HashMap` kullanılmıyor, uyarıyı önlemek için kaldırıldı
 
 // ✅ Task 2.4: Verbose Logging
-use log::{info, debug, warn, error};
+use log::{info, debug, error};
 
 // ============================================================================
 // HYPATIA LANGUAGE DEFINITION
@@ -383,7 +383,7 @@ fn optimize_to_ast_internal(expr_str: &str, info: &ModuleInfo) -> Result<RecExpr
     let is_inference_mode_flag = info.is_inference;
 
     let res = catch_unwind(AssertUnwindSafe(|| {
-        let start_expr: RecExpr<HypatiaLang> = match expr_str.parse() {
+        let start_expr: RecExpr<HypatiaLang> = match expr_str.parse::<RecExpr<HypatiaLang>>() {
             Ok(expr) => {
                 debug!("Parse successful, expression has {} nodes", expr.as_ref().len());
                 expr
