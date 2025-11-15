@@ -966,16 +966,29 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 let b_node = self.reconstruct_node(*b, expr)?;
                 self.build_call_function("mul", &[a_node, b_node], None)
             },
-            
-            _ => { 
-                eprintln!("[WARNING] Unsupported node in reconstruction, falling back to first child: {:?}", node);
-                if node.children().is_empty() {
-                    return Err(HypatiaError::new_err(format!("Unsupported node with no children: {:?}", node)));
+
+            // ========== Catch-all: Unsupported Operations ==========
+            _ => {
+                // Check if this operation is marked as supported in is_supported_node()
+                if is_supported_node(node) {
+                    // Operation is supported but reconstruction not implemented
+                    eprintln!("[ERROR] Reconstruction not implemented for supported operation: {:?}", node);
+                    Err(HypatiaError::new_err(format!(
+                        "Reconstruction not implemented for supported operation: {:?}. \
+                         This is a bug - the operation is marked as supported but has no reconstruction handler.",
+                        node
+                    )))
+                } else {
+                    // Operation is truly unsupported
+                    eprintln!("[ERROR] Attempted to reconstruct unsupported operation: {:?}", node);
+                    Err(HypatiaError::new_err(format!(
+                        "Unsupported operation in reconstruction: {:?}. \
+                         This operation is not currently supported by Hypatia's optimizer.",
+                        node
+                    )))
                 }
-                // Fallback: İlk çocuğu (girdiyi) döndür
-                return self.reconstruct_node(*node.children().first().unwrap(), expr);
             }
-            
+
         }?;
         self.node_map.insert(node_id, new_node_obj.clone_ref(self.py));
         Ok(new_node_obj)
