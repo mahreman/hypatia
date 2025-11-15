@@ -1601,6 +1601,15 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         Ok(new_node.to_object(self.py))
     }
     
+    /// Phase3: Reconstruct FusedConvBN node
+    ///
+    /// Implements the Conv2d + BatchNorm2d fusion formula:
+    ///   gamma_hat = gamma / sqrt(var + eps)
+    ///   w_fused = w_conv * gamma_hat.reshape(-1, 1, 1, 1)
+    ///   b_fused = gamma_hat * (b_conv - mean) + beta
+    ///
+    /// This creates a single Conv2d module with fused parameters that is
+    /// mathematically equivalent to sequential Conv2d → BatchNorm2d.
     fn build_fused_conv_bn_module(
         &mut self, _node_id: Id, expr: &RecExpr<HypatiaLang>,
         input_node: PyObject,
@@ -1609,10 +1618,9 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         s_id: Id, p_id: Id, d_id: Id, g_id: Id
     ) -> PyResult<PyObject> {
 
-        eprintln!("[DEBUG] Building Fused Conv-BN module...");
+        log::info!("Building fused Conv+BN module");
 
-        // ✅ Use var_name (sanitized) instead of canonical_param_name
-        // because GraphModule doesn't have submodules, only parameters/buffers in placeholder_map
+        // 1) Get parameter variable names (sanitized form from AST)
         let w_c_var = self.get_var_name(w_c_id, expr)?;
         let b_c_var = self.get_var_name(b_c_id, expr)?;
         let w_bn_var = self.get_var_name(w_bn_id, expr)?;
@@ -1622,10 +1630,10 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
 
         let b_c_exists = b_c_var != "none";
 
-        eprintln!("[DEBUG] FusedConvBN var names: conv_w={}, bn_w={}, bn_m={}, bn_v={}",
+        log::debug!("FusedConvBN params: conv.w={}, bn.gamma={}, bn.mean={}, bn.var={}",
             w_c_var, w_bn_var, m_var, v_var);
 
-        // Get tensors from placeholder_map (all are placeholders in GraphModule)
+        // 2) Get actual tensors from state_dict (via get_param_tensor)
         let torch = PyModule::import_bound(self.py, "torch")?;
 
         let w_c = self.get_param_tensor(&w_c_var)?;
@@ -1637,63 +1645,87 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let eps_str = self.get_var_name(eps_id, expr)?;
         let eps = self.unsanitize_value(&eps_str)?.extract::<f64>(self.py)?;
 
-        let sqrt_var = v.call_method1("add", (eps,))?.call_method0("sqrt")?;
-        let scale = w_bn.call_method1("div", (sqrt_var,))?;
-
+        // 3) Extract Conv2d shape parameters
         let w_c_shape = w_c.getattr("shape")?.extract::<Vec<usize>>()?;
-        let scale_shape: Vec<isize> = vec![-1, 1, 1, 1];
-        let scale_broadcast = scale.call_method1("view", (scale_shape,))?;
+        let out_channels = w_c_shape[0];
+        // Note: in_channels_per_group = w_c_shape[1]
+        // groups will be extracted from AST below
 
-        let w_fused = w_c.call_method1("mul", (scale_broadcast,))?;
+        // 4) Apply fusion formula: gamma_hat = gamma / sqrt(var + eps)
+        let sqrt_var = v.call_method1("add", (eps,))?.call_method0("sqrt")?;
+        let gamma_hat = w_bn.call_method1("div", (sqrt_var,))?;
 
+        // Reshape gamma_hat for broadcasting: (C,) → (C, 1, 1, 1)
+        let gamma_hat_4d = gamma_hat.call_method1("view", (vec![-1, 1, 1, 1],))?;
+
+        // 5) Compute fused weight: w_fused = w_conv * gamma_hat
+        let w_fused = w_c.call_method1("mul", (gamma_hat_4d,))?;
+
+        // 6) Compute fused bias: b_fused = gamma_hat * (b_conv - mean) + beta
         let b_c_val = if b_c_exists {
-            // ✅ Use var_name (already extracted above as b_c_var)
             self.get_param_tensor(&b_c_var)?
         } else {
+            // If conv has no bias, use zeros_like(mean)
             torch.call_method1("zeros_like", (m.clone(),))?
         };
-        
-        // ✅ DÜZELTME: call_method (self.py) kaldırıldı
-        let b_fused = b_c_val.call_method1("sub", (m,))?
-                           .call_method1("mul", (scale,))?
-                           .call_method1("add", (b_bn,))?;
 
+        let b_fused = b_c_val.call_method1("sub", (m,))?           // b_conv - mean
+                           .call_method1("mul", (gamma_hat,))?     // * gamma_hat
+                           .call_method1("add", (b_bn,))?;         // + beta
+
+        // 7) Extract hyperparameters from AST
         let stride = self.unsanitize_tuple(&self.get_var_name(s_id, expr)?)?;
         let padding = self.unsanitize_tuple(&self.get_var_name(p_id, expr)?)?;
         let dilation = self.unsanitize_tuple(&self.get_var_name(d_id, expr)?)?;
         let groups = self.unsanitize_value(&self.get_var_name(g_id, expr)?)?;
-        
-        let out_channels = w_c_shape[0];
-        // ✅ DÜZELTME: .extract(self.py)? (PyObject üzerinde çağrılıyor)
-        let in_channels = w_c_shape[1] * groups.extract::<usize>(self.py)?;
-        
+
+        let groups_val = groups.extract::<usize>(self.py)?;
+        let in_channels = w_c_shape[1] * groups_val;
         let kernel_size = (w_c_shape[2], w_c_shape[3]).to_object(self.py);
-        
+
+        // 8) Preserve device and dtype from original conv weight
+        let device = w_c.getattr("device")?;
+        let dtype = w_c.getattr("dtype")?;
+
+        log::debug!("Creating fused Conv2d: in={}, out={}, kernel={:?}, stride={:?}, groups={}",
+                    in_channels, out_channels, (w_c_shape[2], w_c_shape[3]),
+                    stride, groups_val);
+
+        // 9) Create new Conv2d module with fused parameters
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
         let kwargs = PyDict::new_bound(self.py);
         kwargs.set_item("stride", stride)?;
         kwargs.set_item("padding", padding)?;
         kwargs.set_item("dilation", dilation)?;
         kwargs.set_item("groups", groups)?;
-        kwargs.set_item("bias", true)?; 
+        kwargs.set_item("bias", true)?;  // Fused conv always has bias
 
-        let conv_module = torch_nn.getattr("Conv2d")?.call(
+        let fused_conv = torch_nn.getattr("Conv2d")?.call(
             (in_channels, out_channels, kernel_size),
             Some(&kwargs)
         )?;
-        
-        conv_module.getattr("weight")?.getattr("data")?.call_method1("copy_", (w_fused,))?;
-        conv_module.getattr("bias")?.getattr("data")?.call_method1("copy_", (b_fused,))?;
 
+        // 10) Copy fused parameters to module
+        // Note: copy_ preserves dtype automatically
+        fused_conv.getattr("weight")?.getattr("data")?.call_method1("copy_", (w_fused,))?;
+        fused_conv.getattr("bias")?.getattr("data")?.call_method1("copy_", (b_fused,))?;
+
+        // 11) Move module to original device if needed
+        // (Usually not necessary as GraphModule is on CPU, but safer to preserve)
+        fused_conv.call_method1("to", (device,))?;
+
+        // 12) Register fused module in param_map and create FX node
         let module_target_name = format!("fused_conv_bn_{}", self.param_map.len());
-        self.param_map.insert(module_target_name.clone(), conv_module.to_object(self.py));
-        
+        log::info!("Fused Conv+BN module created successfully: {}", &module_target_name);
+
+        self.param_map.insert(module_target_name.clone(), fused_conv.to_object(self.py));
+
+        // 13) Create FX graph node calling the fused module
         let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
         let new_node = self.new_graph.call_method(
             "create_node", ("call_module", module_target_name, args_tuple), None
         )?;
-        
-        eprintln!("[DEBUG] Fused Conv-BN module created successfully");
+
         Ok(new_node.to_object(self.py))
     }
 
