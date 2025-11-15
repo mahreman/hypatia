@@ -13,6 +13,7 @@ try:
         PyMultiVector2D,
         PyMultiVector3D,
         HypatiaError,
+        HypatiaCompileResult,
         set_log_level,
     )
 except ImportError as e:
@@ -25,20 +26,43 @@ import torch
 import warnings
 
 def hypatia_backend(gm, example_inputs):
-    """Hypatia compiler backend for torch.compile()"""
-    module_info_map = {}
+    """Hypatia compiler backend for torch.compile()
+
+    Args:
+        gm: torch.fx.GraphModule - The compiled graph module
+        example_inputs: List of example tensors
+
+    Returns:
+        Optimized GraphModule
+    """
     print(f"[Hypatia] Compiling graph with {len(list(gm.graph.nodes))} nodes")
-    
+
+    # Build module_info_map from GraphModule's named_modules
+    module_info_map = {}
+    for name, module in gm.named_modules():
+        is_inference = not getattr(module, "training", False)
+        has_bias = hasattr(module, "bias") and module.bias is not None
+        module_type = type(module).__name__
+
+        module_info_map[name] = {
+            "type": module_type,
+            "has_bias": has_bias,
+            "is_inference": is_inference,
+        }
+
     try:
-        optimized_gm = compile_fx_graph(gm, example_inputs, module_info_map)
-        
-        if optimized_gm is gm:
-            print("[Hypatia] Optimization failed or skipped, using original model")
+        # Call Rust compilation with 4 arguments:
+        # (gm for graph, gm for parameters, example_inputs, module_info_map)
+        result = compile_fx_graph(gm, gm, example_inputs, module_info_map)
+
+        # result is HypatiaCompileResult with optimized_gm and structure_changed
+        if result.structure_changed:
+            print("[Hypatia] ✅ Optimization successful! (graph structure changed - rewrites applied)")
         else:
-            print("[Hypatia] ✅ Optimization successful!")
-        
-        return optimized_gm
-        
+            print("[Hypatia] ✅ Compilation completed (graph structure preserved)")
+
+        return result.optimized_gm
+
     except Exception as e:
         warnings.warn(
             f"Hypatia compilation failed: {e}. Falling back to original model.",
@@ -75,6 +99,7 @@ __all__ = [
     "PyMultiVector2D",
     "PyMultiVector3D",
     "HypatiaError",
+    "HypatiaCompileResult",
     "set_log_level",
     "register_backend",
 ]
