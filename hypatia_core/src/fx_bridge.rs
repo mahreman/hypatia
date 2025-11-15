@@ -22,6 +22,18 @@ use crate::egraph_optimizer::HypatiaLang;
 // fn normalize_placeholder(name: &str) -> String { ... }
 
 // ============================================================================
+// DEBUG FLAGS
+// ============================================================================
+
+/// Check if verbose FX debugging is enabled via HYPATIA_DEBUG_FX environment variable
+/// Set HYPATIA_DEBUG_FX=1 for detailed placeholder mapping and reconstruction logs
+fn is_debug_fx_enabled() -> bool {
+    env::var("HYPATIA_DEBUG_FX")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+// ============================================================================
 // CHECKSUM VALIDATION MODE
 // ============================================================================
 
@@ -176,19 +188,23 @@ pub fn fx_graph_to_sexpr<'py>(
                 )));
             }
             let tensor = example_inputs[next_input_index].clone();
-            // Enhanced debug: show tensor shape and device
-            let shape = tensor.getattr("shape").ok().and_then(|s| s.extract::<Vec<i64>>().ok());
-            let device = tensor.getattr("device").ok().and_then(|d| d.str().ok()).map(|s| s.to_string());
-            eprintln!(
-                "[DEBUG] Placeholder '{}' → example_inputs[{}] (shape={:?}, device={:?})",
-                node.name, next_input_index, shape, device
-            );
+            // Enhanced debug: show tensor shape and device (only if HYPATIA_DEBUG_FX=1)
+            if is_debug_fx_enabled() {
+                let shape = tensor.getattr("shape").ok().and_then(|s| s.extract::<Vec<i64>>().ok());
+                let device = tensor.getattr("device").ok().and_then(|d| d.str().ok()).map(|s| s.to_string());
+                eprintln!(
+                    "[DEBUG] Placeholder '{}' → example_inputs[{}] (shape={:?}, device={:?})",
+                    node.name, next_input_index, shape, device
+                );
+            }
             placeholder_map.insert(node.name.clone(), tensor);
             next_input_index += 1;
         }
     }
 
-    eprintln!("[DEBUG] Placeholder mapping created: {} entries", placeholder_map.len());
+    if is_debug_fx_enabled() {
+        eprintln!("[DEBUG] Placeholder mapping created: {} entries", placeholder_map.len());
+    }
 
     let sexpr = build_sexpr_from_nodes(&nodes, types_map, gm)?;
 
@@ -1305,10 +1321,17 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let weight_tensor = self.get_tensor(&w_name)?;
 
         let b_name = self.get_var_name(b_id, expr)?;
-        let x_name = self.get_var_name(x_id, expr)?;
 
-        // DEBUG: Log linear node arguments
-        eprintln!("[DEBUG] Linear node args: w='{}', b='{}', x='{}'", w_name, b_name, x_name);
+        // DEBUG: Log linear node arguments (only if HYPATIA_DEBUG_FX=1)
+        // x_id might be a nested expression (e.g., ReLU(...)), not just Var/Const
+        if is_debug_fx_enabled() {
+            let x_desc = match self.get_var_name(x_id, expr) {
+                Ok(name) => name,
+                Err(_) => format!("{:?}", expr[x_id])  // Fallback to debug repr for expressions
+            };
+            eprintln!("[DEBUG] Linear node args: w='{}', b='{}', x={}", w_name, b_name, x_desc);
+        }
+
         let has_bias = b_name != "none";
         let bias_tensor = if has_bias {
             Some(self.get_tensor(&b_name)?)
