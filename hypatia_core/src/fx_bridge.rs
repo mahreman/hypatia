@@ -875,15 +875,29 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             .ok_or_else(|| {
                 log::error!("Unknown tensor placeholder: {}", name);
                 pyo3::exceptions::PyKeyError::new_err(format!("Unknown tensor placeholder: {}", name))
+            })
+    }
+
     /// ✅ YENİ: Canonical parameter name al
-    /// Eğer bu bir parametre ise param_var_map'ten real name döner ("fc1.weight")
+    /// Parametre ismini desanitize eder ("l_self_modules_fc1_parameters_weight_" → "fc1.weight")
     /// Değilse sanitized var name döner ("l_x_")
     fn get_canonical_param_name(&self, node_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<String> {
         let var_name = self.get_var_name(node_id, expr)?; // "l_self_modules_fc1_parameters_weight_"
 
-        // Eğer param_var_map'te varsa, real name döndür
-        if let Some(real_name) = self.param_var_map.get(&var_name) {
-            Ok(real_name.clone()) // "fc1.weight"
+        // Parametre ise desanitize et
+        if var_name.starts_with("l_self_modules_") && var_name.contains("_parameters_") {
+            let after_prefix = var_name.strip_prefix("l_self_modules_").unwrap();
+            if let Some(params_idx) = after_prefix.find("_parameters_") {
+                let module_part = &after_prefix[..params_idx];
+                let param_part = &after_prefix[params_idx + 12..]; // "_parameters_" = 12 chars
+
+                let module_canonical = module_part.replace("_", ".");
+                let param_canonical = param_part.strip_suffix("_").unwrap_or(param_part);
+
+                Ok(format!("{}.{}", module_canonical, param_canonical))
+            } else {
+                Ok(var_name)
+            }
         } else {
             Ok(var_name) // Girdi placeholder için ("l_x_")
         }
@@ -897,14 +911,29 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         // Check if it's an input placeholder first (not a parameter)
         if !name.contains('.') && self.placeholder_map.contains_key(name) {
             let placeholder_node = self.placeholder_map.get(name).unwrap();
-            return Ok(placeholder_node.bind(self.py).clone());
+            return Ok(placeholder_node.clone());
         }
 
         // Determine the canonical parameter name
         let canonical_name = if !name.contains('.') {
-            // Check if it's a parameter (in param_var_map)
-            if let Some(canonical) = self.param_var_map.get(name) {
-                canonical.clone()
+            // Check if it's a parameter and desanitize
+            if name.starts_with("l_self_modules_") && name.contains("_parameters_") {
+                // Desanitize parameters: "l_self_modules_fc1_parameters_weight_" → "fc1.weight"
+                let after_prefix = name.strip_prefix("l_self_modules_").unwrap();
+                if let Some(params_idx) = after_prefix.find("_parameters_") {
+                    let module_part = &after_prefix[..params_idx];
+                    let param_part = &after_prefix[params_idx + 12..];
+
+                    let module_canonical = module_part.replace("_", ".");
+                    let param_canonical = param_part.strip_suffix("_").unwrap_or(param_part);
+
+                    format!("{}.{}", module_canonical, param_canonical)
+                } else {
+                    log::error!("Invalid parameter name: '{}'", name);
+                    return Err(pyo3::exceptions::PyKeyError::new_err(
+                        format!("Invalid parameter name: {}", name)
+                    ));
+                }
             } else if name.starts_with("l_self_modules_") && name.contains("_buffers_") {
                 // Desanitize buffers: "l_self_modules_bn_buffers_running_mean_" → "bn.running_mean"
                 let after_prefix = name.strip_prefix("l_self_modules_").unwrap();
@@ -924,7 +953,7 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                     ));
                 }
             } else {
-                log::error!("Unknown tensor name '{}': not in param_var_map or buffers", name);
+                log::error!("Unknown tensor name '{}': not a parameter, buffer, or input placeholder", name);
                 return Err(pyo3::exceptions::PyKeyError::new_err(
                     format!("Unknown tensor name: {}", name)
                 ));
@@ -935,7 +964,7 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         };
 
         // Get tensor from state_dict
-        let state_dict = self.model.call_method0("state_dict")?;
+        let state_dict = self.original_gm.call_method0("state_dict")?;
         state_dict.get_item(&canonical_name)
             .map_err(|e| {
                 log::error!("Parameter '{}' not found in state_dict", canonical_name);
