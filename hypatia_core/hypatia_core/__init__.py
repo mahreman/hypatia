@@ -51,9 +51,10 @@ def hypatia_backend(gm, example_inputs):
         }
 
     try:
-        # Call Rust compilation with 4 arguments:
-        # (gm for graph, gm for parameters, example_inputs, module_info_map)
-        result = compile_fx_graph(gm, gm, example_inputs, module_info_map)
+        # ✅ REFACTORED: Call Rust compilation with 3 arguments:
+        # (gm, example_inputs, module_info_map)
+        # Parametreler artık example_inputs üzerinden çözülüyor
+        result = compile_fx_graph(gm, example_inputs, module_info_map)
 
         # result is HypatiaCompileResult with optimized_gm and structure_changed
         if result.structure_changed:

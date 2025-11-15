@@ -142,43 +142,61 @@ enum FxOp {
 // ============================================================================
 // PHASE 2: CONVERSION RESULT
 // ============================================================================
-pub struct FxConversionResult {
+pub struct FxConversionResult<'py> {
     pub sexpr: String,
-    pub param_var_map: HashMap<String, String>, // sanitized_var_name -> real_param_name
+    pub placeholder_map: HashMap<String, Bound<'py, PyAny>>, // ✅ YENİ: placeholder_name -> tensor
+    // param_var_map artık gereksiz (placeholder_map her şeyi içeriyor)
 }
 
 // ============================================================================
 // PHASE 2: MAIN PARSING FUNCTION (fx_graph_to_sexpr)
 // ============================================================================
-pub fn fx_graph_to_sexpr(
-    py: Python<'_>,
-    gm: &Bound<PyAny>,
+pub fn fx_graph_to_sexpr<'py>(
+    py: Python<'py>,
+    gm: &Bound<'py, PyAny>,
+    example_inputs: &[Bound<'py, PyAny>], // ✅ YENİ: placeholder sırası ile eşleşir
     types_map: &HashMap<String, ModuleInfo>
-) -> PyResult<FxConversionResult> {
+) -> PyResult<FxConversionResult<'py>> {
     let graph = gm.getattr("graph")?;
     eprintln!("[fx_bridge::Phase2] Starting FX parse...");
     let nodes = parse_fx_nodes(py, &graph)?;
     eprintln!("[DEBUG] FX graph node count: {}", nodes.len());
 
-    // NOT: Varsayılan değerler (is_inference vb.)
-    // python_bindings.rs'de ModuleInfo'nun FromPyObject implementasyonunda halledildi.
+    // ✅ YENİ: Placeholder → example_inputs mapping oluştur
+    let mut placeholder_map = HashMap::new();
+    let mut next_input_index = 0;
 
-    let mut param_var_map = HashMap::new();
-    let sexpr = build_sexpr_from_nodes(&nodes, types_map, gm, &mut param_var_map)?;
+    for node in &nodes {
+        if let FxOp::Placeholder = &node.op {
+            if next_input_index >= example_inputs.len() {
+                return Err(HypatiaError::new_err(format!(
+                    "example_inputs too short: expected at least {} inputs for placeholder '{}'",
+                    next_input_index + 1,
+                    node.name
+                )));
+            }
+            let tensor = example_inputs[next_input_index].clone();
+            eprintln!("[DEBUG] Placeholder '{}' → example_inputs[{}]", node.name, next_input_index);
+            placeholder_map.insert(node.name.clone(), tensor);
+            next_input_index += 1;
+        }
+    }
 
-    eprintln!("[DEBUG] Parameter mapping created: {} entries", param_var_map.len());
-    Ok(FxConversionResult { sexpr, param_var_map })
+    eprintln!("[DEBUG] Placeholder mapping created: {} entries", placeholder_map.len());
+
+    let sexpr = build_sexpr_from_nodes(&nodes, types_map, gm)?;
+
+    Ok(FxConversionResult { sexpr, placeholder_map })
 }
 
 // ============================================================================
 // PHASE 3: MAIN RECONSTRUCTION FUNCTION (sexpr_to_fx_graph)
 // ============================================================================
-pub fn sexpr_to_fx_graph(
-    py: Python<'_>,
-    model: &Bound<PyAny>, // ✅ Orijinal model (gm), parametre erişimi için
-    original_gm: &Bound<PyAny>, // Bu da GraphModule (gm), submodule eklemek için
+pub fn sexpr_to_fx_graph<'py>(
+    py: Python<'py>,
+    original_gm: &Bound<'py, PyAny>, // GraphModule (submodule eklemek için)
     optimized_expr: RecExpr<HypatiaLang>,
-    param_var_map: &HashMap<String, String>, // ✅ YENİ: var_name -> real_param_name mapping
+    placeholder_map: &HashMap<String, Bound<'py, PyAny>>, // ✅ YENİ: name -> tensor mapping
 ) -> PyResult<PyObject> {
     eprintln!("[fx_bridge::Phase3] Reconstructing graph from optimized AST...");
 
@@ -189,48 +207,30 @@ pub fn sexpr_to_fx_graph(
 
     let mut rebuilder = FxRebuilder {
         py,
-        model, // ✅ Parametreler için
         original_gm, // Submodule'ler için
         new_graph,
         node_map: HashMap::new(),
-        placeholder_map: HashMap::new(),
+        fx_placeholder_map: HashMap::new(), // ✅ YENİ: FX node'ları için
+        placeholder_map, // ✅ YENİ: Tensörler için
         param_map: HashMap::new(),
-        param_var_map, // ✅ YENİ: Parametre mapping'i ekle
     };
 
+    // ✅ YENİ: Yeni grafa placeholder node'ları ekle
     let original_graph = original_gm.getattr("graph")?;
     for node in original_graph.getattr("nodes")?.iter()? {
         let node = node?;
-        let op = node.getattr("op")?.extract::<String>()?; // Orijinal op'u al
-        let name = node.getattr("name")?.extract::<String>()?; // "l_..._weight_" veya "l_x_"
+        let op = node.getattr("op")?.extract::<String>()?;
+        let name = node.getattr("name")?.extract::<String>()?;
 
         if op == "placeholder" {
             // Yeni grafa placeholder'ı ekle
             let ph_node = rebuilder.new_graph.call_method1("placeholder", (name.clone(),))?;
-            
-            // ✅ DÜZELTME: (Kullanıcının isteği)
-            // ARTIK normalize/sanitize yapmıyoruz
-            // Orijinal FX placeholder adı -> anahtar olarak kullanılacak
-            // 'l_x_' ve 'l_self_modules_...' buraya girecek
-            rebuilder
-                .placeholder_map
-                .insert(name.clone(), ph_node.to_object(py));
-        
+            rebuilder.fx_placeholder_map.insert(name.clone(), ph_node.to_object(py));
         } else if op == "get_attr" {
-            // ✅ DÜZELTME: 'get_attr' düğümleri de parametre olabilir (ResNet)
-            // Bunları da placeholder_map'e eklemeliyiz ki S-expr'deki
-            // 'Var' düğümleri bunları bulabilsin.
-            // (Not: 'get_attr' düğümleri 'create_node' gerektirmez,
-            // bunlar zaten 'gm' üzerinde mevcuttur)
-            
-            // 'get_attr' düğümünü temsil eden bir Python nesnesine ihtiyacımız var.
-            // En kolayı, onu yeni grafikte de 'get_attr' olarak oluşturmaktır.
+            // GetAttr node'ları için de yeni grafikte ekle
             let target = node.getattr("target")?.extract::<String>()?;
             let get_attr_node = rebuilder.new_graph.call_method1("get_attr", (target,))?;
-
-            rebuilder
-                .placeholder_map
-                .insert(name.clone(), get_attr_node.to_object(py));
+            rebuilder.fx_placeholder_map.insert(name.clone(), get_attr_node.to_object(py));
         }
     }
 
@@ -244,13 +244,13 @@ pub fn sexpr_to_fx_graph(
 
     rebuilder.new_graph.call_method1("output", (final_node_obj,))?;
 
-    // Bu, Fused modüller (LinearReLU vb.) için gereklidir
+    // Fused modüller (LinearReLU vb.) için submodule'leri ekle
     for (name, module) in rebuilder.param_map {
         original_gm.call_method("add_submodule", (name, module), None)?;
     }
 
     let new_gm = fx.getattr("GraphModule")?.call1((original_gm, rebuilder.new_graph))?;
-    
+
     eprintln!("[fx_bridge::Phase3] Reconstruction complete.");
     Ok(new_gm.to_object(py))
 }
@@ -381,31 +381,17 @@ fn parse_node_kwargs(_py: Python<'_>, node: &Bound<PyAny>) -> PyResult<HashMap<S
 fn build_sexpr_from_nodes(
     nodes: &[FxNode],
     types_map: &HashMap<String, ModuleInfo>,
-    gm: &Bound<PyAny>,
-    param_var_map: &mut HashMap<String, String>
+    gm: &Bound<PyAny>
 ) -> PyResult<String> {
     let mut node_exprs: HashMap<String, String> = HashMap::new();
 
     for node in nodes {
         let sexpr = match &node.op {
             FxOp::Placeholder => {
-                // ✅ DÜZELTME: (Kullanıcının isteği)
-                // Artık normalize/sanitize yok. Orijinal adı kullan.
-                // 'l_x_' -> 'l_x_'
-                // 'l_self_modules_fc1_parameters_weight_' -> 'l_self_modules_fc1_parameters_weight_'
-                //
-                // ✅ YENİ: Eğer bu bir parametre placeholder'ı ise mapping'e ekle
-                // Pattern: l_self_modules_<name>_parameters_<param>_
-                if node.name.starts_with("l_self_modules_") && node.name.contains("_parameters_") {
-                    // Extract real param name: l_self_modules_fc1_parameters_weight_ -> fc1.weight
-                    let after_modules = &node.name[15..]; // Skip "l_self_modules_"
-                    if let Some(params_idx) = after_modules.find("_parameters_") {
-                        let module_name = &after_modules[..params_idx]; // "fc1"
-                        let param_part = &after_modules[params_idx + 12..].trim_end_matches('_'); // "weight"
-                        let real_param_name = format!("{}.{}", module_name, param_part);
-                        param_var_map.insert(node.name.clone(), real_param_name);
-                    }
-                }
+                // ✅ YENİ: Placeholder isimleri direkt kullanılır
+                // example_inputs sırası ile eşleşir
+                // 'l_x_' -> input placeholder
+                // 'l_self_modules_fc1_parameters_weight_' -> param placeholder
                 node.name.clone()
             },
             FxOp::Output => {
@@ -424,19 +410,10 @@ fn build_sexpr_from_nodes(
             FxOp::CallMethod { method } => {
                 handle_call_method(method, &node.inputs, &node.kwargs, &node_exprs)?
             },
-            FxOp::GetAttr { attr } => {
-                // ✅ DÜZELTME: (Kullanıcının isteği)
-                // Bu, 'get_attr' (örn: ResNet) kullanan modeller içindir.
-                // Not: 'attr' burada 'target'ten gelir, 'name'den değil.
-                // FX grafiği `name='fc1_weight', op='get_attr', target='fc1.weight'` üretebilir.
-                // Bu durumda 'fc1.weight' kullanmalıyız.
-
-                // ✅ YENİ: GetAttr için de mapping ekle
-                // GetAttr durumunda: node.name = sanitized, attr = real name
-                param_var_map.insert(node.name.clone(), attr.clone());
-
-                // ❌ ÖNCEKİ: sanitize_var_name(attr)
-                node.name.clone() // AST'de sanitized ismi kullan
+            FxOp::GetAttr { .. } => {
+                // ✅ YENİ: GetAttr node'ları da placeholder gibi işlenir
+                // Placeholder_map'te zaten var (Phase2'de eklendi)
+                node.name.clone()
             }
         };
         
@@ -868,13 +845,12 @@ fn handle_call_method(
 
 struct FxRebuilder<'a, 'py> {
     py: Python<'py>,
-    model: &'a Bound<'py, PyAny>, // ✅ Orijinal model (gm), parametreler için
     original_gm: &'a Bound<'py, PyAny>, // Submodule eklemek için
     new_graph: &'a Bound<'py, PyAny>,
     node_map: HashMap<Id, PyObject>,
-    placeholder_map: HashMap<String, PyObject>, // Anahtar: 'l_x_' veya 'l_self_modules...'
+    fx_placeholder_map: HashMap<String, PyObject>, // ✅ YENİ: FX node'ları (placeholder/get_attr)
+    placeholder_map: &'a HashMap<String, Bound<'py, PyAny>>, // ✅ YENİ: Tensörler (example_inputs'tan)
     param_map: HashMap<String, PyObject>, // Fused modüller için
-    param_var_map: &'a HashMap<String, String>, // ✅ YENİ: var_name -> real_param_name
 }
 impl<'a, 'py> FxRebuilder<'a, 'py> {
 
@@ -891,6 +867,14 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         }
     }
 
+    /// ✅ YENİ: Tensör al (placeholder_map'ten)
+    /// AST içindeki Var ismi ("l_self_modules_fc1_parameters_weight_", "l_x_" vs.)
+    fn get_tensor(&self, name: &str) -> PyResult<Bound<'py, PyAny>> {
+        self.placeholder_map.get(name)
+            .map(|t| t.clone())
+            .ok_or_else(|| {
+                log::error!("Unknown tensor placeholder: {}", name);
+                pyo3::exceptions::PyKeyError::new_err(format!("Unknown tensor placeholder: {}", name))
     /// ✅ YENİ: Canonical parameter name al
     /// Eğer bu bir parametre ise param_var_map'ten real name döner ("fc1.weight")
     /// Değilse sanitized var name döner ("l_x_")
@@ -973,16 +957,13 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         
         let new_node_obj = match node {
             HypatiaLang::Var(var_symbol) => {
-                // ✅ DÜZELTME: (Kullanıcının isteği)
+                // ✅ YENİ: FX placeholder node'unu döndür
                 let var_name = var_symbol.to_string(); // "l_x_" VEYA "l_self_modules_..."
-                if let Some(placeholder_node) = self.placeholder_map.get(&var_name) {
-                    // Hem 'l_x_' (girdi) hem de 'l_self_modules_...' (parametre)
-                    // placeholder_map'te (veya get_attr_map'te) olmalı.
-                    Ok(placeholder_node.clone_ref(self.py))
+                if let Some(fx_node) = self.fx_placeholder_map.get(&var_name) {
+                    Ok(fx_node.clone_ref(self.py))
                 } else {
-                    // Haritada olmayan bir değişken
                     Err(HypatiaError::new_err(format!(
-                        "Reconstruction failed: Var '{}' is not a known placeholder or get_attr", var_name
+                        "Reconstruction failed: Var '{}' is not a known placeholder", var_name
                     )))
                 }
             }
@@ -1085,25 +1066,24 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             }
             
             HypatiaLang::FusedMLP(ids) => {
-                // ✅ DÜZELTME: placeholder_map + target kullanarak tensörleri al
-                // ✅ DÜZELTME: Parametre erişimini model.getattr ile yap (tensörleri al)
+                // ✅ REFACTORED: get_tensor kullanarak
 
                 let w1_id = ids[0]; let b1_id = ids[1];
                 let w2_id = ids[2]; let b2_id = ids[3];
                 let input_id = ids[4];
 
-                // Get canonical param names and tensors
+                // Tensörleri get_tensor ile al
                 let b1_name = self.get_var_name(b1_id, expr)?;
                 let b2_name = self.get_var_name(b2_id, expr)?;
 
                 let b1_has_bias = b1_name != "none";
                 let b2_has_bias = b2_name != "none";
 
-                let w1_real_name = self.get_canonical_param_name(w1_id, expr)?;
-                let w1_tensor = self.get_param_tensor(&w1_real_name)?;
+                let w1_name = self.get_var_name(w1_id, expr)?;
+                let w1_tensor = self.get_tensor(&w1_name)?;
 
-                let w2_real_name = self.get_canonical_param_name(w2_id, expr)?;
-                let w2_tensor = self.get_param_tensor(&w2_real_name)?;
+                let w2_name = self.get_var_name(w2_id, expr)?;
+                let w2_tensor = self.get_tensor(&w2_name)?;
 
                 let input_obj = self.reconstruct_node(input_id, expr)?;
                 let nn = PyModule::import_bound(self.py, "torch.nn")?;
@@ -1117,8 +1097,7 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 let param_class = nn.getattr("Parameter")?;
                 linear1.setattr("weight", param_class.call1((w1_tensor,))?)?;
                 if b1_has_bias {
-                    let b1_real_name = self.get_canonical_param_name(b1_id, expr)?;
-                    let b1_tensor = self.get_param_tensor(&b1_real_name)?;
+                    let b1_tensor = self.get_tensor(&b1_name)?;
                     linear1.setattr("bias", param_class.call1((b1_tensor,))?)?;
                 }
 
@@ -1131,8 +1110,7 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 let linear2 = nn.getattr("Linear")?.call1((hidden_size, out_features))?;
                 linear2.setattr("weight", param_class.call1((w2_tensor,))?)?;
                 if b2_has_bias {
-                    let b2_real_name = self.get_canonical_param_name(b2_id, expr)?;
-                    let b2_tensor = self.get_param_tensor(&b2_real_name)?;
+                    let b2_tensor = self.get_tensor(&b2_name)?;
                     linear2.setattr("bias", param_class.call1((b2_tensor,))?)?;
                 }
 
@@ -1223,9 +1201,9 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         &mut self, _node_id: Id, expr: &RecExpr<HypatiaLang>,
         w_id: Id, input_node: PyObject, prefix: &str,
     ) -> PyResult<PyObject> {
-        // Get canonical param name and tensor
-        let w_real_name = self.get_canonical_param_name(w_id, expr)?; // "embedding.weight"
-        let w_tensor = self.get_param_tensor(&w_real_name)?;
+        // ✅ REFACTORED: get_tensor kullanarak
+        let w_name = self.get_var_name(w_id, expr)?;
+        let w_tensor = self.get_tensor(&w_name)?;
 
         let module_target_name = format!("{}_{}", prefix, self.param_map.len());
         
@@ -1266,36 +1244,35 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         Ok(new_node.to_object(self.py))
     }
 
-    // ✅ YENİ FONKSİYON: reconstruct_linear() - Parametre kopyalama ile
+    // ✅ REFACTORED: reconstruct_linear() - get_tensor kullanarak
     fn reconstruct_linear(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Get canonical param name and tensor
-        let w_real_name = self.get_canonical_param_name(w_id, expr)?;
-        let original_weight = self.get_param_tensor(&w_real_name)?;
+        // 1. Tensörleri get_tensor ile al
+        let w_name = self.get_var_name(w_id, expr)?;
+        let weight_tensor = self.get_tensor(&w_name)?;
 
         let b_name = self.get_var_name(b_id, expr)?;
         let has_bias = b_name != "none";
-        let original_bias = if has_bias {
-            let b_real_name = self.get_canonical_param_name(b_id, expr)?;
-            Some(self.get_param_tensor(&b_real_name)?)
+        let bias_tensor = if has_bias {
+            Some(self.get_tensor(&b_name)?)
         } else {
             None
         };
 
-        // 3. Shape bilgisini TENSÖRDEN çıkar
-        let weight_shape = original_weight.getattr("shape")?;
+        // 2. Shape bilgisini TENSÖRDEN çıkar
+        let weight_shape = weight_tensor.getattr("shape")?;
         let out_features: i64 = weight_shape.get_item(0)?.extract()?;
         let in_features: i64 = weight_shape.get_item(1)?.extract()?;
 
-        // 4. Yeni Linear modül oluştur
+        // 3. Yeni Linear modül oluştur
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
         let linear_module = torch_nn.getattr("Linear")?.call1((in_features, out_features))?;
 
-        // 5. ✅ PARAMETRELERİ (Tensörleri) KOPYALA
-        linear_module.getattr("weight")?.call_method1("copy_", (original_weight,))?;
-        if let Some(bias_tensor) = original_bias {
-            linear_module.getattr("bias")?.call_method1("copy_", (bias_tensor,))?;
+        // 4. ✅ PARAMETRELERİ (Tensörleri) KOPYALA
+        linear_module.getattr("weight")?.call_method1("copy_", (weight_tensor,))?;
+        if let Some(bias_t) = bias_tensor {
+            linear_module.getattr("bias")?.call_method1("copy_", (bias_t,))?;
         }
 
         // 5. Module map'e ekle ve node oluştur
@@ -1309,25 +1286,24 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         Ok(new_node.to_object(self.py))
     }
 
-    // ✅ YENİ FONKSİYON: reconstruct_conv2d() - Parametre kopyalama ile
+    // ✅ REFACTORED: reconstruct_conv2d() - get_tensor kullanarak
     fn reconstruct_conv2d(&mut self, w_id: Id, b_id: Id, x_id: Id, s_id: Id, p_id: Id, d_id: Id, g_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Get canonical param name and tensor
-        let w_real_name = self.get_canonical_param_name(w_id, expr)?;
-        let original_weight = self.get_param_tensor(&w_real_name)?;
+        // 1. Tensörleri get_tensor ile al
+        let w_name = self.get_var_name(w_id, expr)?;
+        let weight_tensor = self.get_tensor(&w_name)?;
 
         let b_name = self.get_var_name(b_id, expr)?;
         let has_bias = b_name != "none";
-        let original_bias = if has_bias {
-            let b_real_name = self.get_canonical_param_name(b_id, expr)?;
-            Some(self.get_param_tensor(&b_real_name)?)
+        let bias_tensor = if has_bias {
+            Some(self.get_tensor(&b_name)?)
         } else {
             None
         };
 
-        // 3. Shape bilgisini ve hyperparametreleri çıkar
-        let weight_shape = original_weight.getattr("shape")?;
+        // 2. Shape bilgisini ve hyperparametreleri çıkar
+        let weight_shape = weight_tensor.getattr("shape")?;
         let out_channels: i64 = weight_shape.get_item(0)?.extract()?;
         let in_channels_per_group: i64 = weight_shape.get_item(1)?.extract()?;
         let kernel_h: i64 = weight_shape.get_item(2)?.extract()?;
@@ -1341,7 +1317,7 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let in_channels = in_channels_per_group * groups.extract::<i64>(self.py)?;
         let kernel_size = (kernel_h, kernel_w).to_object(self.py);
 
-        // 4. Yeni Conv2d modül oluştur
+        // 3. Yeni Conv2d modül oluştur
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
         let kwargs = PyDict::new_bound(self.py);
         kwargs.set_item("stride", stride)?;
@@ -1355,10 +1331,10 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             Some(&kwargs)
         )?;
 
-        // 5. ✅ PARAMETRELERİ (Tensörleri) KOPYALA
-        conv_module.getattr("weight")?.call_method1("copy_", (original_weight,))?;
-        if let Some(bias_tensor) = original_bias {
-            conv_module.getattr("bias")?.call_method1("copy_", (bias_tensor,))?;
+        // 4. ✅ PARAMETRELERİ (Tensörleri) KOPYALA
+        conv_module.getattr("weight")?.call_method1("copy_", (weight_tensor,))?;
+        if let Some(bias_t) = bias_tensor {
+            conv_module.getattr("bias")?.call_method1("copy_", (bias_t,))?;
         }
 
         // 5. Module map'e ekle ve node oluştur
@@ -1414,43 +1390,41 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     fn reconstruct_layernorm(&mut self, w_id: Id, b_id: Id, x_id: Id, eps_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
 
-        // 1. Get canonical param names and tensors
+        // 1. Tensörleri get_tensor ile al
         let w_name = self.get_var_name(w_id, expr)?;
         let b_name = self.get_var_name(b_id, expr)?;
 
         let has_weight = w_name != "none";
         let has_bias = b_name != "none";
 
-        let original_weight = if has_weight {
-            let w_real_name = self.get_canonical_param_name(w_id, expr)?;
-            Some(self.get_param_tensor(&w_real_name)?)
+        let weight_tensor = if has_weight {
+            Some(self.get_tensor(&w_name)?)
         } else {
             None
         };
 
-        let original_bias = if has_bias {
-            let b_real_name = self.get_canonical_param_name(b_id, expr)?;
-            Some(self.get_param_tensor(&b_real_name)?)
+        let bias_tensor = if has_bias {
+            Some(self.get_tensor(&b_name)?)
         } else {
             None
         };
 
-        // 3. Shape'ten normalized_shape çıkar
-        let normalized_shape = if let Some(ref weight) = original_weight {
+        // 2. Shape'ten normalized_shape çıkar
+        let normalized_shape = if let Some(ref weight) = weight_tensor {
             let w_shape = weight.getattr("shape")?;
             w_shape.extract::<Vec<i64>>()?
-        } else if let Some(ref bias) = original_bias {
+        } else if let Some(ref bias) = bias_tensor {
             let b_shape = bias.getattr("shape")?;
             b_shape.extract::<Vec<i64>>()?
         } else {
             return Err(HypatiaError::new_err("LayerNorm: Both weight and bias are 'none'"));
         };
 
-        // 4. eps değerini al
+        // 3. eps değerini al
         let eps_str = self.get_var_name(eps_id, expr)?;
         let eps_value = self.unsanitize_value(&eps_str)?;
 
-        // 5. LayerNorm modül oluştur
+        // 4. LayerNorm modül oluştur
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
         let kwargs = PyDict::new_bound(self.py);
         kwargs.set_item("eps", eps_value)?;
@@ -1461,12 +1435,12 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             Some(&kwargs)
         )?;
 
-        // 6. ✅ PARAMETRELERİ (Tensörleri) KOPYALA
-        if let Some(weight_tensor) = original_weight {
-            ln_module.getattr("weight")?.call_method1("copy_", (weight_tensor,))?;
+        // 5. ✅ PARAMETRELERİ (Tensörleri) KOPYALA
+        if let Some(weight) = weight_tensor {
+            ln_module.getattr("weight")?.call_method1("copy_", (weight,))?;
         }
-        if let Some(bias_tensor) = original_bias {
-            ln_module.getattr("bias")?.call_method1("copy_", (bias_tensor,))?;
+        if let Some(bias) = bias_tensor {
+            ln_module.getattr("bias")?.call_method1("copy_", (bias,))?;
         }
 
         // 6. Module map'e ekle ve node oluştur
@@ -1543,19 +1517,19 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         &mut self, _node_id: Id, expr: &RecExpr<HypatiaLang>,
         w_id: Id, b_id: Id, m_id: Id, v_id: Id, input_node: PyObject, eps_id: Id
     ) -> PyResult<PyObject> {
-        // Get canonical param names and tensors
-        let w_real_name = self.get_canonical_param_name(w_id, expr)?;
-        let b_real_name = self.get_canonical_param_name(b_id, expr)?;
-        let mean_real_name = self.get_canonical_param_name(m_id, expr)?;
-        let var_real_name = self.get_canonical_param_name(v_id, expr)?;
+        // ✅ REFACTORED: get_tensor kullanarak
+        let w_name = self.get_var_name(w_id, expr)?;
+        let b_name = self.get_var_name(b_id, expr)?;
+        let m_name = self.get_var_name(m_id, expr)?;
+        let v_name = self.get_var_name(v_id, expr)?;
 
-        eprintln!("[DEBUG] BatchNorm resolved names: weight={}, bias={}, mean={}, var={}",
-            w_real_name, b_real_name, mean_real_name, var_real_name);
+        eprintln!("[DEBUG] BatchNorm param names: weight={}, bias={}, mean={}, var={}",
+            w_name, b_name, m_name, v_name);
 
-        let w_tensor = self.get_param_tensor(&w_real_name)?;
-        let b_tensor = self.get_param_tensor(&b_real_name)?;
-        let mean_tensor = self.get_param_tensor(&mean_real_name)?;
-        let var_tensor = self.get_param_tensor(&var_real_name)?;
+        let w_tensor = self.get_tensor(&w_name)?;
+        let b_tensor = self.get_tensor(&b_name)?;
+        let mean_tensor = self.get_tensor(&m_name)?;
+        let var_tensor = self.get_tensor(&v_name)?;
 
         let eps_str = self.get_var_name(eps_id, expr)?;
         let eps = self.unsanitize_value(&eps_str)?;
@@ -1612,7 +1586,7 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
 
         log::info!("Building fused Conv+BN module");
 
-        // 1) Get parameter variable names (sanitized form from AST)
+        // ✅ REFACTORED: get_tensor kullanarak
         let w_c_var = self.get_var_name(w_c_id, expr)?;
         let b_c_var = self.get_var_name(b_c_id, expr)?;
         let w_bn_var = self.get_var_name(w_bn_id, expr)?;
@@ -1625,37 +1599,37 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         log::debug!("FusedConvBN params: conv.w={}, bn.gamma={}, bn.mean={}, bn.var={}",
             w_c_var, w_bn_var, m_var, v_var);
 
-        // 2) Get actual tensors from state_dict (via get_param_tensor)
+        // 1) Tensörleri get_tensor ile al
         let torch = PyModule::import_bound(self.py, "torch")?;
 
-        let w_c = self.get_param_tensor(&w_c_var)?;
-        let w_bn = self.get_param_tensor(&w_bn_var)?;
-        let b_bn = self.get_param_tensor(&b_bn_var)?;
-        let m = self.get_param_tensor(&m_var)?;
-        let v = self.get_param_tensor(&v_var)?;
+        let w_c = self.get_tensor(&w_c_var)?;
+        let w_bn = self.get_tensor(&w_bn_var)?;
+        let b_bn = self.get_tensor(&b_bn_var)?;
+        let m = self.get_tensor(&m_var)?;
+        let v = self.get_tensor(&v_var)?;
 
         let eps_str = self.get_var_name(eps_id, expr)?;
         let eps = self.unsanitize_value(&eps_str)?.extract::<f64>(self.py)?;
 
-        // 3) Extract Conv2d shape parameters
+        // 2) Extract Conv2d shape parameters
         let w_c_shape = w_c.getattr("shape")?.extract::<Vec<usize>>()?;
         let out_channels = w_c_shape[0];
         // Note: in_channels_per_group = w_c_shape[1]
         // groups will be extracted from AST below
 
-        // 4) Apply fusion formula: gamma_hat = gamma / sqrt(var + eps)
+        // 3) Apply fusion formula: gamma_hat = gamma / sqrt(var + eps)
         let sqrt_var = v.call_method1("add", (eps,))?.call_method0("sqrt")?;
         let gamma_hat = w_bn.call_method1("div", (sqrt_var,))?;
 
         // Reshape gamma_hat for broadcasting: (C,) → (C, 1, 1, 1)
         let gamma_hat_4d = gamma_hat.call_method1("view", (vec![-1, 1, 1, 1],))?;
 
-        // 5) Compute fused weight: w_fused = w_conv * gamma_hat
+        // 4) Compute fused weight: w_fused = w_conv * gamma_hat
         let w_fused = w_c.call_method1("mul", (gamma_hat_4d,))?;
 
-        // 6) Compute fused bias: b_fused = gamma_hat * (b_conv - mean) + beta
+        // 5) Compute fused bias: b_fused = gamma_hat * (b_conv - mean) + beta
         let b_c_val = if b_c_exists {
-            self.get_param_tensor(&b_c_var)?
+            self.get_tensor(&b_c_var)?
         } else {
             // If conv has no bias, use zeros_like(mean)
             torch.call_method1("zeros_like", (m.clone(),))?

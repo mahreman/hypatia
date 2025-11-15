@@ -340,21 +340,31 @@ pub fn is_equivalent(expr1_str: String, expr2_str: String) -> PyResult<bool> {
     }
 }
 
-/// ✅ GÜNCELLENDİ: FX GRAPH COMPILATION (4 Argümanlı)
-/// Python'dan gelen 4 argümanlı çağrıya uyacak şekilde imza güncellendi.
+/// ✅ REFACTORED: FX GRAPH COMPILATION - example_inputs üzerinden parametre çözme
+/// Python'dan gelen 3 argümanlı çağrıya uyacak şekilde imza güncellendi.
 /// ✅ Görev 1.3: Returns HypatiaCompileResult with structure_changed flag
 #[pyfunction]
 pub fn compile_fx_graph(
     py_graph_module: PyObject,      // Arg 1: GraphModule (graph için)
-    py_original_model: PyObject,    // Arg 2: ✅ YENİ: Orijinal model (parametreler için)
-    _example_inputs: PyObject,      // Arg 3: example_inputs (List)
-    module_info_map: &Bound<'_, PyDict>, // Arg 4: module_info_map
+    py_example_inputs: PyObject,    // Arg 2: ✅ YENİ: example_inputs (placeholder sırası ile eşleşir)
+    module_info_map: &Bound<'_, PyDict>, // Arg 3: module_info_map
 ) -> PyResult<Py<HypatiaCompileResult>> {
     Python::with_gil(|py| {
         let gm = py_graph_module.bind(py);
-        let model_bound = py_original_model.bind(py); // ✅ Orijinal model parametreler için
-        
-        eprintln!("[DEBUG] compile_fx_graph called (4-arg: gm, original_model, example_inputs, module_info)");
+        let example_inputs_bound = py_example_inputs.bind(py);
+
+        eprintln!("[DEBUG] compile_fx_graph called (3-arg: gm, example_inputs, module_info)");
+
+        // example_inputs'i Vec<Bound<PyAny>>'e çevir
+        let inputs: Vec<Bound<PyAny>> = if let Ok(tuple) = example_inputs_bound.downcast::<pyo3::types::PyTuple>() {
+            tuple.iter().collect()
+        } else if let Ok(list) = example_inputs_bound.downcast::<pyo3::types::PyList>() {
+            list.iter().collect()
+        } else {
+            return Err(HypatiaError::new_err("example_inputs must be a tuple or list"));
+        };
+
+        eprintln!("[DEBUG] example_inputs count: {}", inputs.len());
 
         // ✅ DÜZELTME: `module_info_map` (Dict) 3. argümandır ve zorunludur.
         let info_map: HashMap<String, ModuleInfo> = module_info_map
@@ -370,9 +380,9 @@ pub fn compile_fx_graph(
             has_bias: true,
             is_inference: true // Varsayılan
         });
-        
-        // Bu çağrı artık `gm`'yi doğru şekilde almalı
-        let conversion_result = match crate::fx_bridge::fx_graph_to_sexpr(py, &gm, &info_map) {
+
+        // ✅ YENİ: example_inputs'i fx_graph_to_sexpr'a gönder
+        let conversion_result = match crate::fx_bridge::fx_graph_to_sexpr(py, &gm, &inputs, &info_map) {
             Ok(result) => result,
             Err(e) => {
                 log::warn!("FX graph parsing failed: {}. Falling back to original GraphModule.", e);
@@ -385,9 +395,8 @@ pub fn compile_fx_graph(
         };
 
         let sexpr = &conversion_result.sexpr;
-        let param_var_map = &conversion_result.param_var_map;
         eprintln!("[DEBUG] S-expression (ilk 500 karakter): {:.500}...", sexpr);
-        eprintln!("[DEBUG] Parameter mapping: {} entries", param_var_map.len());
+        eprintln!("[DEBUG] Placeholder mapping: {} entries", conversion_result.placeholder_map.len());
         
         // optimize_to_ast_with_info'yu kullanarak genel is_inference bayrağını iletin
         let optimized_ast = match crate::egraph_optimizer::optimize_to_ast_with_info(&sexpr, &general_info) {
@@ -401,7 +410,7 @@ pub fn compile_fx_graph(
                 })?);
             }
         };
-        
+
         let optimized_sexpr = crate::egraph_optimizer::rec_to_string(&optimized_ast);
         eprintln!("[DEBUG] Optimized AST: {}", optimized_sexpr);
 
@@ -413,8 +422,8 @@ pub fn compile_fx_graph(
             log::info!("Graph structure preserved (no e-graph rewrites applied)");
         }
 
-        // ✅ DÜZELTME: `sexpr_to_fx_graph`'a `model` ve `gm` olarak `gm`'nin kendisini (farklı binding'lerle) ver
-        match crate::fx_bridge::sexpr_to_fx_graph(py, model_bound, &gm, optimized_ast, param_var_map) {
+        // ✅ YENİ: sexpr_to_fx_graph'a placeholder_map'i gönder
+        match crate::fx_bridge::sexpr_to_fx_graph(py, &gm, optimized_ast, &conversion_result.placeholder_map) {
             Ok(optimized_gm) => {
                 // ✅ YENİ: Gelişmiş parametre doğrulama mekanizması
 
