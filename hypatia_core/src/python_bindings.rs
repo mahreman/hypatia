@@ -350,7 +350,7 @@ pub fn compile_fx_graph(
         let conversion_result = match crate::fx_bridge::fx_graph_to_sexpr(py, &gm, &info_map) {
             Ok(result) => result,
             Err(e) => {
-                eprintln!("[compile_fx_graph] FX parsing failed: {}", e);
+                log::warn!("FX graph parsing failed: {}. Falling back to original GraphModule.", e);
                 return Ok(gm.to_object(py)); // Fallback
             }
         };
@@ -364,7 +364,7 @@ pub fn compile_fx_graph(
         let optimized_ast = match crate::egraph_optimizer::optimize_to_ast_with_info(&sexpr, &general_info) {
             Ok(ast) => ast,
             Err(e) => {
-                eprintln!("[compile_fx_graph] Optimization failed: {}", e);
+                log::warn!("E-graph optimization failed: {}. Falling back to original GraphModule.", e);
                 return Ok(gm.to_object(py)); // Fallback
             }
         };
@@ -386,16 +386,15 @@ pub fn compile_fx_graph(
 
                 // 2. Parametre sayısı kontrolü
                 if original_params.len() != optimized_params.len() {
-                    eprintln!("[PARAM LOSS] Parameter count mismatch: {} → {}",
-                              original_params.len(), optimized_params.len());
-                    eprintln!("[PARAM LOSS] Falling back to original model");
+                    log::error!("Parameter count mismatch during reconstruction: {} → {}. Falling back to original model.",
+                                original_params.len(), optimized_params.len());
                     return Ok(gm.to_object(py));
                 }
 
                 // 3. Boş model kontrolü (önceki davranışı koru)
                 if optimized_params.is_empty() && !original_params.is_empty() {
-                    eprintln!("[PARAM LOSS] Optimized model has no parameters (original had {})",
-                              original_params.len());
+                    log::error!("Optimized model has no parameters (original had {}). Falling back to original model.",
+                                original_params.len());
                     return Ok(gm.to_object(py));
                 }
 
@@ -417,8 +416,8 @@ pub fn compile_fx_graph(
                         ) {
                             let diff = (orig_sum - opt_sum).abs();
                             if diff > 1e-3 {
-                                eprintln!("[PARAM MISMATCH] Param #{} checksum failed: {:.6} vs {:.6} (diff: {:.6})",
-                                          i, orig_sum, opt_sum, diff);
+                                log::warn!("Parameter #{} checksum mismatch: {:.6} vs {:.6} (diff: {:.6})",
+                                           i, orig_sum, opt_sum, diff);
                                 mismatch_count += 1;
                             }
                         }
@@ -426,19 +425,17 @@ pub fn compile_fx_graph(
                 }
 
                 if mismatch_count > 0 {
-                    eprintln!("[PARAM MISMATCH] {} out of {} parameters have checksum mismatches",
-                              mismatch_count, original_params.len());
-                    eprintln!("[PARAM MISMATCH] Falling back to original model");
+                    log::error!("{} out of {} parameters have checksum mismatches. Falling back to original model.",
+                                mismatch_count, original_params.len());
                     return Ok(gm.to_object(py));
                 }
 
                 // 5. Tüm doğrulamalar başarılı
-                eprintln!("✅ Parameter preservation verified: {} params", original_params.len());
+                log::info!("Parameter preservation verified: {} params", original_params.len());
                 Ok(optimized_gm)
             }
             Err(err) => {
-                eprintln!("[compile_fx_graph] Reconstruction FAILED: {err:?}");
-                eprintln!("[compile_fx_graph] Falling back to original GraphModule");
+                log::error!("Graph reconstruction failed: {:?}. Falling back to original GraphModule.", err);
                 Ok(gm.to_object(py))
             }
         }

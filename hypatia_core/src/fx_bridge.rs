@@ -815,6 +815,7 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 return Ok(t.bind(self.py).clone());
             } else {
                 // Hata: ne param ne placeholder
+                log::error!("Unknown tensor name '{}': not found in placeholder_map", canonical_name);
                 return Err(pyo3::exceptions::PyKeyError::new_err(
                     format!("Unknown tensor name: {}", canonical_name)
                 ));
@@ -833,6 +834,8 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             .call_method1("get_submodule", (module_path.clone(),))
             .map_err(|e| {
                 e.print(self.py);
+                log::error!("Failed to get_submodule('{}') for parameter '{}': {}",
+                            module_path, canonical_name, e);
                 pyo3::exceptions::PyAttributeError::new_err(format!(
                     "get_submodule('{}') failed", module_path
                 ))
@@ -842,6 +845,8 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             .getattr(field)
             .map_err(|e| {
                 e.print(self.py);
+                log::error!("Submodule '{}' has no attribute '{}' for parameter '{}'",
+                            module_path, field, canonical_name);
                 pyo3::exceptions::PyAttributeError::new_err(format!(
                     "submodule '{}' has no attr '{}'", module_path, field
                 ))
@@ -1051,7 +1056,7 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 // Check if this operation is marked as supported in is_supported_node()
                 if is_supported_node(node) {
                     // Operation is supported but reconstruction not implemented
-                    eprintln!("[ERROR] Reconstruction not implemented for supported operation: {:?}", node);
+                    log::error!("Reconstruction not implemented for supported operation: {:?}. This is a bug.", node);
                     Err(HypatiaError::new_err(format!(
                         "Reconstruction not implemented for supported operation: {:?}. \
                          This is a bug - the operation is marked as supported but has no reconstruction handler.",
@@ -1059,7 +1064,7 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                     )))
                 } else {
                     // Operation is truly unsupported
-                    eprintln!("[ERROR] Attempted to reconstruct unsupported operation: {:?}", node);
+                    log::warn!("Attempted to reconstruct unsupported operation: {:?}. Operation not currently supported.", node);
                     Err(HypatiaError::new_err(format!(
                         "Unsupported operation in reconstruction: {:?}. \
                          This operation is not currently supported by Hypatia's optimizer.",
