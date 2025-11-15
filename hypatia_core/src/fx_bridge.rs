@@ -854,32 +854,26 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 self.build_passthrough_module("transformer_encoder", input_node)
             }
             HypatiaLang::Linear([w_id, b_id, x_id]) => {
-                // ✅ DÜZELTME: Artık 'reconstruct_node'u parametreler için ÇAĞIRIYORUZ
-                // 'w_id' -> 'Var(l_self_..._weight_)' -> 'placeholder_map.get(...)'
-                let w_node = self.reconstruct_node(*w_id, expr)?;
-                let b_node = self.reconstruct_node(*b_id, expr)?;
-                let x_node = self.reconstruct_node(*x_id, expr)?;
-
-                // F.linear(input, weight, bias)
-                self.build_call_function("linear", &[x_node, w_node, b_node], None)
+                // ✅ YENİ: reconstruct_linear kullanarak parametre kopyalama ile nn.Linear modülü oluştur
+                self.reconstruct_linear(*w_id, *b_id, *x_id, expr)
             }
             HypatiaLang::Embedding([w_id, x_id]) => {
                 let input_node = self.reconstruct_node(*x_id, expr)?;
                 self.build_embedding_module(node_id, expr, *w_id, input_node, "embedding")
             }
 
-            // 🟢 ADIM 4: (linear-relu w b x) -> F.relu(F.linear(x, w, b))
-            // (Eski nn.Sequential oluşturan kod bloğu bununla değiştirildi)
+            // ✅ YENİ: (linear-relu w b x) -> nn.ReLU(nn.Linear(x, w, b))
+            // Parametre kopyalama ile nn.Linear ve nn.ReLU modülleri oluştur
             HypatiaLang::LinearReLU(args) => {
                 // args = [w, b, x]
-                let x = self.reconstruct_node(args[2], expr)?;
-                let w = self.reconstruct_node(args[0], expr)?;
-                let b = self.reconstruct_node(args[1], expr)?;
+                let w_id = args[0];
+                let b_id = args[1];
+                let x_id = args[2];
 
-                // F.linear(input, weight, bias)
-                let linear = self.build_call_function("linear", &[x, w, b], None)?;
-                // F.relu(input)
-                let relu = self.build_call_function("relu", &[linear], None)?;
+                // nn.Linear modülü oluştur (parametre kopyalama ile)
+                let linear_node = self.reconstruct_linear(w_id, b_id, x_id, expr)?;
+                // F.relu(input) - fonksiyonel relu kullan
+                let relu = self.build_call_function("relu", &[linear_node], None)?;
                 Ok(relu)
             }
             
@@ -1050,16 +1044,61 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let module_target_name = format!("relu_{}", self.param_map.len());
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
         let relu_module = torch_nn.getattr("ReLU")?.call0()?;
-        
+
         self.param_map.insert(module_target_name.clone(), relu_module.to_object(self.py));
-        
+
         let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
         let new_node = self.new_graph.call_method(
             "create_node", ("call_module", module_target_name, args_tuple), None
         )?;
         Ok(new_node.to_object(self.py))
     }
-    
+
+    // ✅ YENİ FONKSİYON: reconstruct_linear() - Parametre kopyalama ile
+    fn reconstruct_linear(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+
+        // 1. Orijinal parametreleri al
+        let w_full_name = self.get_var_name(w_id, expr)?;
+        let b_full_name = self.get_var_name(b_id, expr)?;
+
+        let original_weight = self.model.getattr(&*w_full_name)
+            .map_err(|e| HypatiaError::new_err(format!("Weight '{}' not found: {}", w_full_name, e)))?;
+
+        let has_bias = b_full_name != "none";
+        let original_bias = if has_bias {
+            Some(self.model.getattr(&*b_full_name)
+                .map_err(|e| HypatiaError::new_err(format!("Bias '{}' not found: {}", b_full_name, e)))?)
+        } else {
+            None
+        };
+
+        // 2. Shape bilgisini çıkar
+        let weight_shape = original_weight.getattr("shape")?;
+        let out_features: i64 = weight_shape.get_item(0)?.extract()?;
+        let in_features: i64 = weight_shape.get_item(1)?.extract()?;
+
+        // 3. Yeni Linear modül oluştur
+        let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
+        let linear_module = torch_nn.getattr("Linear")?.call1((in_features, out_features))?;
+
+        // 4. ✅ PARAMETRELERİ KOPYALA
+        linear_module.getattr("weight")?.call_method1("copy_", (original_weight,))?;
+        if let Some(bias_tensor) = original_bias {
+            linear_module.getattr("bias")?.call_method1("copy_", (bias_tensor,))?;
+        }
+
+        // 5. Module map'e ekle ve node oluştur
+        let module_target_name = format!("linear_{}", self.param_map.len());
+        self.param_map.insert(module_target_name.clone(), linear_module.to_object(self.py));
+
+        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
+        let new_node = self.new_graph.call_method(
+            "create_node", ("call_module", module_target_name, args_tuple), None
+        )?;
+        Ok(new_node.to_object(self.py))
+    }
+
     fn build_call_function(
         &mut self,
         target: &str,
