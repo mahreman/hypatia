@@ -47,12 +47,13 @@ def _load_fused_linear_relu_ext() -> None:
         _FUSED_LINEAR_RELU_EXT = _load_ext(
             name="hypatia_fused_linear_relu",
             sources=[src_cpp, src_cu],
-            verbose=False,
+            verbose=True,  # Show compilation output for debugging
         )
         _HAS_CUDA_KERNEL = True
+        print(f"[Hypatia] ✅ CUDA extension loaded successfully")
     except Exception as exc:
         # Build sırasında hata olursa, sessizce fallback'e geç
-        print(f"[Hypatia] Warning: failed to build fused_linear_relu CUDA extension: {exc}")
+        print(f"[Hypatia] ⚠️  Warning: failed to build fused_linear_relu CUDA extension: {exc}")
         _FUSED_LINEAR_RELU_EXT = None
         _HAS_CUDA_KERNEL = False
 
@@ -290,3 +291,7 @@ def create_fused_mlp_from_tensors(
 
 __all__ = ["FusedLinearReLU", "HypatiaFusedLinearReLU", "FusedLinearReLUFunction",
            "create_fused_linear_relu_from_tensors", "FusedMLP", "create_fused_mlp_from_tensors"]
+
+# ✅ Eager load CUDA extension when module is imported
+# This ensures JIT compilation happens immediately, not lazily
+_load_fused_linear_relu_ext()
