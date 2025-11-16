@@ -1,205 +1,177 @@
-"""
-Fused PyTorch modules for Hypatia optimizations.
+# hypatia_core/fused_modules.py
 
-These modules combine multiple operations into single efficient implementations,
-resulting from E-graph fusion optimizations.
+from __future__ import annotations
 
-Currently available:
-  - HypatiaFusedLinearReLU: Linear + ReLU combination
-"""
-
+import os
 from typing import Optional
-import math
 
 import torch
 import torch.nn as nn
-from torch.autograd import Function
+import torch.nn.functional as F
 
-# Try to import CUDA extension
 try:
-    import hypatia_core._linear_relu_cuda as _C
-    CUDA_EXTENSION_AVAILABLE = True
+    from torch.utils.cpp_extension import load as _load_ext
 except ImportError:
-    _C = None
-    CUDA_EXTENSION_AVAILABLE = False
+    _load_ext = None
+
+# -----------------------------------------------------------------------------
+# C++/CUDA extension yükleme (opsiyonel)
+# -----------------------------------------------------------------------------
+
+_FUSED_LINEAR_RELU_EXT = None
+_HAS_CUDA_KERNEL = False
+
+def _load_fused_linear_relu_ext() -> None:
+    global _FUSED_LINEAR_RELU_EXT, _HAS_CUDA_KERNEL
+
+    if _FUSED_LINEAR_RELU_EXT is not None:
+        return
+
+    if _load_ext is None:
+        _FUSED_LINEAR_RELU_EXT = None
+        _HAS_CUDA_KERNEL = False
+        return
+
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    # Go up one level to hypatia_core root, then into csrc
+    parent_dir = os.path.dirname(this_dir)
+    src_cpp = os.path.join(parent_dir, "csrc", "fused_linear_relu.cpp")
+    src_cu  = os.path.join(parent_dir, "csrc", "fused_linear_relu_kernel.cu")
+
+    if not (os.path.exists(src_cpp) and os.path.exists(src_cu)):
+        _FUSED_LINEAR_RELU_EXT = None
+        _HAS_CUDA_KERNEL = False
+        return
+
+    try:
+        _FUSED_LINEAR_RELU_EXT = _load_ext(
+            name="hypatia_fused_linear_relu",
+            sources=[src_cpp, src_cu],
+            verbose=False,
+        )
+        _HAS_CUDA_KERNEL = True
+    except Exception as exc:
+        # Build sırasında hata olursa, sessizce fallback'e geç
+        print(f"[Hypatia] Warning: failed to build fused_linear_relu CUDA extension: {exc}")
+        _FUSED_LINEAR_RELU_EXT = None
+        _HAS_CUDA_KERNEL = False
 
 
-class FusedLinearReLUFunction(Function):
-    """
-    Autograd Function for fused Linear+ReLU using CUDA kernels.
+# -----------------------------------------------------------------------------
+# Autograd.Function
+# -----------------------------------------------------------------------------
 
-    Forward: y = relu(x @ W^T + b)
-    Backward: Compute gradients w.r.t. input, weight, and bias
-    """
+class FusedLinearReLUFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input: torch.Tensor,
+                weight: torch.Tensor,
+                bias: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        Eğer CUDA kernel mevcutsa:
+          y = ReLU( input @ weight.T + bias ) tek kernel ile hesaplanır.
+        Aksi halde:
+          F.linear + F.relu fallback'ine düşer.
+        """
+        use_cuda_kernel = (
+            input.is_cuda
+            and weight.is_cuda
+            and (bias is None or bias.is_cuda)
+            and _HAS_CUDA_KERNEL
+        )
+
+        if use_cuda_kernel:
+            # C++/CUDA kernel çağrısı
+            y = _FUSED_LINEAR_RELU_EXT.forward(input, weight, bias)
+        else:
+            # Graph-level fusion fallback (kernel fusion yok)
+            y = F.relu(F.linear(input, weight, bias))
+
+        ctx.save_for_backward(input, weight, bias if bias is not None else None, y)
+        return y
 
     @staticmethod
-    def forward(ctx, input, weight, bias):
+    def backward(ctx, grad_output: torch.Tensor):
         """
-        Args:
-            input: Input tensor, shape (..., in_features)
-            weight: Weight tensor, shape (out_features, in_features)
-            bias: Bias tensor, shape (out_features,)
-
-        Returns:
-            output: Output tensor, shape (..., out_features)
-        """
-        # Ensure all tensors are contiguous and on same device/dtype
-        input = input.contiguous()
-        weight = weight.contiguous()
-        bias = bias.contiguous()
-
-        # Call CUDA kernel
-        output = _C.forward(input, weight, bias)
-
-        # Save for backward
-        ctx.save_for_backward(input, weight, bias, output)
-
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """
-        Args:
-            grad_output: Gradient w.r.t. output, shape (..., out_features)
-
-        Returns:
-            grad_input: Gradient w.r.t. input, shape (..., in_features)
-            grad_weight: Gradient w.r.t. weight, shape (out_features, in_features)
-            grad_bias: Gradient w.r.t. bias, shape (out_features,)
+        Backward'ı PyTorch op'larıyla yapıyoruz.
+        Bu, kernel-level fused backward değil ama:
+          - correctness için yeterli
+          - training'de güvenli
         """
         input, weight, bias, output = ctx.saved_tensors
 
-        # Ensure grad_output is contiguous
-        grad_output = grad_output.contiguous()
+        # grad_output shape: [N, out_features]
+        # output: [N, out_features]  (ReLU sonrası)
+        grad_input = grad_weight = grad_bias = None
 
-        # Call CUDA backward kernel
-        grad_input, grad_weight, grad_bias = _C.backward(
-            grad_output, input, weight, bias, output
-        )
+        # dL/dz = dL/dy * 1_{y>0}, z = x @ W^T + b, y = ReLU(z)
+        grad_z = grad_output
+        if output is not None:
+            grad_z = grad_output * (output > 0).to(grad_output.dtype)
+
+        if ctx.needs_input_grad[0]:
+            # grad_input = grad_z @ W
+            grad_input = grad_z.matmul(weight)
+        if ctx.needs_input_grad[1]:
+            # grad_weight = grad_z^T @ input
+            grad_weight = grad_z.t().matmul(input)
+        if ctx.needs_input_grad[2] and bias is not None:
+            # grad_bias = sum_n grad_z[n, :]
+            grad_bias = grad_z.sum(dim=0)
 
         return grad_input, grad_weight, grad_bias
 
 
-class HypatiaFusedLinearReLU(nn.Module):
+# -----------------------------------------------------------------------------
+# nn.Module wrapper (Hypatia FX e-graph'in ürettiği modül)
+# -----------------------------------------------------------------------------
+
+class FusedLinearReLU(nn.Module):
     """
-    Fused Linear + ReLU module.
+    Hypatia'nın e-graph'ı tarafından kullanılan fused Linear+ReLU modülü.
 
-    Semantically equivalent to:
-        y = torch.relu(nn.Linear(in_features, out_features)(x))
-
-    Advantages:
-      - Fewer kernel calls / reduced Python overhead
-      - Fewer intermediate tensor allocations (cache/latency benefits)
-      - Better instruction-level parallelism
+    - State dict uyumluluğu için içerde bir nn.Linear tutuyoruz (self.fc).
+    - CUDA'da mümkünse C++/CUDA kernel'i, aksi halde F.linear+ReLU kullanıyoruz.
     """
 
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-    ) -> None:
+    def __init__(self,
+                 in_features: int,
+                 out_features: int,
+                 bias: bool = True,
+                 device: Optional[torch.device] = None,
+                 dtype: Optional[torch.dtype] = None) -> None:
         super().__init__()
 
-        self.in_features = in_features
-        self.out_features = out_features
-
-        # Create weight and bias parameters directly
-        # This gives us more control for kernel fusion
         factory_kwargs = {'device': device, 'dtype': dtype}
-        self.weight = nn.Parameter(torch.empty((out_features, in_features), **factory_kwargs))
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
-        else:
-            self.register_parameter('bias', None)
+        self.fc = nn.Linear(in_features, out_features, bias=bias, **factory_kwargs)
 
-        # Initialize parameters using Kaiming initialization (good for ReLU)
-        self.reset_parameters()
-
-        # Packed weight buffer for future optimization
-        # (prepacking for optimal memory layout)
-        self.register_buffer("_packed_weight", None, persistent=False)
-
-    def reset_parameters(self) -> None:
-        """Initialize parameters using Kaiming uniform initialization."""
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias, -bound, bound)
+        # Extension'ı lazy-load
+        _load_fused_linear_relu_ext()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: Linear transformation followed by ReLU"""
-
-        # Check if we can use CUDA kernel
-        use_cuda_kernel = (
-            CUDA_EXTENSION_AVAILABLE and
-            x.is_cuda and
-            self.weight.is_cuda and
-            (self.bias is None or self.bias.is_cuda) and
-            x.dtype == torch.float32 and
-            self.weight.dtype == torch.float32 and
-            (self.bias is None or self.bias.dtype == torch.float32)
-        )
-
-        if use_cuda_kernel:
-            # Use fused CUDA kernel
-            # TODO: In future, use packed weight for better performance
-            # if self._packed_weight is None or self._packed_weight.shape != self.weight.shape:
-            #     self._packed_weight = self.weight.contiguous()
-
-            weight = self.weight.contiguous()
-            bias = self.bias if self.bias is not None else torch.zeros(
-                self.out_features, device=self.weight.device, dtype=self.weight.dtype
-            )
-
-            return FusedLinearReLUFunction.apply(x, weight, bias)
+        if x.is_cuda and _HAS_CUDA_KERNEL:
+            return FusedLinearReLUFunction.apply(x, self.fc.weight, self.fc.bias)
         else:
-            # Fallback to PyTorch implementation
-            # (for CPU, fp16/bf16, or when CUDA extension not available)
-            output = torch.nn.functional.linear(x, self.weight, self.bias)
-            return torch.relu(output)
+            # CPU veya extension yoksa: normal path
+            return F.relu(self.fc(x))
 
-    def __repr__(self):
-        return (f"HypatiaFusedLinearReLU(in_features={self.in_features}, "
-                f"out_features={self.out_features}, bias={self.bias is not None})")
 
+# Backward compatibility alias
+HypatiaFusedLinearReLU = FusedLinearReLU
+
+
+# -----------------------------------------------------------------------------
+# Helper function for FX graph reconstruction
+# -----------------------------------------------------------------------------
 
 def create_fused_linear_relu_from_tensors(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-) -> HypatiaFusedLinearReLU:
+) -> FusedLinearReLU:
     """
-    Create a HypatiaFusedLinearReLU module from existing weight and bias tensors.
+    Create a FusedLinearReLU module from existing weight and bias tensors.
 
     This helper is called from Rust (fx_bridge::reconstruct_fused_linear_relu)
     during graph reconstruction.
-
-    Task:
-      - Create HypatiaFusedLinearReLU from weight and bias tensors
-      - Initialize module DIRECTLY on correct device & dtype
-      - Copy parameters (now safe since same device/dtype)
-
-    Args:
-        weight: Linear layer weight tensor, shape [out_features, in_features]
-        bias: Linear layer bias tensor, shape [out_features], or None
-
-    Returns:
-        HypatiaFusedLinearReLU module with copied parameters on same device as inputs
-
-    Raises:
-        TypeError: If weight is not a tensor
-        ValueError: If weight shape is invalid
-
-    Example:
-        >>> weight = torch.randn(128, 256, device='cuda')  # out=128, in=256
-        >>> bias = torch.randn(128, device='cuda')
-        >>> module = create_fused_linear_relu_from_tensors(weight, bias)
-        >>> module.fc.weight.device  # cuda:0
-        >>> x = torch.randn(32, 256, device='cuda')
-        >>> out = module(x)  # shape: [32, 128], device: cuda:0
     """
     if not torch.is_tensor(weight):
         raise TypeError(f"weight must be a Tensor, got {type(weight)}")
@@ -215,9 +187,8 @@ def create_fused_linear_relu_from_tensors(
     out_features, in_features = weight.shape
     use_bias = bias is not None and torch.is_tensor(bias)
 
-    # 1) Create module DIRECTLY on correct device & dtype
-    #    This is CRITICAL for CUDA compatibility - avoids device mismatch errors
-    fused = HypatiaFusedLinearReLU(
+    # Create module on correct device & dtype
+    fused = FusedLinearReLU(
         in_features=in_features,
         out_features=out_features,
         bias=use_bias,
@@ -225,12 +196,14 @@ def create_fused_linear_relu_from_tensors(
         dtype=dtype,
     )
 
-    # 2) Copy parameters (safe now - same device & dtype)
+    # Copy parameters
     with torch.no_grad():
-        fused.weight.copy_(weight)
-
+        fused.fc.weight.copy_(weight)
         if use_bias:
-            # Align bias to module's device/dtype if needed
-            fused.bias.copy_(bias.to(device=device, dtype=dtype))
+            fused.fc.bias.copy_(bias.to(device=device, dtype=dtype))
 
     return fused
+
+
+__all__ = ["FusedLinearReLU", "HypatiaFusedLinearReLU", "FusedLinearReLUFunction",
+           "create_fused_linear_relu_from_tensors"]
