@@ -152,29 +152,34 @@ pub struct HardwareAwareCost {
     pub is_inference: bool,
 }
 
-impl CostFunction<HypatiaLang> for HardwareAwareCost { 
-    type Cost = f64; 
+impl CostFunction<HypatiaLang> for HardwareAwareCost {
+    type Cost = f64;
 
     fn cost<C>(&mut self, enode: &HypatiaLang, mut costs: C) -> Self::Cost
     where C: FnMut(Id) -> Self::Cost,
     {
         let children_cost: f64 = enode.children().iter().map(|&id| costs(id)).sum();
-        
-        // Basitleştirilmiş Maliyet Hesaplama
+
+        // ✅ UPDATED: Improved cost model with FLOPs + memory access
+        // Formula: total_cost = alpha * flop_cost + beta * mem_cost + stability_penalty + children_cost
+        let alpha = 1.0; // FLOPs weight
+        let beta = 2.0;  // Memory access weight (more expensive)
+
         let (flops, mem_access, stability_penalty) = match enode {
-            HypatiaLang::MatMul(_) => (300.0, 10.0, 0.0), 
+            HypatiaLang::MatMul(_) => (300.0, 10.0, 0.0),
             HypatiaLang::Conv2d(_) => (500.0, 50.0, 0.0),
-            HypatiaLang::Linear(_) => (100.0, 5.0, 0.0),
-            HypatiaLang::BatchNorm(_) => (50.0, 20.0, 0.0), 
-            HypatiaLang::Add(_) | HypatiaLang::Sub(_) => (1.0, 0.0, 0.0),
-            HypatiaLang::Mul(_) => (10.0, 0.0, 0.0),
-            HypatiaLang::Div(_) => (40.0, 0.0, 100.0), 
-            
-            // Fusion Hedefleri
-            HypatiaLang::FusedConvBN(_) => (500.0, 50.0, 0.0),
-            HypatiaLang::LinearReLU(_) => (100.0, 5.0, 0.0),
-            HypatiaLang::FusedLinearReLU(_) => (95.0, 4.0, 0.0), // Slightly cheaper than separate Linear+ReLU
-            HypatiaLang::FusedMLP(_) => (200.0, 10.0, 0.0),
+            HypatiaLang::Linear(_) => (100.0, 10.0, 0.0), // 2 * (m * n * k) flops, (m*k + k*n + m*n) memory
+            HypatiaLang::ReLU(_) => (1.0, 1.0, 0.0), // Cheap elementwise op
+            HypatiaLang::BatchNorm(_) => (50.0, 20.0, 0.0),
+            HypatiaLang::Add(_) | HypatiaLang::Sub(_) => (1.0, 0.5, 0.0),
+            HypatiaLang::Mul(_) => (2.0, 0.5, 0.0),
+            HypatiaLang::Div(_) => (40.0, 0.5, 100.0),
+
+            // ✅ UPDATED: Fusion targets with improved cost estimation
+            HypatiaLang::FusedConvBN(_) => (500.0, 40.0, 0.0), // Less memory than separate Conv+BN
+            HypatiaLang::LinearReLU(_) => (100.0, 8.0, 0.0), // Less memory than separate
+            HypatiaLang::FusedLinearReLU(_) => (100.0, 7.0, 0.0), // Single kernel, better memory locality
+            HypatiaLang::FusedMLP(_) => (200.0, 12.0, 0.0), // Two linear + ReLU fused
 
             // --- YENİ EKLENEN MALİYETLER (SNIPPET 5) ---
             // Modern aktivasyonlar için maliyet
@@ -198,9 +203,8 @@ impl CostFunction<HypatiaLang> for HardwareAwareCost {
             _ => (0.0, 0.0, 0.0),
         };
 
-        // Cost = FLOPs * 1.0 + Memory_Access * 10.0 + Stability_Penalty * lambda
-        let lambda = 1.0; 
-        let cost = flops * 1.0 + mem_access * 10.0 + stability_penalty * lambda + children_cost;
+        // ✅ UPDATED: Use alpha/beta weights
+        let cost = alpha * flops + beta * mem_access + stability_penalty + children_cost;
         cost
     }
 }
@@ -267,36 +271,40 @@ fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantF
     // These 4 rules (linear-relu-fusion, mlp-fusion-from-fused, conv-bn-fusion, linear-chain)
     // are now defined in the "always active" section at line 293+ to avoid duplicates
 
-    // ✅ DÜZELTME: Fusion kuralları artık her zaman aktif (training ve inference modda)
-    // Bu kurallar güvenlidir çünkü sadece hesaplama grafiğini optimize eder,
-    // parametreleri değiştirmez.
+    // ✅ UPDATED: Enhanced fusion rules with better cost modeling
+    // These rules are active in both training and inference mode
     rules.extend(vec![
-        // 🟢 KURAL 1: Linear-ReLU Fusion (original)
+        // 🟢 KURAL 1: Linear-ReLU Fusion (primary rule)
+        // This creates the HypatiaFusedLinearReLU with CUDA kernel
         rewrite!("linear-relu-fusion";
-            "(relu (linear ?w ?b ?x))"
-            =>
-            "(linear-relu ?w ?b ?x)"),
-
-        // 🟢 NEW: Fused Linear+ReLU (using new naming convention)
-        rewrite!("fuse-linear-relu";
             "(relu (linear ?w ?b ?x))"
             =>
             "(fused_linear_relu ?w ?b ?x)"),
 
         // 🟢 KURAL 2: MLP Fusion (Linear-ReLU + Linear)
+        // Pattern: Linear(W2, b2, ReLU(Linear(W1, b1, x)))
         rewrite!("mlp-fusion-from-fused";
-            "(linear ?w2 ?b2 (linear-relu ?w1 ?b1 ?x))"
+            "(linear ?w2 ?b2 (fused_linear_relu ?w1 ?b1 ?x))"
             =>
             "(fused-mlp ?w1 ?b1 ?w2 ?b2 ?x)"),
 
-        // 🟢 KURAL 3: Conv2d-BatchNorm Fusion
+        // 🟢 KURAL 2b: MLP Fusion with Dropout (common training pattern)
+        // Pattern: Dropout(ReLU(Linear(W, b, x))) - keep dropout, fuse Linear+ReLU
+        rewrite!("linear-relu-dropout-fusion";
+            "(dropout ?p (relu (linear ?w ?b ?x)))"
+            =>
+            "(dropout ?p (fused_linear_relu ?w ?b ?x))"),
+
+        // 🟢 KURAL 3: Conv2d-BatchNorm Fusion (inference optimization)
         rewrite!("conv-bn-fusion";
             "(batchnorm ?w_bn ?b_bn ?m ?v (conv2d ?w_c ?b_c ?x ?s ?p ?d ?g) ?eps)"
             =>
             "(fused_conv_bn ?w_c ?b_c ?w_bn ?b_bn ?m ?v ?x ?eps ?s ?p ?d ?g)"),
 
-        // 🟢 KURAL 4: Linear Chain (W2(W1*x + b1) + b2 -> (W2*W1)*x + (W2*b1 + b2))
-        rewrite!("linear-chain";
+        // 🟢 KURAL 4: Linear Chain Folding (when both are parameters)
+        // W2(W1*x + b1) + b2 -> (W2*W1)*x + (W2*b1 + b2)
+        // NOTE: This is an algebraic optimization, useful for inference
+        rewrite!("linear-chain-fold";
             "(linear ?w2 ?b2 (linear ?w1 ?b1 ?x))"
             =>
             "(linear (matmul ?w2 ?w1) (add (matmul ?w2 ?b1) ?b2) ?x)"),
