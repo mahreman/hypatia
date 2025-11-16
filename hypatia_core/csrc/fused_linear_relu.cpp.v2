@@ -1,0 +1,69 @@
+// hypatia_core/csrc/fused_linear_relu.cpp
+// OPTIMIZED VERSION with backward pass
+
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+
+namespace hypatia {
+namespace fused_linear_relu {
+
+// CUDA forward declaration
+at::Tensor fused_linear_relu_forward_cuda(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias_opt);
+
+// CUDA backward declaration
+std::vector<at::Tensor> fused_linear_relu_backward_cuda(
+    const at::Tensor& grad_out,
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& output);
+
+// Forward wrapper
+at::Tensor fused_linear_relu_forward(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias_opt) {
+
+    TORCH_CHECK(input.device().is_cuda(),
+                "fused_linear_relu_forward: only CUDA is implemented");
+    return fused_linear_relu_forward_cuda(input, weight, bias_opt);
+}
+
+// Backward wrapper
+std::vector<at::Tensor> fused_linear_relu_backward(
+    const at::Tensor& grad_out,
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& output) {
+
+    TORCH_CHECK(input.device().is_cuda(),
+                "fused_linear_relu_backward: only CUDA is implemented");
+    return fused_linear_relu_backward_cuda(grad_out, input, weight, output);
+}
+
+} // namespace fused_linear_relu
+} // namespace hypatia
+
+// PyBind11 bindings
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(
+        "forward",
+        &hypatia::fused_linear_relu::fused_linear_relu_forward,
+        "Fused Linear+ReLU forward (cuBLAS + custom ReLU)",
+        py::arg("input"),
+        py::arg("weight"),
+        py::arg("bias") = c10::nullopt
+    );
+
+    m.def(
+        "backward",
+        &hypatia::fused_linear_relu::fused_linear_relu_backward,
+        "Fused Linear+ReLU backward (cuBLAS + fused gradient)",
+        py::arg("grad_out"),
+        py::arg("input"),
+        py::arg("weight"),
+        py::arg("output")
+    );
+}
