@@ -1,6 +1,9 @@
 import torch
 from torch import nn
 
+# Import hypatia_core - automatically registers the 'hypatia' backend
+import hypatia_core
+
 torch._dynamo.reset()
 
 class ToyModel(nn.Module):

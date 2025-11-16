@@ -88,22 +88,38 @@ def hypatia_backend(gm, example_inputs):
         print(f"[Hypatia] ❌ Compilation error: {e}")
         return gm
 
+# Global flag to track backend registration
+_HYPATIA_BACKEND_REGISTERED = False
+
 def register_backend():
-    """Register Hypatia backend with PyTorch"""
+    """Register Hypatia backend with PyTorch
+
+    This function is idempotent - calling it multiple times is safe.
+    It will only register the backend once, even across multiple imports.
+    """
+    global _HYPATIA_BACKEND_REGISTERED
+
+    # Quick return if already registered
+    if _HYPATIA_BACKEND_REGISTERED:
+        return
+
     try:
-        # Check if already registered to avoid duplicate warnings
+        # Double-check with torch._dynamo
         backends = torch._dynamo.list_backends()
         if "hypatia" in backends:
-            # Already registered, skip
+            _HYPATIA_BACKEND_REGISTERED = True
             return
 
         torch._dynamo.register_backend(name="hypatia", compiler_fn=hypatia_backend)
+        _HYPATIA_BACKEND_REGISTERED = True
+
         print("✅ Hypatia backend registered successfully")
         print("   Usage: torch.compile(model, backend='hypatia')")
-        print(f"   ✓ Backend confirmed in: {backends}")
+        print(f"   ✓ Backend confirmed in: {torch._dynamo.list_backends()}")
 
     except Exception as e:
-        warnings.warn(f"Failed to register Hypatia backend: {e}")
+        warnings.warn(f"Failed to register Hypatia backend: {e}", category=RuntimeWarning)
+        raise
 
 # Auto-register on import
 register_backend()
