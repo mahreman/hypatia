@@ -1133,66 +1133,15 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             }
             
             HypatiaLang::FusedMLP(ids) => {
-                // ✅ REFACTORED: get_tensor kullanarak
+                // ✅ REFACTORED: Use FusedMLP module with kernel fusion
+                // Pattern: (fused-mlp w1 b1 w2 b2 x)
+                let w1_id = ids[0];
+                let b1_id = ids[1];
+                let w2_id = ids[2];
+                let b2_id = ids[3];
+                let x_id = ids[4];
 
-                let w1_id = ids[0]; let b1_id = ids[1];
-                let w2_id = ids[2]; let b2_id = ids[3];
-                let input_id = ids[4];
-
-                // Tensörleri get_tensor ile al
-                let b1_name = self.get_var_name(b1_id, expr)?;
-                let b2_name = self.get_var_name(b2_id, expr)?;
-
-                let b1_has_bias = b1_name != "none";
-                let b2_has_bias = b2_name != "none";
-
-                let w1_name = self.get_var_name(w1_id, expr)?;
-                let w1_tensor = self.get_tensor(&w1_name)?;
-
-                let w2_name = self.get_var_name(w2_id, expr)?;
-                let w2_tensor = self.get_tensor(&w2_name)?;
-
-                let input_obj = self.reconstruct_node(input_id, expr)?;
-                let nn = PyModule::import_bound(self.py, "torch.nn")?;
-
-                // W1 shape'ten boyutları çıkar
-                let w1_shape = w1_tensor.getattr("shape")?;
-                let hidden_size = w1_shape.get_item(0)?.extract::<i64>()?;
-                let in_features = w1_shape.get_item(1)?.extract::<i64>()?;
-
-                let linear1 = nn.getattr("Linear")?.call1((in_features, hidden_size))?;
-                let param_class = nn.getattr("Parameter")?;
-                linear1.setattr("weight", param_class.call1((w1_tensor,))?)?;
-                if b1_has_bias {
-                    let b1_tensor = self.get_tensor(&b1_name)?;
-                    linear1.setattr("bias", param_class.call1((b1_tensor,))?)?;
-                }
-
-                let relu = nn.getattr("ReLU")?.call0()?;
-
-                // W2 shape'ten boyutları çıkar
-                let w2_shape = w2_tensor.getattr("shape")?;
-                let out_features = w2_shape.get_item(0)?.extract::<i64>()?;
-
-                let linear2 = nn.getattr("Linear")?.call1((hidden_size, out_features))?;
-                linear2.setattr("weight", param_class.call1((w2_tensor,))?)?;
-                if b2_has_bias {
-                    let b2_tensor = self.get_tensor(&b2_name)?;
-                    linear2.setattr("bias", param_class.call1((b2_tensor,))?)?;
-                }
-
-                let sequential = nn.getattr("Sequential")?.call1((linear1, relu, linear2))?;
-                let module_name = format!("fused_mlp_{}", self.param_map.len());
-
-                self.original_gm.call_method("add_submodule", (&module_name, sequential), None)?;
-
-                let node = self.new_graph.call_method(
-                    "create_node",
-                    ("call_module", &module_name, (input_obj,)),
-                    None
-                )?;
-
-                Ok(node.to_object(self.py))
+                self.reconstruct_fused_mlp(w1_id, b1_id, w2_id, b2_id, x_id, expr)
             },
             
             HypatiaLang::Mul([a, b]) => {
@@ -1417,6 +1366,82 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         )?;
 
         log::info!("✅ Created fused Linear+ReLU module: {}", module_target_name);
+        Ok(new_node.to_object(self.py))
+    }
+
+    /// ✅ NEW: Reconstruct FusedMLP (2-layer MLP with kernel fusion)
+    /// Pattern: (fused-mlp w1 b1 w2 b2 x) -> FusedMLP module
+    fn reconstruct_fused_mlp(
+        &mut self,
+        w1_id: Id, b1_id: Id,
+        w2_id: Id, b2_id: Id,
+        x_id: Id,
+        expr: &RecExpr<HypatiaLang>
+    ) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+
+        // 1. Get weight and bias tensors for both layers
+        let w1_name = self.get_var_name(w1_id, expr)?;
+        let weight1_tensor = self.get_tensor(&w1_name)?;
+
+        let b1_name = self.get_var_name(b1_id, expr)?;
+        let bias1_tensor = if b1_name != "none" {
+            Some(self.get_tensor(&b1_name)?)
+        } else {
+            None
+        };
+
+        let w2_name = self.get_var_name(w2_id, expr)?;
+        let weight2_tensor = self.get_tensor(&w2_name)?;
+
+        let b2_name = self.get_var_name(b2_id, expr)?;
+        let bias2_tensor = if b2_name != "none" {
+            Some(self.get_tensor(&b2_name)?)
+        } else {
+            None
+        };
+
+        // 2. Import Python helper
+        let hypatia_core = PyModule::import_bound(self.py, "hypatia_core")?;
+        let create_fn = hypatia_core.getattr("create_fused_mlp_from_tensors")?;
+
+        // 3. Create fused MLP module
+        let none_obj = self.py.None();
+        let none_value = none_obj.bind(self.py);
+
+        let bias1_arg = match bias1_tensor {
+            Some(ref b) => b.as_any(),
+            None => none_value.as_any()
+        };
+
+        let bias2_arg = match bias2_tensor {
+            Some(ref b) => b.as_any(),
+            None => none_value.as_any()
+        };
+
+        let fused_module = create_fn.call1((
+            weight1_tensor.as_any(),
+            bias1_arg,
+            weight2_tensor.as_any(),
+            bias2_arg
+        ))?;
+
+        // 4. Move module to input's device (for CUDA compatibility)
+        let input_tensor = input_node.bind(self.py);
+        if let Ok(device_attr) = input_tensor.getattr("device") {
+            fused_module.call_method1("to", (device_attr,))?;
+        }
+
+        // 5. Add to module map and create FX node
+        let module_target_name = format!("fused_mlp_{}", self.param_map.len());
+        self.param_map.insert(module_target_name.clone(), fused_module.to_object(self.py));
+
+        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
+        let new_node = self.new_graph.call_method(
+            "create_node", ("call_module", module_target_name.clone(), args_tuple), None
+        )?;
+
+        log::info!("✅ Created fused MLP module: {}", module_target_name);
         Ok(new_node.to_object(self.py))
     }
 
