@@ -1096,6 +1096,10 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 // ✅ YENİ: reconstruct_linear kullanarak parametre kopyalama ile nn.Linear modülü oluştur
                 self.reconstruct_linear(*w_id, *b_id, *x_id, expr)
             }
+            HypatiaLang::FusedLinearReLU([w_id, b_id, x_id]) => {
+                // ✅ NEW: Fused Linear+ReLU reconstruction
+                self.reconstruct_fused_linear_relu(*w_id, *b_id, *x_id, expr)
+            }
             HypatiaLang::Embedding([w_id, x_id]) => {
                 let input_node = self.reconstruct_node(*x_id, expr)?;
                 self.build_embedding_module(node_id, expr, *w_id, input_node, "embedding")
@@ -1365,6 +1369,54 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let new_node = self.new_graph.call_method(
             "create_node", ("call_module", module_target_name, args_tuple), None
         )?;
+        Ok(new_node.to_object(self.py))
+    }
+
+    // ✅ NEW: Fused Linear+ReLU reconstruction
+    fn reconstruct_fused_linear_relu(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+
+        // 1. Get weight and bias tensors
+        let w_name = self.get_var_name(w_id, expr)?;
+        let weight_tensor = self.get_tensor(&w_name)?;
+
+        let b_name = self.get_var_name(b_id, expr)?;
+        let bias_tensor = if b_name != "none" {
+            Some(self.get_tensor(&b_name)?)
+        } else {
+            None
+        };
+
+        // 2. Import Python helper
+        let hypatia_core = PyModule::import_bound(self.py, "hypatia_core")?;
+        let create_fn = hypatia_core.getattr("create_fused_linear_relu_from_tensors")?;
+
+        // 3. Create fused module (weight/bias already on correct device from get_tensor)
+        let none_obj = self.py.None();
+        let none_value = none_obj.bind(self.py);
+        let bias_arg = match bias_tensor {
+            Some(ref b) => b.as_any(),
+            None => none_value.as_any()
+        };
+
+        let fused_module = create_fn.call1((weight_tensor.as_any(), bias_arg))?;
+
+        // 4. Move module to input's device (for CUDA compatibility)
+        let input_tensor = input_node.bind(self.py);
+        if let Ok(device_attr) = input_tensor.getattr("device") {
+            fused_module.call_method1("to", (device_attr,))?;
+        }
+
+        // 5. Add to module map and create FX node
+        let module_target_name = format!("fused_linear_relu_{}", self.param_map.len());
+        self.param_map.insert(module_target_name.clone(), fused_module.to_object(self.py));
+
+        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
+        let new_node = self.new_graph.call_method(
+            "create_node", ("call_module", module_target_name.clone(), args_tuple), None
+        )?;
+
+        log::info!("✅ Created fused Linear+ReLU module: {}", module_target_name);
         Ok(new_node.to_object(self.py))
     }
 

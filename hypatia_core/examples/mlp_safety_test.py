@@ -15,6 +15,9 @@ import hypatia_core  # Auto-registers 'hypatia' backend
 # Enable strict checksum validation mode
 os.environ["HYPATIA_CHECKSUM_MODE"] = "strict"
 
+# Enable fusion for testing
+os.environ.setdefault("HYPATIA_ENABLE_LINRELU_FUSION", "1")
+
 
 class MLP(nn.Module):
     def __init__(self, in_dim=784, hidden_dim=256, out_dim=10):

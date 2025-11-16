@@ -26,6 +26,9 @@ import torch
 import warnings
 import os
 
+# Import fused modules
+from .fused_modules import HypatiaFusedLinearReLU, create_fused_linear_relu_from_tensors
+
 # Feature flag for verbose FX debugging
 DEBUG_FX = os.environ.get("HYPATIA_DEBUG_FX", "0") == "1"
 
@@ -119,4 +122,7 @@ __all__ = [
     "HypatiaCompileResult",
     "set_log_level",
     "register_backend",
+    # Fused modules
+    "HypatiaFusedLinearReLU",
+    "create_fused_linear_relu_from_tensors",
 ]
