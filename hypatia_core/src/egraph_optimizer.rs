@@ -283,10 +283,12 @@ fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantF
 
         // 🟢 KURAL 2: MLP Fusion (Linear-ReLU + Linear)
         // Pattern: Linear(W2, b2, ReLU(Linear(W1, b1, x)))
-        rewrite!("mlp-fusion-from-fused";
-            "(linear ?w2 ?b2 (fused_linear_relu ?w1 ?b1 ?x))"
-            =>
-            "(fused-mlp ?w1 ?b1 ?w2 ?b2 ?x)"),
+        // ⚠️ TEMPORARILY DISABLED: Causes nested FusedMLP for 3+ layer MLPs
+        // TODO: Implement proper multi-layer fusion or add guards
+        // rewrite!("mlp-fusion-from-fused";
+        //     "(linear ?w2 ?b2 (fused_linear_relu ?w1 ?b1 ?x))"
+        //     =>
+        //     "(fused-mlp ?w1 ?b1 ?w2 ?b2 ?x)"),
 
         // 🟢 KURAL 2b: MLP Fusion with Dropout (common training pattern)
         // Pattern: Dropout(ReLU(Linear(W, b, x))) - keep dropout, fuse Linear+ReLU
