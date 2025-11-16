@@ -8,6 +8,9 @@ Tests Hypatia compilation in STRICT mode to verify:
 """
 
 import os
+import sys
+# Add hypatia_core to path for direct import
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
 import torch.nn as nn
 import hypatia_core  # Auto-registers 'hypatia' backend
