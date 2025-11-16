@@ -1,52 +1,14 @@
+import os
+import sys
+# Add hypatia_core to path for direct import
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 import torch
 import torch.nn as nn
-import torch._dynamo as dynamo
 import time
 
-# 1. Kendi Rust modülünüzü import edin
+# Import hypatia_core - automatically registers the 'hypatia' backend
 import hypatia_core
-
-# 2. Wrapper'ı "hypatia" adıyla Dynamo'ya KAYDEDİN
-# @dynamo.register_backend decorator'ı, fonksiyonun adını
-# (bu durumda 'hypatia') backend adı olarak kullanır.
-print("--- 'hypatia' backend'i PyTorch Dynamo'ya kaydediliyor... ---")
-
-@dynamo.register_backend
-def hypatia(gm: torch.fx.GraphModule, example_inputs: list):
-    """
-    Bu, torch.compile'ın çağıracağı köprü fonksiyondur.
-    Rust fonksiyonumuzun beklediği 'module_info_map' argümanını hazırlar.
-    """
-    print("\n[Hypatia] Backend Wrapper (hypatia) çağrıldı. ModuleInfoMap oluşturuluyor...")
-    
-    module_info_map = {}
-    for name, module in gm.named_modules():
-        is_inference = not getattr(module, "training", False)
-        has_bias = hasattr(module, "bias") and module.bias is not None
-        module_type = type(module).__name__
-
-        module_info_map[name] = {
-            "type": module_type,
-            "has_bias": has_bias,
-            "is_inference": is_inference,
-        }
-        
-    print(f"[Hypatia] {len(module_info_map)} modül bilgisi toplandı.")
-
-    # 3. Hazırlanan argümanlarla asıl Rust fonksiyonunu çağırın
-    try:
-        compiled_gm = hypatia_core.compile_fx_graph(
-            gm,
-            example_inputs,
-            module_info_map
-        )
-        print("[Hypatia] Rust (compile_fx_graph) başarıyla tamamlandı.")
-        return compiled_gm
-    except Exception as e:
-        print(f"[Hypatia] Rust (compile_fx_graph) Hatası: {e}")
-        return gm  # Hata durumunda optimize edilmemiş orijinal grafiği geri döndür
-
-print("--- Kayıt başarılı. ---")
 
 
 # --- (Geri kalan test kodunuz buradan devam edebilir) ---

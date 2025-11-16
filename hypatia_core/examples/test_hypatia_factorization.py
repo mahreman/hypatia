@@ -1,5 +1,13 @@
+import os
+import sys
+# Add hypatia_core to path for direct import
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 import torch
 from torch import nn
+
+# Import hypatia_core - automatically registers the 'hypatia' backend
+import hypatia_core
 
 torch._dynamo.reset()
 
