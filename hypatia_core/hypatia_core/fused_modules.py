@@ -205,5 +205,88 @@ def create_fused_linear_relu_from_tensors(
     return fused
 
 
+# -----------------------------------------------------------------------------
+# FusedMLP: Multi-layer fusion using FusedLinearReLU
+# -----------------------------------------------------------------------------
+
+class FusedMLP(nn.Module):
+    """
+    2-layer MLP with fused Linear+ReLU for first layer.
+
+    This module is created by the e-graph optimizer when it detects:
+        linear(w2, b2, relu(linear(w1, b1, x)))
+
+    The e-graph rewrites this to:
+        (fused-mlp w1 b1 w2 b2 x)
+
+    Architecture:
+        x -> FusedLinearReLU(w1, b1) -> Linear(w2, b2) -> output
+    """
+
+    def __init__(self,
+                 weight1: torch.Tensor,
+                 bias1: Optional[torch.Tensor],
+                 weight2: torch.Tensor,
+                 bias2: Optional[torch.Tensor],
+                 device: Optional[torch.device] = None,
+                 dtype: Optional[torch.dtype] = None) -> None:
+        """
+        Args:
+            weight1: Weight tensor for first layer [hidden, in_features]
+            bias1: Bias tensor for first layer [hidden] or None
+            weight2: Weight tensor for second layer [out_features, hidden]
+            bias2: Bias tensor for second layer [out_features] or None
+            device: Device to place parameters on
+            dtype: Data type for parameters
+        """
+        super().__init__()
+
+        _load_fused_linear_relu_ext()
+
+        # Layer 1: FusedLinearReLU
+        self.layer1 = create_fused_linear_relu_from_tensors(weight1, bias1)
+
+        # Layer 2: Linear (no activation)
+        out_features, hidden_size = weight2.shape
+        self.layer2 = nn.Linear(hidden_size, out_features, bias=(bias2 is not None),
+                               device=device, dtype=dtype)
+
+        with torch.no_grad():
+            self.layer2.weight.copy_(weight2)
+            if bias2 is not None:
+                self.layer2.bias.copy_(bias2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.layer1(x)
+        x = self.layer2(x)
+        return x
+
+
+def create_fused_mlp_from_tensors(
+    weight1: torch.Tensor,
+    bias1: Optional[torch.Tensor],
+    weight2: torch.Tensor,
+    bias2: Optional[torch.Tensor],
+) -> FusedMLP:
+    """
+    Create a FusedMLP module from weight and bias tensors.
+
+    This helper is called from Rust (fx_bridge) during graph reconstruction.
+
+    Args:
+        weight1: Weight for first layer (FusedLinearReLU)
+        bias1: Bias for first layer or None
+        weight2: Weight for second layer (Linear)
+        bias2: Bias for second layer or None
+
+    Returns:
+        FusedMLP module with parameters copied from tensors
+    """
+    device = weight1.device
+    dtype = weight1.dtype
+
+    return FusedMLP(weight1, bias1, weight2, bias2, device=device, dtype=dtype)
+
+
 __all__ = ["FusedLinearReLU", "HypatiaFusedLinearReLU", "FusedLinearReLUFunction",
-           "create_fused_linear_relu_from_tensors"]
+           "create_fused_linear_relu_from_tensors", "FusedMLP", "create_fused_mlp_from_tensors"]
