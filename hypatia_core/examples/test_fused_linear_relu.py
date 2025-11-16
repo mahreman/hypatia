@@ -57,7 +57,7 @@ def check_forward_backward(device: str = "cpu", atol: float = 1e-6):
     assert gx_diff < atol, "Input gradients differ!"
 
     w_base = baseline[0].weight.grad
-    w_fused = fused.fc.weight.grad
+    w_fused = fused.weight.grad
     gw_diff = (w_base - w_fused).abs().max().item()
     print(f"  [backward] max |∂L/∂W_base - ∂L/∂W_fused| = {gw_diff:.3e}")
     assert gw_diff < atol, "Weight gradients differ!"

@@ -9,9 +9,75 @@ Currently available:
 """
 
 from typing import Optional
+import math
 
 import torch
 import torch.nn as nn
+from torch.autograd import Function
+
+# Try to import CUDA extension
+try:
+    import hypatia_core._linear_relu_cuda as _C
+    CUDA_EXTENSION_AVAILABLE = True
+except ImportError:
+    _C = None
+    CUDA_EXTENSION_AVAILABLE = False
+
+
+class FusedLinearReLUFunction(Function):
+    """
+    Autograd Function for fused Linear+ReLU using CUDA kernels.
+
+    Forward: y = relu(x @ W^T + b)
+    Backward: Compute gradients w.r.t. input, weight, and bias
+    """
+
+    @staticmethod
+    def forward(ctx, input, weight, bias):
+        """
+        Args:
+            input: Input tensor, shape (..., in_features)
+            weight: Weight tensor, shape (out_features, in_features)
+            bias: Bias tensor, shape (out_features,)
+
+        Returns:
+            output: Output tensor, shape (..., out_features)
+        """
+        # Ensure all tensors are contiguous and on same device/dtype
+        input = input.contiguous()
+        weight = weight.contiguous()
+        bias = bias.contiguous()
+
+        # Call CUDA kernel
+        output = _C.forward(input, weight, bias)
+
+        # Save for backward
+        ctx.save_for_backward(input, weight, bias, output)
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Args:
+            grad_output: Gradient w.r.t. output, shape (..., out_features)
+
+        Returns:
+            grad_input: Gradient w.r.t. input, shape (..., in_features)
+            grad_weight: Gradient w.r.t. weight, shape (out_features, in_features)
+            grad_bias: Gradient w.r.t. bias, shape (out_features,)
+        """
+        input, weight, bias, output = ctx.saved_tensors
+
+        # Ensure grad_output is contiguous
+        grad_output = grad_output.contiguous()
+
+        # Call CUDA backward kernel
+        grad_input, grad_weight, grad_bias = _C.backward(
+            grad_output, input, weight, bias, output
+        )
+
+        return grad_input, grad_weight, grad_bias
 
 
 class HypatiaFusedLinearReLU(nn.Module):
@@ -36,24 +102,69 @@ class HypatiaFusedLinearReLU(nn.Module):
         dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
-        # CRITICAL: Create Linear directly on the target device
-        # This ensures no CPU→CUDA copies during forward pass
-        self.fc = nn.Linear(
-            in_features,
-            out_features,
-            bias=bias,
-            device=device,
-            dtype=dtype,
-        )
+
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Create weight and bias parameters directly
+        # This gives us more control for kernel fusion
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        self.weight = nn.Parameter(torch.empty((out_features, in_features), **factory_kwargs))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
+        else:
+            self.register_parameter('bias', None)
+
+        # Initialize parameters using Kaiming initialization (good for ReLU)
+        self.reset_parameters()
+
+        # Packed weight buffer for future optimization
+        # (prepacking for optimal memory layout)
+        self.register_buffer("_packed_weight", None, persistent=False)
+
+    def reset_parameters(self) -> None:
+        """Initialize parameters using Kaiming uniform initialization."""
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass: Linear transformation followed by ReLU"""
-        # Single fused operation: Linear + ReLU
-        return torch.relu(self.fc(x))
+
+        # Check if we can use CUDA kernel
+        use_cuda_kernel = (
+            CUDA_EXTENSION_AVAILABLE and
+            x.is_cuda and
+            self.weight.is_cuda and
+            (self.bias is None or self.bias.is_cuda) and
+            x.dtype == torch.float32 and
+            self.weight.dtype == torch.float32 and
+            (self.bias is None or self.bias.dtype == torch.float32)
+        )
+
+        if use_cuda_kernel:
+            # Use fused CUDA kernel
+            # TODO: In future, use packed weight for better performance
+            # if self._packed_weight is None or self._packed_weight.shape != self.weight.shape:
+            #     self._packed_weight = self.weight.contiguous()
+
+            weight = self.weight.contiguous()
+            bias = self.bias if self.bias is not None else torch.zeros(
+                self.out_features, device=self.weight.device, dtype=self.weight.dtype
+            )
+
+            return FusedLinearReLUFunction.apply(x, weight, bias)
+        else:
+            # Fallback to PyTorch implementation
+            # (for CPU, fp16/bf16, or when CUDA extension not available)
+            output = torch.nn.functional.linear(x, self.weight, self.bias)
+            return torch.relu(output)
 
     def __repr__(self):
-        return (f"HypatiaFusedLinearReLU(in_features={self.fc.in_features}, "
-                f"out_features={self.fc.out_features}, bias={self.fc.bias is not None})")
+        return (f"HypatiaFusedLinearReLU(in_features={self.in_features}, "
+                f"out_features={self.out_features}, bias={self.bias is not None})")
 
 
 def create_fused_linear_relu_from_tensors(
@@ -116,10 +227,10 @@ def create_fused_linear_relu_from_tensors(
 
     # 2) Copy parameters (safe now - same device & dtype)
     with torch.no_grad():
-        fused.fc.weight.copy_(weight)
+        fused.weight.copy_(weight)
 
         if use_bias:
             # Align bias to module's device/dtype if needed
-            fused.fc.bias.copy_(bias.to(device=device, dtype=dtype))
+            fused.bias.copy_(bias.to(device=device, dtype=dtype))
 
     return fused
