@@ -8,12 +8,18 @@ Tests Hypatia compilation in STRICT mode to verify:
 """
 
 import os
+import sys
+# Add hypatia_core to path for direct import
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
 import torch.nn as nn
 import hypatia_core  # Auto-registers 'hypatia' backend
 
 # Enable strict checksum validation mode
 os.environ["HYPATIA_CHECKSUM_MODE"] = "strict"
+
+# Enable fusion for testing
+os.environ.setdefault("HYPATIA_ENABLE_LINRELU_FUSION", "1")
 
 
 class MLP(nn.Module):
@@ -25,10 +31,18 @@ class MLP(nn.Module):
         self.act = nn.ReLU()
 
     def forward(self, x):
-        x = self.act(self.fc1(x))
-        x = self.act(self.fc2(x))
-        x = self.fc3(x)
-        return x
+        x1 = self.act(self.fc1(x))
+        x2 = self.act(self.fc2(x1))
+        x3 = self.fc3(x2)
+        return x3, (x1, x2, x3)  # Return intermediates for debugging
+
+
+def dump_weight_norms(model, prefix):
+    """Debug helper: print weight norms for each layer"""
+    print(f"\n[{prefix}] weight norms:")
+    for name, param in model.named_parameters():
+        print(f"  {name:30s}  ||param|| = {param.norm().item():.6f}")
+
 
 
 def main():
@@ -48,7 +62,7 @@ def main():
 
     print("Step 1: Running eager (reference) model...")
     with torch.no_grad():
-        y_ref = model(x)
+        y_ref, (ref_x1, ref_x2, ref_x3) = model(x)
 
     # Check for NaN in reference
     if torch.isnan(y_ref).any():
@@ -64,7 +78,7 @@ def main():
 
     print("Step 3: Running compiled model...")
     with torch.no_grad():
-        y_opt = opt(x)
+        y_opt, (opt_x1, opt_x2, opt_x3) = opt(x)
 
     # Check for NaN in optimized output
     if torch.isnan(y_opt).any():
@@ -82,6 +96,19 @@ def main():
 
     print(f"  Max absolute difference:  {max_diff:.6e}")
     print(f"  Mean absolute difference: {mean_diff:.6e}")
+
+    # Layer-by-layer diff
+    print("\n  Layer-by-layer differences:")
+    layer1_diff = (ref_x1 - opt_x1).abs().max().item()
+    layer2_diff = (ref_x2 - opt_x2).abs().max().item()
+    layer3_diff = (ref_x3 - opt_x3).abs().max().item()
+    print(f"    After fc1+relu: {layer1_diff:.6e}")
+    print(f"    After fc2+relu: {layer2_diff:.6e}")
+    print(f"    After fc3:      {layer3_diff:.6e}")
+
+    # Weight norms comparison
+    dump_weight_norms(model, "eager")
+    dump_weight_norms(opt, "hypatia")
     print()
 
     # Validate

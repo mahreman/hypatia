@@ -24,6 +24,13 @@ except ImportError as e:
 
 import torch
 import warnings
+import os
+
+# Import fused modules
+from .fused_modules import HypatiaFusedLinearReLU, create_fused_linear_relu_from_tensors
+
+# Feature flag for verbose FX debugging
+DEBUG_FX = os.environ.get("HYPATIA_DEBUG_FX", "0") == "1"
 
 def hypatia_backend(gm, example_inputs):
     """Hypatia compiler backend for torch.compile()
@@ -36,6 +43,15 @@ def hypatia_backend(gm, example_inputs):
         Optimized GraphModule
     """
     print(f"[Hypatia] Compiling graph with {len(list(gm.graph.nodes))} nodes")
+
+    # DEBUG: Log example_inputs order (only if HYPATIA_DEBUG_FX=1)
+    if DEBUG_FX:
+        print("\n[DEBUG] example_inputs types / shapes:")
+        for i, t in enumerate(example_inputs):
+            try:
+                print(f"  [{i}] shape={tuple(t.shape)}, device={t.device}, requires_grad={t.requires_grad}")
+            except Exception:
+                print(f"  [{i}] non-tensor: {type(t)}")
 
     # Build module_info_map from GraphModule's named_modules
     module_info_map = {}
@@ -106,4 +122,7 @@ __all__ = [
     "HypatiaCompileResult",
     "set_log_level",
     "register_backend",
+    # Fused modules
+    "HypatiaFusedLinearReLU",
+    "create_fused_linear_relu_from_tensors",
 ]

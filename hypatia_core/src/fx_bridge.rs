@@ -22,6 +22,18 @@ use crate::egraph_optimizer::HypatiaLang;
 // fn normalize_placeholder(name: &str) -> String { ... }
 
 // ============================================================================
+// DEBUG FLAGS
+// ============================================================================
+
+/// Check if verbose FX debugging is enabled via HYPATIA_DEBUG_FX environment variable
+/// Set HYPATIA_DEBUG_FX=1 for detailed placeholder mapping and reconstruction logs
+fn is_debug_fx_enabled() -> bool {
+    env::var("HYPATIA_DEBUG_FX")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+// ============================================================================
 // CHECKSUM VALIDATION MODE
 // ============================================================================
 
@@ -176,13 +188,23 @@ pub fn fx_graph_to_sexpr<'py>(
                 )));
             }
             let tensor = example_inputs[next_input_index].clone();
-            eprintln!("[DEBUG] Placeholder '{}' → example_inputs[{}]", node.name, next_input_index);
+            // Enhanced debug: show tensor shape and device (only if HYPATIA_DEBUG_FX=1)
+            if is_debug_fx_enabled() {
+                let shape = tensor.getattr("shape").ok().and_then(|s| s.extract::<Vec<i64>>().ok());
+                let device = tensor.getattr("device").ok().and_then(|d| d.str().ok()).map(|s| s.to_string());
+                eprintln!(
+                    "[DEBUG] Placeholder '{}' → example_inputs[{}] (shape={:?}, device={:?})",
+                    node.name, next_input_index, shape, device
+                );
+            }
             placeholder_map.insert(node.name.clone(), tensor);
             next_input_index += 1;
         }
     }
 
-    eprintln!("[DEBUG] Placeholder mapping created: {} entries", placeholder_map.len());
+    if is_debug_fx_enabled() {
+        eprintln!("[DEBUG] Placeholder mapping created: {} entries", placeholder_map.len());
+    }
 
     let sexpr = build_sexpr_from_nodes(&nodes, types_map, gm)?;
 
@@ -878,6 +900,18 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             })
     }
 
+    /// ✅ Helper: Modülü referans tensörün device'ına taşı
+    /// Bu, CUDA tensörlerle çalışırken critical!
+    fn move_module_to_tensor_device(
+        &self,
+        module: &Bound<'py, PyAny>,
+        tensor: &Bound<'py, PyAny>,
+    ) -> PyResult<()> {
+        let device = tensor.getattr("device")?;
+        module.call_method1("to", (device,))?;
+        Ok(())
+    }
+
     /// ✅ YENİ: Canonical parameter name al
     /// Parametre ismini desanitize eder ("l_self_modules_fc1_parameters_weight_" → "fc1.weight")
     /// Değilse sanitized var name döner ("l_x_")
@@ -1062,6 +1096,10 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 // ✅ YENİ: reconstruct_linear kullanarak parametre kopyalama ile nn.Linear modülü oluştur
                 self.reconstruct_linear(*w_id, *b_id, *x_id, expr)
             }
+            HypatiaLang::FusedLinearReLU([w_id, b_id, x_id]) => {
+                // ✅ NEW: Fused Linear+ReLU reconstruction
+                self.reconstruct_fused_linear_relu(*w_id, *b_id, *x_id, expr)
+            }
             HypatiaLang::Embedding([w_id, x_id]) => {
                 let input_node = self.reconstruct_node(*x_id, expr)?;
                 self.build_embedding_module(node_id, expr, *w_id, input_node, "embedding")
@@ -1245,6 +1283,11 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let embedding_dim = w_shape[1];
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
         let embedding_module = torch_nn.getattr("Embedding")?.call1((num_embeddings, embedding_dim))?;
+
+        // ✅ CRITICAL: Modülü weight'in device'ına taşı (CUDA support için)
+        self.move_module_to_tensor_device(&embedding_module, &w_tensor)?;
+
+        // Artık aynı device'tayız, copy yapabiliriz!
         embedding_module.getattr("weight")?.getattr("data")?.call_method1("copy_", (w_tensor,))?;
         
         self.param_map.insert(module_target_name.clone(), embedding_module.to_object(self.py));
@@ -1282,6 +1325,17 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let weight_tensor = self.get_tensor(&w_name)?;
 
         let b_name = self.get_var_name(b_id, expr)?;
+
+        // DEBUG: Log linear node arguments (only if HYPATIA_DEBUG_FX=1)
+        // x_id might be a nested expression (e.g., ReLU(...)), not just Var/Const
+        if is_debug_fx_enabled() {
+            let x_desc = match self.get_var_name(x_id, expr) {
+                Ok(name) => name,
+                Err(_) => format!("{:?}", expr[x_id])  // Fallback to debug repr for expressions
+            };
+            eprintln!("[DEBUG] Linear node args: w='{}', b='{}', x={}", w_name, b_name, x_desc);
+        }
+
         let has_bias = b_name != "none";
         let bias_tensor = if has_bias {
             Some(self.get_tensor(&b_name)?)
@@ -1298,7 +1352,10 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
         let linear_module = torch_nn.getattr("Linear")?.call1((in_features, out_features))?;
 
-        // 4. ✅ PARAMETRELERİ (Tensörleri) KOPYALA
+        // 3.5. ✅ CRITICAL: Modülü weight'in device'ına taşı (CUDA support için)
+        self.move_module_to_tensor_device(&linear_module, &weight_tensor)?;
+
+        // 4. ✅ PARAMETRELERİ (Tensörleri) KOPYALA (artık aynı device'tayız!)
         linear_module.getattr("weight")?.call_method1("copy_", (weight_tensor,))?;
         if let Some(bias_t) = bias_tensor {
             linear_module.getattr("bias")?.call_method1("copy_", (bias_t,))?;
@@ -1312,6 +1369,54 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let new_node = self.new_graph.call_method(
             "create_node", ("call_module", module_target_name, args_tuple), None
         )?;
+        Ok(new_node.to_object(self.py))
+    }
+
+    // ✅ NEW: Fused Linear+ReLU reconstruction
+    fn reconstruct_fused_linear_relu(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+
+        // 1. Get weight and bias tensors
+        let w_name = self.get_var_name(w_id, expr)?;
+        let weight_tensor = self.get_tensor(&w_name)?;
+
+        let b_name = self.get_var_name(b_id, expr)?;
+        let bias_tensor = if b_name != "none" {
+            Some(self.get_tensor(&b_name)?)
+        } else {
+            None
+        };
+
+        // 2. Import Python helper
+        let hypatia_core = PyModule::import_bound(self.py, "hypatia_core")?;
+        let create_fn = hypatia_core.getattr("create_fused_linear_relu_from_tensors")?;
+
+        // 3. Create fused module (weight/bias already on correct device from get_tensor)
+        let none_obj = self.py.None();
+        let none_value = none_obj.bind(self.py);
+        let bias_arg = match bias_tensor {
+            Some(ref b) => b.as_any(),
+            None => none_value.as_any()
+        };
+
+        let fused_module = create_fn.call1((weight_tensor.as_any(), bias_arg))?;
+
+        // 4. Move module to input's device (for CUDA compatibility)
+        let input_tensor = input_node.bind(self.py);
+        if let Ok(device_attr) = input_tensor.getattr("device") {
+            fused_module.call_method1("to", (device_attr,))?;
+        }
+
+        // 5. Add to module map and create FX node
+        let module_target_name = format!("fused_linear_relu_{}", self.param_map.len());
+        self.param_map.insert(module_target_name.clone(), fused_module.to_object(self.py));
+
+        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
+        let new_node = self.new_graph.call_method(
+            "create_node", ("call_module", module_target_name.clone(), args_tuple), None
+        )?;
+
+        log::info!("✅ Created fused Linear+ReLU module: {}", module_target_name);
         Ok(new_node.to_object(self.py))
     }
 
@@ -1360,7 +1465,10 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             Some(&kwargs)
         )?;
 
-        // 4. ✅ PARAMETRELERİ (Tensörleri) KOPYALA
+        // 3.5. ✅ CRITICAL: Modülü weight'in device'ına taşı (CUDA support için)
+        self.move_module_to_tensor_device(&conv_module, &weight_tensor)?;
+
+        // 4. ✅ PARAMETRELERİ (Tensörleri) KOPYALA (artık aynı device'tayız!)
         conv_module.getattr("weight")?.call_method1("copy_", (weight_tensor,))?;
         if let Some(bias_t) = bias_tensor {
             conv_module.getattr("bias")?.call_method1("copy_", (bias_t,))?;
@@ -1464,7 +1572,14 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             Some(&kwargs)
         )?;
 
-        // 5. ✅ PARAMETRELERİ (Tensörleri) KOPYALA
+        // 4.5. ✅ CRITICAL: Modülü referans tensörün device'ına taşı (CUDA support için)
+        if let Some(ref weight) = weight_tensor {
+            self.move_module_to_tensor_device(&ln_module, weight)?;
+        } else if let Some(ref bias) = bias_tensor {
+            self.move_module_to_tensor_device(&ln_module, bias)?;
+        }
+
+        // 5. ✅ PARAMETRELERİ (Tensörleri) KOPYALA (artık aynı device'tayız!)
         if let Some(weight) = weight_tensor {
             ln_module.getattr("weight")?.call_method1("copy_", (weight,))?;
         }
@@ -1579,6 +1694,10 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             Some(&kwargs)
         )?;
 
+        // ✅ CRITICAL: Modülü weight'in device'ına taşı (CUDA support için)
+        self.move_module_to_tensor_device(&bn_module, &w_tensor)?;
+
+        // Artık aynı device'tayız, copy yapabiliriz!
         bn_module.getattr("weight")?.getattr("data")?.call_method1("copy_", (w_tensor,))?;
         bn_module.getattr("bias")?.getattr("data")?.call_method1("copy_", (b_tensor,))?;
         bn_module.getattr("running_mean")?.getattr("data")?.call_method1("copy_", (mean_tensor,))?;
@@ -1678,10 +1797,6 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let in_channels = w_c_shape[1] * groups_val;
         let kernel_size = (w_c_shape[2], w_c_shape[3]).to_object(self.py);
 
-        // 8) Preserve device and dtype from original conv weight
-        let device = w_c.getattr("device")?;
-        let dtype = w_c.getattr("dtype")?;
-
         log::debug!("Creating fused Conv2d: in={}, out={}, kernel={:?}, stride={:?}, groups={}",
                     in_channels, out_channels, (w_c_shape[2], w_c_shape[3]),
                     stride, groups_val);
@@ -1700,14 +1815,14 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             Some(&kwargs)
         )?;
 
-        // 10) Copy fused parameters to module
+        // 9.5) ✅ CRITICAL: ÖNCE modülü device'a taşı, SONRA copy yap!
+        // Bu sayede CPU→CUDA copy hatası almayız
+        self.move_module_to_tensor_device(&fused_conv, &w_c)?;
+
+        // 10) Copy fused parameters to module (artık aynı device'tayız!)
         // Note: copy_ preserves dtype automatically
         fused_conv.getattr("weight")?.getattr("data")?.call_method1("copy_", (w_fused,))?;
         fused_conv.getattr("bias")?.getattr("data")?.call_method1("copy_", (b_fused,))?;
-
-        // 11) Move module to original device if needed
-        // (Usually not necessary as GraphModule is on CPU, but safer to preserve)
-        fused_conv.call_method1("to", (device,))?;
 
         // 12) Register fused module in param_map and create FX node
         let module_target_name = format!("fused_conv_bn_{}", self.param_map.len());

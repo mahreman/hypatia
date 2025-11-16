@@ -22,6 +22,10 @@ print(f"[DEBUG] Registered backends: {torch._dynamo.list_backends()}")
 # Aggressive mode: disable checksum validation to maximize performance
 os.environ["HYPATIA_CHECKSUM_MODE"] = "off"  # or "soft" for warnings only
 
+# Enable fusion for performance testing
+os.environ.setdefault("HYPATIA_ENABLE_LINRELU_FUSION", "1")
+print(f"[INFO] Fusion enabled: HYPATIA_ENABLE_LINRELU_FUSION=1")
+
 
 class MLP(nn.Module):
     def __init__(self, in_dim=784, hidden_dim=256, out_dim=10):

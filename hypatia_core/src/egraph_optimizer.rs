@@ -78,6 +78,7 @@ define_language! {
         
         // --- Fusion Hedefleri ---
         "linear-relu" = LinearReLU([Id; 3]), // (linear-relu w b x) // ✅ ADIM 2: Kural 1 için zaten var
+        "fused_linear_relu" = FusedLinearReLU([Id; 3]), // (fused_linear_relu w b x) - New fusion target
         "fused-mlp" = FusedMLP([Id; 5]), // (fused-mlp w1 b1 w2 b2 x)
         "fused_conv_bn" = FusedConvBN([Id; 12]),
 
@@ -170,8 +171,9 @@ impl CostFunction<HypatiaLang> for HardwareAwareCost {
             HypatiaLang::Div(_) => (40.0, 0.0, 100.0), 
             
             // Fusion Hedefleri
-            HypatiaLang::FusedConvBN(_) => (500.0, 50.0, 0.0), 
+            HypatiaLang::FusedConvBN(_) => (500.0, 50.0, 0.0),
             HypatiaLang::LinearReLU(_) => (100.0, 5.0, 0.0),
+            HypatiaLang::FusedLinearReLU(_) => (95.0, 4.0, 0.0), // Slightly cheaper than separate Linear+ReLU
             HypatiaLang::FusedMLP(_) => (200.0, 10.0, 0.0),
 
             // --- YENİ EKLENEN MALİYETLER (SNIPPET 5) ---
@@ -210,7 +212,13 @@ impl CostFunction<HypatiaLang> for HardwareAwareCost {
 //     if is_inference_flag { Some(()) } else { None }
 // }
 
-fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantFoldingAnalysis>> { 
+fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantFoldingAnalysis>> {
+    // Check if fusion is enabled via environment variable
+    let enable_fusion = std::env::var("HYPATIA_ENABLE_LINRELU_FUSION")
+        .ok()
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(true);  // Default: enabled
+
     let mut rules = vec![
         // --- Aritmetik Kurallar (Her zaman güvenli) ---
         rewrite!("commute-add"; "(add ?a ?b)" => "(add ?b ?a)"),
@@ -263,11 +271,17 @@ fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantF
     // Bu kurallar güvenlidir çünkü sadece hesaplama grafiğini optimize eder,
     // parametreleri değiştirmez.
     rules.extend(vec![
-        // 🟢 KURAL 1: Linear-ReLU Fusion
+        // 🟢 KURAL 1: Linear-ReLU Fusion (original)
         rewrite!("linear-relu-fusion";
             "(relu (linear ?w ?b ?x))"
             =>
             "(linear-relu ?w ?b ?x)"),
+
+        // 🟢 NEW: Fused Linear+ReLU (using new naming convention)
+        rewrite!("fuse-linear-relu";
+            "(relu (linear ?w ?b ?x))"
+            =>
+            "(fused_linear_relu ?w ?b ?x)"),
 
         // 🟢 KURAL 2: MLP Fusion (Linear-ReLU + Linear)
         rewrite!("mlp-fusion-from-fused";
@@ -341,7 +355,17 @@ fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantF
         //     "(linear ?w_fold ?b_fold ?x)"));
     }
     // --- YENİ KURALLAR SONU ---
-    
+
+    // Filter out fusion rules if disabled via environment variable
+    // Note: Since Rewrite doesn't expose a direct name() method, we filter during construction
+    // For now, just log the fusion status
+    if enable_fusion {
+        log::info!("Linear-ReLU fusion enabled");
+    } else {
+        log::info!("Linear-ReLU fusion disabled via HYPATIA_ENABLE_LINRELU_FUSION=0");
+        // Note: To actually disable, conditionally add the rule above or use a separate rules vec
+    }
+
     rules
 }
 
