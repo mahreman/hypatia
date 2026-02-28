@@ -1,4 +1,4 @@
-//! INT4 Block Quantization with AVX2 SIMD for Large Model Inference
+//! INT4 Block Quantization with AVX-512/AVX2 SIMD for Large Model Inference
 //!
 //! For large models (1B+ params), memory bandwidth is the bottleneck:
 //! - LLaMA-7B FFN weights: 344MB per layer in f32
@@ -9,9 +9,10 @@
 //! - Same weights in INT4: 43MB per layer
 //! - Reading time: 1.1ms per layer
 //!
-//! AVX2 SIMD acceleration:
-//! - Fused dequantize + dot product: no intermediate f32 buffer needed
-//! - Process 16 INT4 values per iteration (2x __m256 FMA)
+//! SIMD acceleration (auto-detected at runtime):
+//! - AVX-512: Process 32 INT4 values per iteration (2x __m512 FMA)
+//! - AVX2 fallback: Process 16 INT4 values per iteration (2x __m256 FMA)
+//! - NEON: ARM64 support for Apple Silicon
 //! - Rayon parallelism across output rows (16 cores)
 //!
 //! Format: Block quantization with group_size elements per block
@@ -130,6 +131,120 @@ impl QuantizedTensor {
     pub fn compression_ratio(&self) -> f32 {
         self.original_bytes() as f32 / self.memory_bytes() as f32
     }
+}
+
+// ============================================================================
+// AVX-512 SIMD Fused INT4 Dot Product (2x throughput vs AVX2)
+// ============================================================================
+
+/// AVX-512 fused INT4 dequantize + dot product for one weight row.
+///
+/// Processes 32 INT4 values per iteration using 512-bit registers:
+/// 1. Load 16 packed bytes = 32 INT4 values
+/// 2. Extract nibbles, interleave to original order
+/// 3. Zero-extend u8 -> i32 -> f32 (16 values per __m512)
+/// 4. Dequantize: scale * (q - zero)
+/// 5. FMA with input values
+///
+/// 2x throughput compared to AVX2 (32 values/iter vs 16).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx2,fma")]
+unsafe fn q4_dot_avx512(
+    input: &[f32],
+    packed_row: &[u8],
+    row_scales: &[f32],
+    row_zeros: &[f32],
+    group_size: usize,
+    in_features: usize,
+) -> f32 {
+    let num_groups = (in_features + group_size - 1) / group_size;
+    let mask_0f = _mm_set1_epi8(0x0F);
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut scalar_acc = 0.0f32;
+
+    for g in 0..num_groups {
+        let col_start = g * group_size;
+        let col_end = (col_start + group_size).min(in_features);
+        let group_len = col_end - col_start;
+
+        let scale_v = _mm512_set1_ps(row_scales[g]);
+        let zero_v = _mm512_set1_ps(row_zeros[g]);
+
+        let mut c = 0;
+
+        // Process 32 values per iteration (16 packed bytes)
+        while c + 32 <= group_len {
+            let byte_offset = (col_start + c) / 2;
+
+            // Load 16 bytes = 32 INT4 values
+            let packed_bytes = _mm_loadu_si128(
+                packed_row.as_ptr().add(byte_offset) as *const __m128i,
+            );
+
+            // Extract nibbles
+            let low = _mm_and_si128(packed_bytes, mask_0f);
+            let high = _mm_and_si128(_mm_srli_epi16(packed_bytes, 4), mask_0f);
+
+            // Interleave: first 16 values (from first 8 bytes)
+            let interleaved_lo = _mm_unpacklo_epi8(low, high);
+            // Next 16 values (from next 8 bytes)
+            let interleaved_hi = _mm_unpackhi_epi8(low, high);
+
+            // Convert 16 u8 -> 16 i32 -> 16 f32 (AVX-512)
+            let vals_lo = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(interleaved_lo));
+            let vals_hi = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(interleaved_hi));
+
+            // Dequantize: scale * (q - zero)
+            let dq_lo = _mm512_mul_ps(scale_v, _mm512_sub_ps(vals_lo, zero_v));
+            let dq_hi = _mm512_mul_ps(scale_v, _mm512_sub_ps(vals_hi, zero_v));
+
+            // Load 16 input floats at a time and FMA
+            let inp_lo = _mm512_loadu_ps(input.as_ptr().add(col_start + c));
+            let inp_hi = _mm512_loadu_ps(input.as_ptr().add(col_start + c + 16));
+
+            acc0 = _mm512_fmadd_ps(dq_lo, inp_lo, acc0);
+            acc1 = _mm512_fmadd_ps(dq_hi, inp_hi, acc1);
+
+            c += 32;
+        }
+
+        // Handle remaining 16 values (AVX-512 single register)
+        if c + 16 <= group_len {
+            let byte_offset = (col_start + c) / 2;
+            let packed_bytes = _mm_loadl_epi64(
+                packed_row.as_ptr().add(byte_offset) as *const __m128i,
+            );
+
+            let low = _mm_and_si128(packed_bytes, mask_0f);
+            let high = _mm_and_si128(_mm_srli_epi16(packed_bytes, 4), mask_0f);
+            let interleaved = _mm_unpacklo_epi8(low, high);
+
+            let vals = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(interleaved));
+            let dq = _mm512_mul_ps(scale_v, _mm512_sub_ps(vals, zero_v));
+            let inp = _mm512_loadu_ps(input.as_ptr().add(col_start + c));
+            acc0 = _mm512_fmadd_ps(dq, inp, acc0);
+
+            c += 16;
+        }
+
+        // Scalar remainder
+        while c < group_len {
+            let abs_col = col_start + c;
+            let byte_idx = abs_col / 2;
+            let q = if abs_col % 2 == 0 {
+                (packed_row[byte_idx] & 0x0F) as f32
+            } else {
+                (packed_row[byte_idx] >> 4) as f32
+            };
+            scalar_acc += row_scales[g] * (q - row_zeros[g]) * input[abs_col];
+            c += 1;
+        }
+    }
+
+    // Combine accumulators: horizontal sum of 2 x __m512
+    let combined = _mm512_add_ps(acc0, acc1);
+    _mm512_reduce_add_ps(combined) + scalar_acc
 }
 
 // ============================================================================
@@ -468,6 +583,11 @@ pub fn quantized_linear_ref(
     //   Each batch row processes all output values sequentially with SIMD.
     //   Input row (~16KB) stays in L1 cache while iterating over all output rows.
 
+    // Runtime SIMD dispatch: prefer AVX-512 > AVX2 > NEON > scalar
+    #[cfg(target_arch = "x86_64")]
+    let use_avx512 = std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("avx512bw");
+
     if batch <= 1 {
         // Single batch: parallelize over output rows
         let output_row = &mut output[0..out_feat];
@@ -483,9 +603,15 @@ pub fn quantized_linear_ref(
 
                 #[cfg(target_arch = "x86_64")]
                 {
-                    *out_val = unsafe {
-                        q4_dot_avx2(input, packed_row, row_scales, row_zeros, group_size, in_feat)
-                    };
+                    if use_avx512 {
+                        *out_val = unsafe {
+                            q4_dot_avx512(input, packed_row, row_scales, row_zeros, group_size, in_feat)
+                        };
+                    } else {
+                        *out_val = unsafe {
+                            q4_dot_avx2(input, packed_row, row_scales, row_zeros, group_size, in_feat)
+                        };
+                    }
                 }
                 #[cfg(target_arch = "aarch64")]
                 {
@@ -503,10 +629,6 @@ pub fn quantized_linear_ref(
         // This gives out_feat parallel tasks (e.g. 11008 for LLaMA-7B),
         // fully saturating all CPU cores. Each task loads one weight row
         // (~2KB, fits in L1) and computes dot products against all batch inputs.
-        //
-        // Previous approach (parallelize over batch rows) only gave `batch`
-        // tasks (e.g. 4), leaving most cores idle and re-reading the entire
-        // weight matrix per thread.
         use rayon::prelude::*;
         (0..out_feat).into_par_iter().for_each(|o| {
             let packed_start = o * packed_cols;
@@ -521,9 +643,15 @@ pub fn quantized_linear_ref(
 
                 #[cfg(target_arch = "x86_64")]
                 {
-                    val = unsafe {
-                        q4_dot_avx2(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
-                    };
+                    if use_avx512 {
+                        val = unsafe {
+                            q4_dot_avx512(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
+                        };
+                    } else {
+                        val = unsafe {
+                            q4_dot_avx2(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
+                        };
+                    }
                 }
                 #[cfg(target_arch = "aarch64")]
                 {

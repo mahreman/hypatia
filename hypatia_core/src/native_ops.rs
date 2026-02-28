@@ -537,6 +537,10 @@ pub fn softmax_inplace(input: &mut [f32], rows: usize, cols: usize) {
 ///
 /// For single-token (seq_len=1) this reduces to identity after V projection.
 /// For multi-token, computes full causal self-attention per batch element.
+///
+/// Optimization: Uses strided GEMM to work directly on interleaved Q/K/V
+/// projections, eliminating per-head copy/scatter overhead. For GPT-2
+/// with seq=32, this eliminates 884K float copies per forward pass.
 pub fn multi_head_attention(
     input: &[f32],           // [batch*seq_len, hidden]
     wq: &[f32], bq: Option<&[f32]>,  // [hidden, hidden]
@@ -568,56 +572,60 @@ pub fn multi_head_attention(
                 .copy_from_slice(&v[b * hidden..(b + 1) * hidden]);
         }
     } else {
-        // Full causal self-attention with GEMM and fused scale+mask+softmax.
+        // Full causal self-attention with strided micro-kernel GEMM.
         //
-        // Buffers are reused across heads (no per-head allocation).
-        // Note: Head-level parallelism is NOT used because per-head GEMM is
-        // tiny (seq*head_dim, ~65K FLOPs) and Rayon overhead dominates.
-        let mut q_head = vec![0.0f32; seq_len * head_dim];
-        let mut k_head = vec![0.0f32; seq_len * head_dim];
-        let mut v_head = vec![0.0f32; seq_len * head_dim];
+        // Q, K, V are [total_rows, hidden] with head h at column offset h*head_dim.
+        // Uses matrixmultiply::sgemm for per-head attention GEMMs because:
+        // 1. Zero-copy: works directly on interleaved data via stride parameters
+        // 2. Low overhead: ~2μs vs MKL's ~5-10μs per call for tiny matrices
+        // 3. No thread pool: avoids Rayon/MKL thread synchronization
+        //
+        // For 12 heads × 12 blocks = 288 GEMM calls, this saves ~1-2ms.
         let mut scores = vec![0.0f32; seq_len * seq_len];
-        let mut attn_v = vec![0.0f32; seq_len * head_dim];
+        let hidden_stride = hidden as isize;
+        let seq_stride = seq_len as isize;
 
         for b in 0..batch {
-            let b_start = b * seq_len;
+            let b_off = b * seq_len * hidden;
 
             for h in 0..n_heads {
                 let h_off = h * head_dim;
 
-                // Extract contiguous Q_h, K_h, V_h: [seq_len, head_dim]
-                for i in 0..seq_len {
-                    let src_off = (b_start + i) * hidden + h_off;
-                    let dst_off = i * head_dim;
-                    q_head[dst_off..dst_off + head_dim]
-                        .copy_from_slice(&q[src_off..src_off + head_dim]);
-                    k_head[dst_off..dst_off + head_dim]
-                        .copy_from_slice(&k[src_off..src_off + head_dim]);
-                    v_head[dst_off..dst_off + head_dim]
-                        .copy_from_slice(&v[src_off..src_off + head_dim]);
+                let q_ptr = unsafe { q.as_ptr().add(b_off + h_off) };
+                let k_ptr = unsafe { k.as_ptr().add(b_off + h_off) };
+                let v_ptr = unsafe { v.as_ptr().add(b_off + h_off) };
+                let out_ptr = unsafe { attn_output.as_mut_ptr().add(b_off + h_off) };
+
+                // scores = (Q_h @ K_h^T) * scale -> [seq_len, seq_len]
+                // matrixmultiply handles C = alpha * A @ B + beta * C
+                // A = Q_h: [seq, head_dim], row stride=hidden, col stride=1
+                // B = K_h^T: we want Q @ K^T, so B is K with swapped strides
+                //   K: [seq, head_dim] with rs=hidden, cs=1
+                //   K^T: rs=1, cs=hidden (swap row/col strides)
+                unsafe {
+                    matrixmultiply::sgemm(
+                        seq_len, head_dim, seq_len,
+                        scale,  // alpha fuses the 1/sqrt(d) scaling
+                        q_ptr, hidden_stride, 1,   // Q_h: row stride=hidden, col stride=1
+                        k_ptr, 1, hidden_stride,   // K_h^T: row stride=1, col stride=hidden
+                        0.0,
+                        scores.as_mut_ptr(), seq_stride, 1,
+                    );
                 }
 
-                // scores = Q_h @ K_h^T -> [seq_len, seq_len]
-                gemm_nt(&q_head, &k_head, &mut scores, seq_len, head_dim, seq_len);
-
-                // Fused scale + causal mask + softmax (single pass per row)
-                // Avoids 3-pass (scale, mask, softmax) by combining into 1 pass
+                // Causal mask + softmax (scale already applied by GEMM)
                 for i in 0..seq_len {
                     let row = &mut scores[i * seq_len..(i + 1) * seq_len];
-                    // Scale valid entries, find max simultaneously
                     let mut max_val = f32::NEG_INFINITY;
                     for j in 0..=i {
-                        row[j] *= scale;
                         if row[j] > max_val { max_val = row[j]; }
                     }
-                    // Exponentiate and sum (only non-masked entries)
                     let mut sum = 0.0f32;
                     for j in 0..=i {
                         let e = (row[j] - max_val).exp();
                         row[j] = e;
                         sum += e;
                     }
-                    // Set masked to 0, normalize valid
                     let inv_sum = 1.0 / sum;
                     for j in 0..=i {
                         row[j] *= inv_sum;
@@ -627,15 +635,19 @@ pub fn multi_head_attention(
                     }
                 }
 
-                // attn_v = scores @ V_h -> [seq_len, head_dim]
-                gemm_nn(&scores, &v_head, &mut attn_v, seq_len, seq_len, head_dim);
-
-                // Write back to interleaved output
-                for i in 0..seq_len {
-                    let src_off = i * head_dim;
-                    let dst_off = (b_start + i) * hidden + h_off;
-                    attn_output[dst_off..dst_off + head_dim]
-                        .copy_from_slice(&attn_v[src_off..src_off + head_dim]);
+                // out_h = scores @ V_h -> write directly to interleaved output
+                // scores: [seq, seq] contiguous
+                // V_h: [seq, head_dim] with rs=hidden, cs=1
+                // out_h: [seq, head_dim] with rs=hidden, cs=1
+                unsafe {
+                    matrixmultiply::sgemm(
+                        seq_len, seq_len, head_dim,
+                        1.0,
+                        scores.as_ptr(), seq_stride, 1,    // scores contiguous
+                        v_ptr, hidden_stride, 1,           // V_h strided
+                        0.0,
+                        out_ptr, hidden_stride, 1,         // output strided (direct write)
+                    );
                 }
             }
         }
