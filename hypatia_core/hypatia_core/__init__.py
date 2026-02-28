@@ -29,6 +29,12 @@ import os
 # Import fused modules
 from .fused_modules import HypatiaFusedLinearReLU, create_fused_linear_relu_from_tensors
 
+# Import direct model optimizer
+from .optimizer import optimize, count_optimizations, HypatiaTrainer
+
+# Import Rust-native forward pass (bypasses PyTorch dispatch)
+from .native_model import NativeModel, NativeTrainer
+
 # Feature flag for verbose FX debugging
 DEBUG_FX = os.environ.get("HYPATIA_DEBUG_FX", "0") == "1"
 
@@ -141,4 +147,12 @@ __all__ = [
     # Fused modules
     "HypatiaFusedLinearReLU",
     "create_fused_linear_relu_from_tensors",
+    # Direct model optimizer
+    "optimize",
+    "count_optimizations",
+    # Rust-native forward pass
+    "NativeModel",
+    "NativeTrainer",
+    "native_forward",
+    "native_train_step",
 ]

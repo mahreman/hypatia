@@ -1,10 +1,12 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyAny}; // PyAny eklendi
+use pyo3::types::{PyDict, PyAny, PyList, PyTuple}; // PyAny eklendi
 use pyo3::Bound;
+use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray1, PyReadwriteArray2, PyArray2, PyUntypedArrayMethods, PyArrayMethods};
 
 use crate::multivector2d::MultiVector2D;
 use crate::multivector3d::MultiVector3D;
 use crate::symbolic::Symbol;
+use crate::native_ops;
 use std::collections::HashMap;
 
 // Hypatia özel hata sınıfı
@@ -573,4 +575,185 @@ pub fn set_log_level(level: &str) -> PyResult<()> {
         .ok();
 
     Ok(())
+}
+
+// ============================================================================
+// Native Forward Pass - Bypasses PyTorch dispatch overhead
+// ============================================================================
+
+/// Native MLP forward pass: all layers fused in a single Rust call.
+/// ZERO-COPY: weight and bias data is read directly from numpy arrays.
+///
+/// Args:
+///     input: numpy array [batch, in_features] f32
+///     layers: Python list of (weight_np, bias_np_or_None, activation_str) tuples
+///
+/// Returns:
+///     numpy array [batch, out_features] f32
+#[pyfunction]
+pub fn native_forward<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    layers: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let input_shape = input.shape();
+    let batch = input_shape[0];
+    let in_features = input_shape[1];
+
+    let input_slice = input
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
+
+    // Process layers with zero-copy weight access
+    let mut current = input_slice.to_vec(); // Only copy input once
+    let mut current_feat = in_features;
+
+    for item in layers.iter() {
+        let tuple = item
+            .downcast::<PyTuple>()
+            .map_err(|_| HypatiaError::new_err("Each layer must be a tuple (weight, bias, activation)"))?;
+
+        // Zero-copy: borrow weight data directly from numpy array
+        let weight: PyReadonlyArray2<f32> = tuple.get_item(0)?.extract()?;
+        let out_feat = weight.shape()[0];
+        let w_slice = weight
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Weight must be C-contiguous: {}", e)))?;
+
+        let bias_obj = tuple.get_item(1)?;
+        let activation: String = tuple.get_item(2)?.extract()?;
+        let is_relu = activation.to_lowercase() == "relu";
+
+        // Call GEMM with zero-copy references - branch on bias presence
+        if bias_obj.is_none() {
+            current = native_ops::fused_linear(
+                &current, w_slice, None, batch, current_feat, out_feat, is_relu,
+            );
+        } else {
+            let bias: PyReadonlyArray1<f32> = bias_obj.extract()?;
+            let b_slice = bias
+                .as_slice()
+                .map_err(|e| HypatiaError::new_err(format!("Bias must be C-contiguous: {}", e)))?;
+            current = native_ops::fused_linear(
+                &current, w_slice, Some(b_slice), batch, current_feat, out_feat, is_relu,
+            );
+        }
+
+        current_feat = out_feat;
+    }
+
+    // Convert to numpy 2D array
+    let result_2d: Vec<Vec<f32>> = current
+        .chunks(current_feat)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+
+    PyArray2::from_vec2_bound(py, &result_2d)
+        .map_err(|e| HypatiaError::new_err(format!("Failed to create output array: {}", e)))
+}
+
+/// Native training step: forward -> MSE loss -> backward -> SGD update.
+/// All computation in Rust, single Python crossing.
+///
+/// Args:
+///     input: numpy [batch, in_features] f32
+///     target: numpy [batch, out_features] f32
+///     weights: list of numpy [out, in] f32 arrays (will be modified in-place!)
+///     biases: list of numpy [out] f32 arrays or None (will be modified in-place!)
+///     activations: list of activation strings ("relu" or "none")
+///     lr: learning rate
+///
+/// Returns:
+///     loss value (float)
+#[pyfunction]
+pub fn native_train_step<'py>(
+    _py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    target: PyReadonlyArray2<'py, f32>,
+    weights: &Bound<'py, PyList>,
+    biases: &Bound<'py, PyList>,
+    activations: &Bound<'py, PyList>,
+    lr: f32,
+) -> PyResult<f32> {
+    let batch = input.shape()[0];
+    let in_features = input.shape()[1];
+    let out_features_final = target.shape()[1];
+
+    let input_slice = input
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
+    let target_slice = target
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Target must be C-contiguous: {}", e)))?;
+
+    let num_layers = weights.len();
+
+    // Extract weight/bias data as mutable owned Vecs
+    let mut weight_vecs: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
+    let mut bias_vecs: Vec<Option<Vec<f32>>> = Vec::with_capacity(num_layers);
+    let mut dims: Vec<(usize, usize, bool)> = Vec::with_capacity(num_layers);
+
+    for i in 0..num_layers {
+        let w: PyReadonlyArray2<f32> = weights.get_item(i)?.extract()?;
+        let out_f = w.shape()[0];
+        let in_f = w.shape()[1];
+
+        weight_vecs.push(
+            w.as_slice()
+                .map_err(|e| HypatiaError::new_err(format!("Weight must be C-contiguous: {}", e)))?
+                .to_vec(),
+        );
+
+        let b_obj = biases.get_item(i)?;
+        if b_obj.is_none() {
+            bias_vecs.push(None);
+        } else {
+            let b: PyReadonlyArray1<f32> = b_obj.extract()?;
+            bias_vecs.push(Some(
+                b.as_slice()
+                    .map_err(|e| HypatiaError::new_err(format!("Bias must be C-contiguous: {}", e)))?
+                    .to_vec(),
+            ));
+        }
+
+        let act: String = activations.get_item(i)?.extract()?;
+        let is_relu = act.to_lowercase() == "relu";
+
+        dims.push((in_f, out_f, is_relu));
+    }
+
+    // Run training step
+    let loss = native_ops::train_step_sgd(
+        input_slice,
+        target_slice,
+        batch,
+        in_features,
+        out_features_final,
+        &mut weight_vecs,
+        &mut bias_vecs,
+        &dims,
+        lr,
+    );
+
+    // Write updated weights/biases back to numpy arrays
+    for i in 0..num_layers {
+        let w_py = weights.get_item(i)?;
+        let mut w_arr: PyReadwriteArray2<f32> = w_py.extract()?;
+        let w_slice = w_arr
+            .as_slice_mut()
+            .map_err(|e| HypatiaError::new_err(format!("Weight write-back failed: {}", e)))?;
+        w_slice.copy_from_slice(&weight_vecs[i]);
+
+        if let Some(ref bias_data) = bias_vecs[i] {
+            let b_py = biases.get_item(i)?;
+            if !b_py.is_none() {
+                let mut b_arr: PyReadwriteArray1<f32> = b_py.extract()?;
+                let b_slice = b_arr.as_slice_mut()
+                    .map_err(|e| HypatiaError::new_err(format!("Bias write-back failed: {}", e)))?;
+                b_slice.copy_from_slice(bias_data);
+            }
+        }
+    }
+
+    Ok(loss)
 }
