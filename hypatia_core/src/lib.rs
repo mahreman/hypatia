@@ -77,6 +77,10 @@ pub fn _hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::python_bindings::native_forward, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::native_train_step, m)?)?;
 
+    // Fused native kernels for torch.compile (Phase 3 reconstruction)
+    m.add_function(wrap_pyfunction!(crate::python_bindings::fused_gelu_mlp_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::fused_linear_relu_forward, m)?)?;
+
     // INT4 quantized inference (for large models)
     m.add_function(wrap_pyfunction!(crate::python_bindings::quantize_weights, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::quantized_forward, m)?)?;

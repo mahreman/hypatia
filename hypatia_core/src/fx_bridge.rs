@@ -1337,24 +1337,32 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
     }
 
     // ✅ FIX: Fused Linear+ReLU reconstruction using call_function
-    // Instead of creating FusedLinearReLU modules with baked-in weights,
-    // we decompose into F.linear + F.relu call_function nodes that reference
-    // placeholder parameters directly. This ensures torch._dynamo can correctly
-    // pass updated parameters when reusing compiled graphs.
+    // Uses Hypatia's fused_linear_relu_forward which calls MKL sgemm_ with
+    // fused bias + ReLU in a single memory pass, bypassing PyTorch dispatch.
     fn reconstruct_fused_linear_relu(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
         let weight_node = self.reconstruct_node(w_id, expr)?;
 
         let b_name = self.get_var_name(b_id, expr)?;
-        let linear_result = if b_name == "none" {
-            self.build_call_function("linear", &[input_node, weight_node], None)?
+        let bias_node = if b_name == "none" {
+            self.py.None().into_bound(self.py).to_object(self.py)
         } else {
-            let bias_node = self.reconstruct_node(b_id, expr)?;
-            self.build_call_function("linear", &[input_node, weight_node, bias_node], None)?
+            self.reconstruct_node(b_id, expr)?
         };
 
-        // F.relu(linear_result)
-        self.build_call_function("relu", &[linear_result], None)
+        // Call Hypatia's native fused kernel
+        let hypatia = PyModule::import_bound(self.py, "_hypatia_core")?;
+        let target_fn = hypatia.getattr("fused_linear_relu_forward")?;
+
+        let args_tuple = PyTuple::new_bound(
+            self.py,
+            &[input_node, weight_node, bias_node],
+        );
+        let new_node = self.new_graph.call_method1(
+            "create_node",
+            ("call_function", target_fn, args_tuple, self.py.None()),
+        )?;
+        Ok(new_node.to_object(self.py))
     }
 
     /// ✅ FIX: Reconstruct FusedMLP using call_function nodes
@@ -1391,8 +1399,9 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         }
     }
 
-    /// Reconstruct FusedGeluMLP: (fused_gelu_mlp w1 b1 w2 b2 x) → F.linear(F.gelu(F.linear(x, w1, b1)), w2, b2)
-    /// This is the standard transformer MLP pattern (Linear → GELU → Linear).
+    /// Reconstruct FusedGeluMLP: (fused_gelu_mlp w1 b1 w2 b2 x) → hypatia native kernel
+    /// Uses Hypatia's fused_gelu_mlp_forward which calls MKL sgemm_ + MKL VML vsTanh
+    /// in a single Rust call, bypassing PyTorch dispatch overhead entirely.
     fn reconstruct_fused_gelu_mlp(
         &mut self,
         w1_id: Id, b1_id: Id,
@@ -1404,26 +1413,33 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let weight1_node = self.reconstruct_node(w1_id, expr)?;
         let weight2_node = self.reconstruct_node(w2_id, expr)?;
 
-        // Layer 1: F.linear(input, w1, b1)
         let b1_name = self.get_var_name(b1_id, expr)?;
-        let linear1 = if b1_name == "none" {
-            self.build_call_function("linear", &[input_node, weight1_node], None)?
+        let bias1_node = if b1_name == "none" {
+            self.py.None().into_bound(self.py).to_object(self.py)
         } else {
-            let bias1_node = self.reconstruct_node(b1_id, expr)?;
-            self.build_call_function("linear", &[input_node, weight1_node, bias1_node], None)?
+            self.reconstruct_node(b1_id, expr)?
         };
 
-        // GELU activation (uses MKL VML vsTanh in our runtime)
-        let gelu1 = self.build_call_function("gelu", &[linear1], None)?;
-
-        // Layer 2: F.linear(gelu1, w2, b2)
         let b2_name = self.get_var_name(b2_id, expr)?;
-        if b2_name == "none" {
-            self.build_call_function("linear", &[gelu1, weight2_node], None)
+        let bias2_node = if b2_name == "none" {
+            self.py.None().into_bound(self.py).to_object(self.py)
         } else {
-            let bias2_node = self.reconstruct_node(b2_id, expr)?;
-            self.build_call_function("linear", &[gelu1, weight2_node, bias2_node], None)
-        }
+            self.reconstruct_node(b2_id, expr)?
+        };
+
+        // Call Hypatia's native fused kernel instead of PyTorch ops
+        let hypatia = PyModule::import_bound(self.py, "_hypatia_core")?;
+        let target_fn = hypatia.getattr("fused_gelu_mlp_forward")?;
+
+        let args_tuple = PyTuple::new_bound(
+            self.py,
+            &[input_node, weight1_node, bias1_node, weight2_node, bias2_node],
+        );
+        let new_node = self.new_graph.call_method1(
+            "create_node",
+            ("call_function", target_fn, args_tuple, self.py.None()),
+        )?;
+        Ok(new_node.to_object(self.py))
     }
 
     // ✅ REFACTORED: reconstruct_conv2d() - get_tensor kullanarak

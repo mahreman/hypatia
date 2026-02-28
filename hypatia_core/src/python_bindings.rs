@@ -755,6 +755,167 @@ pub fn native_train_step<'py>(
 }
 
 // ============================================================================
+// Fused Native Kernels for torch.compile (Phase 3 Reconstruction)
+// ============================================================================
+
+/// Fast tensor→numpy conversion: tries .numpy() first (zero-copy for contiguous f32 CPU tensors),
+/// falls back to .detach().float().contiguous().numpy() if needed.
+#[inline]
+fn tensor_to_numpy_2d<'py>(tensor: &Bound<'py, PyAny>) -> PyResult<PyReadonlyArray2<'py, f32>> {
+    // Fast path: torch.compile always passes contiguous f32 CPU tensors
+    if let Ok(arr) = tensor.call_method0("numpy").and_then(|a| a.extract::<PyReadonlyArray2<f32>>()) {
+        return Ok(arr);
+    }
+    // Slow path: ensure correct dtype/layout
+    tensor
+        .call_method0("detach")?
+        .call_method0("float")?
+        .call_method0("contiguous")?
+        .call_method0("numpy")?
+        .extract()
+}
+
+/// Fast tensor→numpy conversion for 1D tensors.
+#[inline]
+fn tensor_to_numpy_1d<'py>(tensor: &Bound<'py, PyAny>) -> PyResult<PyReadonlyArray1<'py, f32>> {
+    if let Ok(arr) = tensor.call_method0("numpy").and_then(|a| a.extract::<PyReadonlyArray1<f32>>()) {
+        return Ok(arr);
+    }
+    tensor
+        .call_method0("detach")?
+        .call_method0("contiguous")?
+        .call_method0("numpy")?
+        .extract()
+}
+
+/// Fused GELU MLP: Linear → GELU → Linear in a single Rust call.
+/// Uses MKL sgemm_ for GEMM and MKL VML vsTanh for vectorized GELU.
+///
+/// Called by torch.compile's reconstructed FX graph for the fused_gelu_mlp pattern.
+/// Accepts torch tensors (CPU, f32), returns torch tensor.
+///
+/// Args:
+///     input: torch.Tensor [batch, in_features]
+///     w1: torch.Tensor [hidden, in_features]
+///     b1: torch.Tensor [hidden] or None
+///     w2: torch.Tensor [out_features, hidden]
+///     b2: torch.Tensor [out_features] or None
+///
+/// Returns:
+///     torch.Tensor [batch, out_features]
+#[pyfunction]
+pub fn fused_gelu_mlp_forward<'py>(
+    py: Python<'py>,
+    input: &Bound<'py, PyAny>,
+    w1: &Bound<'py, PyAny>,
+    b1: &Bound<'py, PyAny>,
+    w2: &Bound<'py, PyAny>,
+    b2: &Bound<'py, PyAny>,
+) -> PyResult<PyObject> {
+    let torch = PyModule::import_bound(py, "torch")?;
+
+    let input_np = tensor_to_numpy_2d(input)?;
+    let input_slice = input_np
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
+    let batch = input_np.shape()[0];
+    let in_feat = input_np.shape()[1];
+
+    let w1_np = tensor_to_numpy_2d(w1)?;
+    let w1_slice = w1_np
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("W1 must be C-contiguous: {}", e)))?;
+    let hidden = w1_np.shape()[0];
+
+    // Layer 1: linear(input, w1, b1) — no activation
+    let mut hidden_out = if b1.is_none() {
+        native_ops::fused_linear(input_slice, w1_slice, None, batch, in_feat, hidden, false)
+    } else {
+        let b1_np = tensor_to_numpy_1d(b1)?;
+        let b1_slice = b1_np
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("B1 must be C-contiguous: {}", e)))?;
+        native_ops::fused_linear(input_slice, w1_slice, Some(b1_slice), batch, in_feat, hidden, false)
+    };
+
+    // GELU activation (MKL VML vsTanh vectorized, 12x faster than scalar)
+    native_ops::gelu(&mut hidden_out);
+
+    let w2_np = tensor_to_numpy_2d(w2)?;
+    let w2_slice = w2_np
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("W2 must be C-contiguous: {}", e)))?;
+    let out_feat = w2_np.shape()[0];
+
+    // Layer 2: linear(gelu_out, w2, b2) — no activation
+    let output = if b2.is_none() {
+        native_ops::fused_linear(&hidden_out, w2_slice, None, batch, hidden, out_feat, false)
+    } else {
+        let b2_np = tensor_to_numpy_1d(b2)?;
+        let b2_slice = b2_np
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("B2 must be C-contiguous: {}", e)))?;
+        native_ops::fused_linear(&hidden_out, w2_slice, Some(b2_slice), batch, hidden, out_feat, false)
+    };
+
+    // Zero-copy: Vec ownership → numpy → torch.from_numpy
+    let flat = PyArray1::from_vec_bound(py, output);
+    let reshaped = flat.reshape([batch, out_feat])
+        .map_err(|e| HypatiaError::new_err(format!("Failed to reshape output: {}", e)))?;
+    let result = torch.call_method1("from_numpy", (reshaped,))?;
+    Ok(result.to_object(py))
+}
+
+/// Fused Linear + ReLU in a single Rust call.
+/// Uses MKL sgemm_ for GEMM with fused bias + ReLU in one memory pass.
+///
+/// Args:
+///     input: torch.Tensor [batch, in_features]
+///     weight: torch.Tensor [out_features, in_features]
+///     bias: torch.Tensor [out_features] or None
+///
+/// Returns:
+///     torch.Tensor [batch, out_features]
+#[pyfunction]
+pub fn fused_linear_relu_forward<'py>(
+    py: Python<'py>,
+    input: &Bound<'py, PyAny>,
+    weight: &Bound<'py, PyAny>,
+    bias: &Bound<'py, PyAny>,
+) -> PyResult<PyObject> {
+    let torch = PyModule::import_bound(py, "torch")?;
+
+    let input_np = tensor_to_numpy_2d(input)?;
+    let input_slice = input_np
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
+    let batch = input_np.shape()[0];
+    let in_feat = input_np.shape()[1];
+
+    let w_np = tensor_to_numpy_2d(weight)?;
+    let w_slice = w_np
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weight must be C-contiguous: {}", e)))?;
+    let out_feat = w_np.shape()[0];
+
+    let output = if bias.is_none() {
+        native_ops::fused_linear(input_slice, w_slice, None, batch, in_feat, out_feat, true)
+    } else {
+        let b_np = tensor_to_numpy_1d(bias)?;
+        let b_slice = b_np
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Bias must be C-contiguous: {}", e)))?;
+        native_ops::fused_linear(input_slice, w_slice, Some(b_slice), batch, in_feat, out_feat, true)
+    };
+
+    let flat = PyArray1::from_vec_bound(py, output);
+    let reshaped = flat.reshape([batch, out_feat])
+        .map_err(|e| HypatiaError::new_err(format!("Failed to reshape output: {}", e)))?;
+    let result = torch.call_method1("from_numpy", (reshaped,))?;
+    Ok(result.to_object(py))
+}
+
+// ============================================================================
 // INT4 Quantized Inference - For Large Models (1B+ params)
 // ============================================================================
 
