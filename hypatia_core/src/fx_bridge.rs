@@ -1162,9 +1162,18 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 Ok(relu)
             }
             
+            HypatiaLang::FusedLinearReLU(ids) => {
+                // Same as LinearReLU: F.linear + F.relu
+                let w_id = ids[0];
+                let b_id = ids[1];
+                let x_id = ids[2];
+                let linear_node = self.reconstruct_linear(w_id, b_id, x_id, expr)?;
+                let relu = self.build_call_function("relu", &[linear_node], None)?;
+                Ok(relu)
+            }
+
             HypatiaLang::FusedMLP(ids) => {
-                // ✅ REFACTORED: Use FusedMLP module with kernel fusion
-                // Pattern: (fused-mlp w1 b1 w2 b2 x)
+                // Pattern: (fused-mlp w1 b1 w2 b2 x) → F.linear(F.relu(F.linear(x, w1, b1)), w2, b2)
                 let w1_id = ids[0];
                 let b1_id = ids[1];
                 let w2_id = ids[2];
@@ -1172,6 +1181,17 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 let x_id = ids[4];
 
                 self.reconstruct_fused_mlp(w1_id, b1_id, w2_id, b2_id, x_id, expr)
+            },
+
+            HypatiaLang::FusedGeluMLP(ids) => {
+                // Pattern: (fused_gelu_mlp w1 b1 w2 b2 x) → F.linear(F.gelu(F.linear(x, w1, b1)), w2, b2)
+                let w1_id = ids[0];
+                let b1_id = ids[1];
+                let w2_id = ids[2];
+                let b2_id = ids[3];
+                let x_id = ids[4];
+
+                self.reconstruct_fused_gelu_mlp(w1_id, b1_id, w2_id, b2_id, x_id, expr)
             },
             
             HypatiaLang::Mul([a, b]) => {
@@ -1366,6 +1386,41 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         } else {
             let bias2_node = self.reconstruct_node(b2_id, expr)?;
             self.build_call_function("linear", &[relu1, weight2_node, bias2_node], None)
+        }
+    }
+
+    /// Reconstruct FusedGeluMLP: (fused_gelu_mlp w1 b1 w2 b2 x) → F.linear(F.gelu(F.linear(x, w1, b1)), w2, b2)
+    /// This is the standard transformer MLP pattern (Linear → GELU → Linear).
+    fn reconstruct_fused_gelu_mlp(
+        &mut self,
+        w1_id: Id, b1_id: Id,
+        w2_id: Id, b2_id: Id,
+        x_id: Id,
+        expr: &RecExpr<HypatiaLang>
+    ) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+        let weight1_node = self.reconstruct_node(w1_id, expr)?;
+        let weight2_node = self.reconstruct_node(w2_id, expr)?;
+
+        // Layer 1: F.linear(input, w1, b1)
+        let b1_name = self.get_var_name(b1_id, expr)?;
+        let linear1 = if b1_name == "none" {
+            self.build_call_function("linear", &[input_node, weight1_node], None)?
+        } else {
+            let bias1_node = self.reconstruct_node(b1_id, expr)?;
+            self.build_call_function("linear", &[input_node, weight1_node, bias1_node], None)?
+        };
+
+        // GELU activation (uses MKL VML vsTanh in our runtime)
+        let gelu1 = self.build_call_function("gelu", &[linear1], None)?;
+
+        // Layer 2: F.linear(gelu1, w2, b2)
+        let b2_name = self.get_var_name(b2_id, expr)?;
+        if b2_name == "none" {
+            self.build_call_function("linear", &[gelu1, weight2_node], None)
+        } else {
+            let bias2_node = self.reconstruct_node(b2_id, expr)?;
+            self.build_call_function("linear", &[gelu1, weight2_node, bias2_node], None)
         }
     }
 
@@ -1948,7 +2003,9 @@ fn is_supported_node(node: &HypatiaLang) -> bool {
         }
 
         // ========== Fusion Operations ==========
-        HypatiaLang::LinearReLU(_) | HypatiaLang::FusedMLP(_) | HypatiaLang::FusedConvBN(_) => true,
+        HypatiaLang::LinearReLU(_) | HypatiaLang::FusedLinearReLU(_) |
+        HypatiaLang::FusedMLP(_) | HypatiaLang::FusedGeluMLP(_) |
+        HypatiaLang::FusedConvBN(_) => true,
 
         // ========== Statistical Operations ==========
         HypatiaLang::Mean(_) => true,
@@ -1997,13 +2054,15 @@ mod tests {
     fn test_unsanitize_value_f64() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
+            let placeholder_map_owned: HashMap<String, Bound<'_, PyAny>> = HashMap::new();
+            let dummy = PyDict::new_bound(py);
             let rebuilder = FxRebuilder {
                 py,
-                model: PyDict::new_bound(py).as_any(),
-                original_gm: PyDict::new_bound(py).as_any(), // Dummy
-                new_graph: PyDict::new_bound(py).as_any(), // Dummy
+                original_gm: dummy.as_any(),
+                new_graph: dummy.as_any(),
                 node_map: HashMap::new(),
-                placeholder_map: HashMap::new(),
+                fx_placeholder_map: HashMap::new(),
+                placeholder_map: &placeholder_map_owned,
                 param_map: HashMap::new(),
             };
 
@@ -2028,16 +2087,18 @@ mod tests {
     fn test_unsanitize_tuple() {
          pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
+            let placeholder_map_owned: HashMap<String, Bound<'_, PyAny>> = HashMap::new();
+            let dummy = PyDict::new_bound(py);
             let rebuilder = FxRebuilder {
                 py,
-                model: PyDict::new_bound(py).as_any(),
-                original_gm: PyDict::new_bound(py).as_any(),
-                new_graph: PyDict::new_bound(py).as_any(),
+                original_gm: dummy.as_any(),
+                new_graph: dummy.as_any(),
                 node_map: HashMap::new(),
-                placeholder_map: HashMap::new(),
+                fx_placeholder_map: HashMap::new(),
+                placeholder_map: &placeholder_map_owned,
                 param_map: HashMap::new(),
             };
-            
+
             let val = rebuilder.unsanitize_tuple("1_1").unwrap();
             let tuple = val.downcast_bound::<PyTuple>(py).unwrap();
             assert_eq!(tuple.len(), 2);

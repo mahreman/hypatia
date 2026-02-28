@@ -589,39 +589,52 @@ pub fn quantized_linear_ref(
         && std::is_x86_feature_detected!("avx512bw");
 
     if batch <= 1 {
-        // Single batch: parallelize over output rows
+        // Single batch: parallelize over output rows with chunking.
+        // Each chunk processes multiple output rows sequentially, amortizing
+        // Rayon scheduling overhead (~1μs per task) over more work per task.
+        // Input (in_feat floats) stays in L1 cache across the chunk.
         let output_row = &mut output[0..out_feat];
-        output_row
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(o, out_val)| {
-                let packed_start = o * packed_cols;
-                let packed_row = &packed_data[packed_start..packed_start + packed_cols];
-                let scales_start = o * num_groups_per_row;
-                let row_scales = &scales[scales_start..scales_start + num_groups_per_row];
-                let row_zeros = &zeros[scales_start..scales_start + num_groups_per_row];
 
-                #[cfg(target_arch = "x86_64")]
-                {
-                    if use_avx512 {
+        // Chunk size: enough work per task to make Rayon overhead negligible.
+        // At ~0.4μs per dot product (in_feat=1600), 64 dots = ~25μs vs ~1μs Rayon overhead.
+        // For in_feat=4096, 32 dots = ~64μs which is also fine.
+        let chunk_size = if in_feat >= 4096 { 32 } else { 64 };
+
+        output_row
+            .par_chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base_o = chunk_idx * chunk_size;
+                for (i, out_val) in chunk.iter_mut().enumerate() {
+                    let o = base_o + i;
+                    let packed_start = o * packed_cols;
+                    let packed_row = &packed_data[packed_start..packed_start + packed_cols];
+                    let scales_start = o * num_groups_per_row;
+                    let row_scales = &scales[scales_start..scales_start + num_groups_per_row];
+                    let row_zeros = &zeros[scales_start..scales_start + num_groups_per_row];
+
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if use_avx512 {
+                            *out_val = unsafe {
+                                q4_dot_avx512(input, packed_row, row_scales, row_zeros, group_size, in_feat)
+                            };
+                        } else {
+                            *out_val = unsafe {
+                                q4_dot_avx2(input, packed_row, row_scales, row_zeros, group_size, in_feat)
+                            };
+                        }
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
                         *out_val = unsafe {
-                            q4_dot_avx512(input, packed_row, row_scales, row_zeros, group_size, in_feat)
-                        };
-                    } else {
-                        *out_val = unsafe {
-                            q4_dot_avx2(input, packed_row, row_scales, row_zeros, group_size, in_feat)
+                            q4_dot_neon(input, packed_row, row_scales, row_zeros, group_size, in_feat)
                         };
                     }
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    *out_val = unsafe {
-                        q4_dot_neon(input, packed_row, row_scales, row_zeros, group_size, in_feat)
-                    };
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                {
-                    *out_val = q4_dot_scalar(input, packed_row, row_scales, row_zeros, group_size, in_feat);
+                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                    {
+                        *out_val = q4_dot_scalar(input, packed_row, row_scales, row_zeros, group_size, in_feat);
+                    }
                 }
             });
     } else {

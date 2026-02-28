@@ -98,7 +98,7 @@ pub fn batch_rotate_3d<'py>(
 #[cfg(test)]
 mod tests {
     use super::{batch_rotate_2d, batch_rotate_3d};
-    use numpy::PyArray2;
+    use numpy::{PyArray2, PyArrayMethods};
     use pyo3::Python;
 
     #[test]
@@ -106,10 +106,13 @@ mod tests {
         Python::with_gil(|py| {
             let data = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
             let arr = PyArray2::from_vec2_bound(py, &data).unwrap();
-            
+
             // theta = 0 (identity rotasyon)
             let result_arr = batch_rotate_2d(py, 0.0, arr.readonly()).unwrap();
-            let result_data = result_arr.to_vec2().unwrap();
+            let view = unsafe { result_arr.as_array() };
+            let result_data: Vec<Vec<f64>> = view.rows().into_iter()
+                .map(|row| row.to_vec())
+                .collect();
 
             assert_eq!(data, result_data);
         });
@@ -120,10 +123,13 @@ mod tests {
         Python::with_gil(|py| {
             let data = vec![vec![1.0, 2.0, 5.0], vec![3.0, 4.0, 6.0]];
             let arr = PyArray2::from_vec2_bound(py, &data).unwrap();
-            
+
             // theta = 0 (identity rotasyon)
             let result_arr = batch_rotate_3d(py, 0.0, 0.0, 0.0, 1.0, arr.readonly()).unwrap();
-            let result_data = result_arr.to_vec2().unwrap();
+            let view = unsafe { result_arr.as_array() };
+            let result_data: Vec<Vec<f64>> = view.rows().into_iter()
+                .map(|row| row.to_vec())
+                .collect();
 
             assert_eq!(data, result_data);
         });
