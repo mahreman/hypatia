@@ -296,105 +296,6 @@ fn q4_dot_scalar(
 }
 
 // ============================================================================
-// SIMD-Accelerated Dequantization for Tiled BLAS Path (batch > 1)
-// ============================================================================
-
-/// AVX2 SIMD dequantization of a weight row group into f32 buffer.
-/// Processes 16 INT4 values per iteration.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn dequant_group_avx2(
-    packed_row: &[u8],
-    byte_start: usize,
-    scale: f32,
-    zero: f32,
-    output: &mut [f32],
-    count: usize,
-) {
-    let mask_0f = _mm_set1_epi8(0x0F);
-    let scale_v = _mm256_set1_ps(scale);
-    let zero_v = _mm256_set1_ps(zero);
-
-    let mut c = 0;
-
-    while c + 16 <= count {
-        let byte_offset = byte_start + c / 2;
-        let packed_bytes = _mm_loadl_epi64(
-            packed_row.as_ptr().add(byte_offset) as *const __m128i,
-        );
-
-        let low = _mm_and_si128(packed_bytes, mask_0f);
-        let high = _mm_and_si128(_mm_srli_epi16(packed_bytes, 4), mask_0f);
-        let interleaved = _mm_unpacklo_epi8(low, high);
-
-        let vals_lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(interleaved));
-        let vals_hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
-            _mm_srli_si128(interleaved, 8),
-        ));
-
-        let dq_lo = _mm256_mul_ps(scale_v, _mm256_sub_ps(vals_lo, zero_v));
-        let dq_hi = _mm256_mul_ps(scale_v, _mm256_sub_ps(vals_hi, zero_v));
-
-        _mm256_storeu_ps(output.as_mut_ptr().add(c), dq_lo);
-        _mm256_storeu_ps(output.as_mut_ptr().add(c + 8), dq_hi);
-
-        c += 16;
-    }
-
-    // Handle remaining 8
-    if c + 8 <= count {
-        let byte_offset = byte_start + c / 2;
-        let raw = std::ptr::read_unaligned(
-            packed_row.as_ptr().add(byte_offset) as *const u32,
-        );
-        let packed_bytes = _mm_cvtsi32_si128(raw as i32);
-
-        let low = _mm_and_si128(packed_bytes, mask_0f);
-        let high = _mm_and_si128(_mm_srli_epi16(packed_bytes, 4), mask_0f);
-        let interleaved = _mm_unpacklo_epi8(low, high);
-
-        let vals = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(interleaved));
-        let dq = _mm256_mul_ps(scale_v, _mm256_sub_ps(vals, zero_v));
-
-        _mm256_storeu_ps(output.as_mut_ptr().add(c), dq);
-        c += 8;
-    }
-
-    // Scalar remainder
-    while c < count {
-        let actual_byte = byte_start + c / 2;
-        let q = if c % 2 == 0 {
-            (packed_row[actual_byte] & 0x0F) as f32
-        } else {
-            (packed_row[actual_byte] >> 4) as f32
-        };
-        output[c] = scale * (q - zero);
-        c += 1;
-    }
-}
-
-// ============================================================================
-// OpenBLAS FFI
-// ============================================================================
-
-extern "C" {
-    fn cblas_sgemm(
-        order: i32, transa: i32, transb: i32,
-        m: i32, n: i32, k: i32,
-        alpha: f32, a: *const f32, lda: i32,
-        b: *const f32, ldb: i32,
-        beta: f32, c: *mut f32, ldc: i32,
-    );
-}
-
-const CBLAS_ROW_MAJOR: i32 = 101;
-const CBLAS_NO_TRANS: i32 = 111;
-const CBLAS_TRANS: i32 = 112;
-
-/// Tile size for batch > 1 path.
-const TILE_ROWS: usize = 256;
-
-// ============================================================================
 // Main Entry Point: Quantized Linear Layer
 // ============================================================================
 
@@ -421,134 +322,67 @@ pub fn quantized_linear_ref(
 
     let mut output = vec![0.0f32; batch * out_feat];
 
-    if batch <= 4 {
-        // === FUSED SIMD DOT PRODUCT + RAYON PARALLELISM ===
-        // Best for batch=1 (LLM inference): directly compute dot products
-        // from INT4 packed data without intermediate dequantized buffer.
+    // === FUSED SIMD DOT PRODUCT + RAYON PARALLELISM ===
+    // Directly compute dot products from INT4 packed data without intermediate
+    // dequantized buffer.
+    //
+    // Parallelization strategy:
+    // - batch=1: Parallelize over output rows (many fine-grained tasks, best for LLM inference)
+    // - batch>1: Parallelize over batch rows (fewer tasks, avoids Rayon scheduling overhead)
+    //   Each batch row processes all output values sequentially with SIMD.
+    //   Input row (~16KB) stays in L1 cache while iterating over all output rows.
 
-        // For each batch element, parallelize across output rows
-        for b in 0..batch {
-            let input_row = &input[b * in_feat..(b + 1) * in_feat];
-            let output_row = &mut output[b * out_feat..(b + 1) * out_feat];
+    if batch <= 1 {
+        // Single batch: parallelize over output rows
+        let output_row = &mut output[0..out_feat];
+        output_row
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(o, out_val)| {
+                let packed_start = o * packed_cols;
+                let packed_row = &packed_data[packed_start..packed_start + packed_cols];
+                let scales_start = o * num_groups_per_row;
+                let row_scales = &scales[scales_start..scales_start + num_groups_per_row];
+                let row_zeros = &zeros[scales_start..scales_start + num_groups_per_row];
 
-            output_row
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(o, out_val)| {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    *out_val = unsafe {
+                        q4_dot_avx2(input, packed_row, row_scales, row_zeros, group_size, in_feat)
+                    };
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    *out_val = q4_dot_scalar(input, packed_row, row_scales, row_zeros, group_size, in_feat);
+                }
+            });
+    } else {
+        // Multiple batches: parallelize over batch rows to reduce Rayon overhead.
+        // Each batch row does all output values sequentially with SIMD.
+        output
+            .par_chunks_mut(out_feat)
+            .enumerate()
+            .for_each(|(b, out_row)| {
+                let input_row = &input[b * in_feat..(b + 1) * in_feat];
+                for o in 0..out_feat {
                     let packed_start = o * packed_cols;
-                    let packed_end = packed_start + packed_cols;
-                    let packed_row = &packed_data[packed_start..packed_end];
+                    let packed_row = &packed_data[packed_start..packed_start + packed_cols];
                     let scales_start = o * num_groups_per_row;
-                    let row_scales =
-                        &scales[scales_start..scales_start + num_groups_per_row];
-                    let row_zeros =
-                        &zeros[scales_start..scales_start + num_groups_per_row];
+                    let row_scales = &scales[scales_start..scales_start + num_groups_per_row];
+                    let row_zeros = &zeros[scales_start..scales_start + num_groups_per_row];
 
                     #[cfg(target_arch = "x86_64")]
                     {
-                        *out_val = unsafe {
-                            q4_dot_avx2(
-                                input_row,
-                                packed_row,
-                                row_scales,
-                                row_zeros,
-                                group_size,
-                                in_feat,
-                            )
+                        out_row[o] = unsafe {
+                            q4_dot_avx2(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
                         };
                     }
-
                     #[cfg(not(target_arch = "x86_64"))]
                     {
-                        *out_val = q4_dot_scalar(
-                            input_row,
-                            packed_row,
-                            row_scales,
-                            row_zeros,
-                            group_size,
-                            in_feat,
-                        );
-                    }
-                });
-        }
-    } else {
-        // === SIMD DEQUANT + TILED BLAS GEMM ===
-        // Better for batch > 4: BLAS amortizes dequant cost across batch dimension
-
-        for g in 0..num_groups_per_row {
-            let col_start = g * group_size;
-            let col_end = (col_start + group_size).min(in_feat);
-            let tile_cols = col_end - col_start;
-            let is_first_group = g == 0;
-
-            let mut row_start = 0;
-            while row_start < out_feat {
-                let row_end = (row_start + TILE_ROWS).min(out_feat);
-                let tile_rows = row_end - row_start;
-
-                // SIMD-accelerated dequantization
-                let mut dequant = vec![0.0f32; tile_rows * tile_cols];
-
-                for r in 0..tile_rows {
-                    let weight_row = row_start + r;
-                    let group_idx = weight_row * num_groups_per_row + g;
-                    let scale = scales[group_idx];
-                    let zero = zeros[group_idx];
-                    let byte_start = weight_row * packed_cols + col_start / 2;
-                    let dequant_offset = r * tile_cols;
-
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe {
-                        dequant_group_avx2(
-                            packed_data,
-                            byte_start,
-                            scale,
-                            zero,
-                            &mut dequant[dequant_offset..dequant_offset + tile_cols],
-                            tile_cols,
-                        );
-                    }
-
-                    #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        for c in 0..tile_cols {
-                            let abs_col = col_start + c;
-                            let byte_idx = weight_row * packed_cols + abs_col / 2;
-                            let q = if abs_col % 2 == 0 {
-                                (packed_data[byte_idx] & 0x0F) as f32
-                            } else {
-                                (packed_data[byte_idx] >> 4) as f32
-                            };
-                            dequant[dequant_offset + c] = scale * (q - zero);
-                        }
+                        out_row[o] = q4_dot_scalar(input_row, packed_row, row_scales, row_zeros, group_size, in_feat);
                     }
                 }
-
-                // GEMM: output[:, row_start:row_end] += input[:, col_start:col_end] @ dequant.T
-                let beta = if is_first_group { 0.0 } else { 1.0 };
-
-                unsafe {
-                    cblas_sgemm(
-                        CBLAS_ROW_MAJOR,
-                        CBLAS_NO_TRANS,
-                        CBLAS_TRANS,
-                        batch as i32,
-                        tile_rows as i32,
-                        tile_cols as i32,
-                        1.0,
-                        input.as_ptr().add(col_start),
-                        in_feat as i32,
-                        dequant.as_ptr(),
-                        tile_cols as i32,
-                        beta,
-                        output.as_mut_ptr().add(row_start),
-                        out_feat as i32,
-                    );
-                }
-
-                row_start = row_end;
-            }
-        }
+            });
     }
 
     // Fused bias + activation
