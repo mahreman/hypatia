@@ -264,7 +264,37 @@ pub fn sexpr_to_fx_graph<'py>(
         }
     };
 
-    rebuilder.new_graph.call_method1("output", (final_node_obj,))?;
+    // ✅ FIX: Preserve original output format (torch._dynamo expects tuple output)
+    // The original graph returns (result,) as a tuple, so we must match that format.
+    // Detect original output format by checking the original graph's output node.
+    let original_graph = original_gm.getattr("graph")?;
+    let mut output_is_tuple = true; // default: wrap in tuple (safe default for torch.compile)
+    for node in original_graph.getattr("nodes")?.iter()? {
+        let node = node?;
+        let op = node.getattr("op")?.extract::<String>()?;
+        if op == "output" {
+            // Check if original output args is a tuple of nodes
+            if let Ok(args) = node.getattr("args") {
+                if let Ok(args_tuple) = args.downcast::<PyTuple>() {
+                    if args_tuple.len() == 1 {
+                        // Check if the single arg is itself a tuple/list (wrapped output)
+                        let first = args_tuple.get_item(0)?;
+                        output_is_tuple = first.downcast::<PyTuple>().is_ok()
+                            || first.is_instance_of::<pyo3::types::PyList>();
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if output_is_tuple {
+        // Wrap output in a tuple to match torch._dynamo's expected format
+        let output_tuple = PyTuple::new_bound(py, &[final_node_obj]);
+        rebuilder.new_graph.call_method1("output", (output_tuple,))?;
+    } else {
+        rebuilder.new_graph.call_method1("output", (final_node_obj,))?;
+    }
 
     // Fused modüller (LinearReLU vb.) için submodule'leri ekle
     for (name, module) in rebuilder.param_map {
@@ -1297,12 +1327,21 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let out_features: i64 = weight_shape.get_item(0)?.extract()?;
         let in_features: i64 = weight_shape.get_item(1)?.extract()?;
 
-        // 3. Yeni Linear modül oluştur
+        // 3. Yeni Linear modül oluştur (bias parametresini doğru ayarla)
         let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
-        let linear_module = torch_nn.getattr("Linear")?.call1((in_features, out_features))?;
+        let kwargs = PyDict::new_bound(self.py);
+        kwargs.set_item("bias", has_bias)?;
+        let linear_module = torch_nn.getattr("Linear")?.call((in_features, out_features), Some(&kwargs))?;
 
-        // 3.5. ✅ CRITICAL: Modülü weight'in device'ına taşı (CUDA support için)
-        self.move_module_to_tensor_device(&linear_module, &weight_tensor)?;
+        // 3.5. ✅ CRITICAL: Modülü weight'in device ve dtype'ına taşı
+        let weight_dtype = weight_tensor.getattr("dtype")?;
+        let weight_device = weight_tensor.getattr("device")?;
+        linear_module.call_method("to", (), Some(&{
+            let kw = PyDict::new_bound(self.py);
+            kw.set_item("device", weight_device)?;
+            kw.set_item("dtype", weight_dtype)?;
+            kw
+        }))?;
 
         // 4. ✅ PARAMETRELERİ (Tensörleri) KOPYALA (artık aynı device'tayız!)
         linear_module.getattr("weight")?.call_method1("copy_", (weight_tensor,))?;
@@ -1350,11 +1389,13 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
 
         let fused_module = create_fn.call1((weight_tensor.as_any(), bias_arg))?;
 
-        // 4. Move module to input's device (for CUDA compatibility)
-        let input_tensor = input_node.bind(self.py);
-        if let Ok(device_attr) = input_tensor.getattr("device") {
-            fused_module.call_method1("to", (device_attr,))?;
-        }
+        // 4. Ensure module matches weight's device and dtype
+        let weight_dtype = weight_tensor.getattr("dtype")?;
+        let weight_device = weight_tensor.getattr("device")?;
+        let to_kwargs = PyDict::new_bound(self.py);
+        to_kwargs.set_item("device", weight_device)?;
+        to_kwargs.set_item("dtype", weight_dtype)?;
+        fused_module.call_method("to", (), Some(&to_kwargs))?;
 
         // 5. Add to module map and create FX node
         let module_target_name = format!("fused_linear_relu_{}", self.param_map.len());
@@ -1426,11 +1467,13 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             bias2_arg
         ))?;
 
-        // 4. Move module to input's device (for CUDA compatibility)
-        let input_tensor = input_node.bind(self.py);
-        if let Ok(device_attr) = input_tensor.getattr("device") {
-            fused_module.call_method1("to", (device_attr,))?;
-        }
+        // 4. Ensure module matches weight's device and dtype
+        let w1_dtype = weight1_tensor.getattr("dtype")?;
+        let w1_device = weight1_tensor.getattr("device")?;
+        let to_kwargs = PyDict::new_bound(self.py);
+        to_kwargs.set_item("device", w1_device)?;
+        to_kwargs.set_item("dtype", w1_dtype)?;
+        fused_module.call_method("to", (), Some(&to_kwargs))?;
 
         // 5. Add to module map and create FX node
         let module_target_name = format!("fused_mlp_{}", self.param_map.len());
