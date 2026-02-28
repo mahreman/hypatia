@@ -757,3 +757,152 @@ pub fn native_train_step<'py>(
 
     Ok(loss)
 }
+
+// ============================================================================
+// INT4 Quantized Inference - For Large Models (1B+ params)
+// ============================================================================
+
+/// Quantize weight matrices to INT4 block format.
+/// Returns an opaque handle (list of quantized layer data) for use with quantized_forward.
+///
+/// Args:
+///     layers: list of (weight_np, bias_np_or_None, activation_str) tuples
+///     group_size: quantization group size (default: 128)
+///
+/// Returns:
+///     list of (packed_data_bytes, scales_np, zeros_np, bias_np_or_None, activation_str,
+///              rows, cols, group_size, orig_bytes, quant_bytes) tuples
+#[pyfunction]
+#[pyo3(signature = (layers, group_size=128))]
+pub fn quantize_weights<'py>(
+    py: Python<'py>,
+    layers: &Bound<'py, PyList>,
+    group_size: usize,
+) -> PyResult<PyObject> {
+    let result = pyo3::types::PyList::empty_bound(py);
+
+    for item in layers.iter() {
+        let tuple = item
+            .downcast::<PyTuple>()
+            .map_err(|_| HypatiaError::new_err("Each layer must be a tuple"))?;
+
+        let weight: PyReadonlyArray2<f32> = tuple.get_item(0)?.extract()?;
+        let rows = weight.shape()[0];
+        let cols = weight.shape()[1];
+        let w_slice = weight
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Weight must be C-contiguous: {}", e)))?;
+
+        // Quantize to INT4
+        let qt = crate::quantize::QuantizedTensor::quantize(w_slice, rows, cols, group_size);
+
+        let orig_bytes = qt.original_bytes();
+        let quant_bytes = qt.memory_bytes();
+
+        // Convert to Python objects
+        let scales_np = numpy::PyArray1::from_vec_bound(py, qt.scales);
+        let zeros_np = numpy::PyArray1::from_vec_bound(py, qt.zeros);
+        let data_np = numpy::PyArray1::from_vec_bound(py, qt.data);
+
+        let bias_obj = tuple.get_item(1)?;
+        let activation = tuple.get_item(2)?;
+
+        let layer_tuple = PyTuple::new_bound(
+            py,
+            &[
+                data_np.as_any().clone(),
+                scales_np.as_any().clone(),
+                zeros_np.as_any().clone(),
+                bias_obj.clone(),
+                activation.clone(),
+                rows.into_py(py).bind(py).clone(),
+                cols.into_py(py).bind(py).clone(),
+                group_size.into_py(py).bind(py).clone(),
+                orig_bytes.into_py(py).bind(py).clone(),
+                quant_bytes.into_py(py).bind(py).clone(),
+            ],
+        );
+
+        result.append(layer_tuple)?;
+    }
+
+    Ok(result.into())
+}
+
+/// Quantized forward pass: dequantize + GEMM fused, reducing memory bandwidth by ~7x.
+///
+/// Args:
+///     input: numpy [batch, in_features] f32
+///     quantized_layers: output from quantize_weights()
+///
+/// Returns:
+///     numpy [batch, out_features] f32
+#[pyfunction]
+pub fn quantized_forward<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    quantized_layers: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    let input_slice = input
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
+
+    let mut current = input_slice.to_vec();
+    let mut current_feat = input.shape()[1];
+
+    for item in quantized_layers.iter() {
+        let tuple = item
+            .downcast::<PyTuple>()
+            .map_err(|_| HypatiaError::new_err("Invalid quantized layer format"))?;
+
+        // ZERO-COPY: borrow data directly from numpy arrays via as_slice()
+        let data: numpy::PyReadonlyArray1<u8> = tuple.get_item(0)?.extract()?;
+        let scales: PyReadonlyArray1<f32> = tuple.get_item(1)?.extract()?;
+        let zeros: PyReadonlyArray1<f32> = tuple.get_item(2)?.extract()?;
+        let bias_obj = tuple.get_item(3)?;
+        let activation: String = tuple.get_item(4)?.extract()?;
+        let rows: usize = tuple.get_item(5)?.extract()?;
+        let cols: usize = tuple.get_item(6)?.extract()?;
+        let group_size: usize = tuple.get_item(7)?.extract()?;
+
+        let is_relu = activation.to_lowercase() == "relu";
+
+        // Zero-copy slices from numpy
+        let data_slice = data
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Data not contiguous: {}", e)))?;
+        let scales_slice = scales
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Scales not contiguous: {}", e)))?;
+        let zeros_slice = zeros
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Zeros not contiguous: {}", e)))?;
+
+        // Call quantized_linear_ref with zero-copy slices (no .to_vec()!)
+        if bias_obj.is_none() {
+            current = crate::quantize::quantized_linear_ref(
+                &current, data_slice, scales_slice, zeros_slice,
+                rows, cols, group_size, None, batch, is_relu,
+            );
+        } else {
+            let bias: PyReadonlyArray1<f32> = bias_obj.extract()?;
+            let b_slice = bias
+                .as_slice()
+                .map_err(|e| HypatiaError::new_err(format!("Bias not contiguous: {}", e)))?;
+            current = crate::quantize::quantized_linear_ref(
+                &current, data_slice, scales_slice, zeros_slice,
+                rows, cols, group_size, Some(b_slice), batch, is_relu,
+            );
+        }
+        current_feat = rows;
+    }
+
+    let result_2d: Vec<Vec<f32>> = current
+        .chunks(current_feat)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+
+    PyArray2::from_vec2_bound(py, &result_2d)
+        .map_err(|e| HypatiaError::new_err(format!("Failed to create output array: {}", e)))
+}
