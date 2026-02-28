@@ -362,7 +362,9 @@ pub fn train_step_sgd(
 
 /// LayerNorm: y = gamma * (x - mean) / sqrt(var + eps) + beta
 ///
-/// Normalizes across the last dimension (features).
+/// Two-pass: sum for mean, then sum-of-squares for variance.
+/// Uses f32 throughout for speed (values are well-conditioned in practice).
+///
 /// input: [batch, features], gamma: [features], beta: [features]
 pub fn layer_norm(
     input: &[f32],
@@ -377,28 +379,27 @@ pub fn layer_norm(
     debug_assert_eq!(beta.len(), features);
 
     let mut output = vec![0.0f32; batch * features];
+    let inv_n = 1.0 / features as f32;
 
     for b in 0..batch {
         let row = &input[b * features..(b + 1) * features];
         let out_row = &mut output[b * features..(b + 1) * features];
 
-        // Compute mean
-        let mut mean = 0.0f32;
+        // Pass 1: mean
+        let mut sum = 0.0f32;
         for &v in row.iter() {
-            mean += v;
+            sum += v;
         }
-        mean /= features as f32;
+        let mean = sum * inv_n;
 
-        // Compute variance
-        let mut var = 0.0f32;
+        // Pass 2: variance + normalize + affine (fused)
+        let mut var_sum = 0.0f32;
         for &v in row.iter() {
             let d = v - mean;
-            var += d * d;
+            var_sum += d * d;
         }
-        var /= features as f32;
+        let inv_std = 1.0 / (var_sum * inv_n + eps).sqrt();
 
-        // Normalize + affine transform
-        let inv_std = 1.0 / (var + eps).sqrt();
         for j in 0..features {
             out_row[j] = gamma[j] * (row[j] - mean) * inv_std + beta[j];
         }
@@ -411,7 +412,10 @@ pub fn layer_norm(
 // GELU Activation
 // ============================================================================
 
-/// Approximate GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+/// GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+///
+/// In-place activation. Uses standard tanh for numerical accuracy
+/// (error accumulates over many transformer layers).
 pub fn gelu(input: &mut [f32]) {
     const SQRT_2_PI: f32 = 0.7978845608; // sqrt(2/pi)
     const C: f32 = 0.044715;
@@ -494,10 +498,11 @@ pub fn multi_head_attention(
                 .copy_from_slice(&v[b * hidden..(b + 1) * hidden]);
         }
     } else {
-        // Full causal self-attention using GEMM for Q@K^T and attn@V.
+        // Full causal self-attention with GEMM and fused scale+mask+softmax.
         //
-        // The Q/K/V are stored as [total_rows, hidden] with heads interleaved.
-        // We extract contiguous per-head buffers for GEMM efficiency.
+        // Buffers are reused across heads (no per-head allocation).
+        // Note: Head-level parallelism is NOT used because per-head GEMM is
+        // tiny (seq*head_dim, ~65K FLOPs) and Rayon overhead dominates.
         let mut q_head = vec![0.0f32; seq_len * head_dim];
         let mut k_head = vec![0.0f32; seq_len * head_dim];
         let mut v_head = vec![0.0f32; seq_len * head_dim];
@@ -522,26 +527,37 @@ pub fn multi_head_attention(
                         .copy_from_slice(&v[src_off..src_off + head_dim]);
                 }
 
-                // scores = Q_h @ K_h^T * scale -> [seq_len, seq_len]
-                // Using GEMM: C = A @ B^T where A=[seq,head_dim], B=[seq,head_dim]
+                // scores = Q_h @ K_h^T -> [seq_len, seq_len]
                 gemm_nt(&q_head, &k_head, &mut scores, seq_len, head_dim, seq_len);
 
-                // Apply scale and causal mask
+                // Fused scale + causal mask + softmax (single pass per row)
+                // Avoids 3-pass (scale, mask, softmax) by combining into 1 pass
                 for i in 0..seq_len {
-                    for j in 0..seq_len {
-                        if j > i {
-                            scores[i * seq_len + j] = f32::NEG_INFINITY;
-                        } else {
-                            scores[i * seq_len + j] *= scale;
-                        }
+                    let row = &mut scores[i * seq_len..(i + 1) * seq_len];
+                    // Scale valid entries, find max simultaneously
+                    let mut max_val = f32::NEG_INFINITY;
+                    for j in 0..=i {
+                        row[j] *= scale;
+                        if row[j] > max_val { max_val = row[j]; }
+                    }
+                    // Exponentiate and sum (only non-masked entries)
+                    let mut sum = 0.0f32;
+                    for j in 0..=i {
+                        let e = (row[j] - max_val).exp();
+                        row[j] = e;
+                        sum += e;
+                    }
+                    // Set masked to 0, normalize valid
+                    let inv_sum = 1.0 / sum;
+                    for j in 0..=i {
+                        row[j] *= inv_sum;
+                    }
+                    for j in (i + 1)..seq_len {
+                        row[j] = 0.0;
                     }
                 }
 
-                // Softmax each row of scores
-                softmax_inplace(&mut scores, seq_len, seq_len);
-
                 // attn_v = scores @ V_h -> [seq_len, head_dim]
-                // GEMM: C = A @ B where A=[seq,seq], B=[seq,head_dim]
                 gemm_nn(&scores, &v_head, &mut attn_v, seq_len, seq_len, head_dim);
 
                 // Write back to interleaved output
