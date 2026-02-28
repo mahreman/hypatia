@@ -23,6 +23,9 @@ use rayon::prelude::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
 /// Group size for block quantization (128 is standard, like GPTQ/AWQ)
 pub const DEFAULT_GROUP_SIZE: usize = 128;
 
@@ -265,8 +268,8 @@ unsafe fn q4_dot_avx2(
     hsum256_ps(combined) + scalar_acc
 }
 
-/// Scalar fallback for non-x86_64 platforms
-#[cfg(not(target_arch = "x86_64"))]
+/// Scalar fallback for platforms without SIMD
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn q4_dot_scalar(
     input: &[f32],
     packed_row: &[u8],
@@ -293,6 +296,139 @@ fn q4_dot_scalar(
         }
     }
     acc
+}
+
+// ============================================================================
+// ARM NEON SIMD Fused INT4 Dot Product (Apple Silicon / ARM64)
+// ============================================================================
+
+/// NEON fused INT4 dequantize + dot product for one weight row.
+///
+/// Processes 16 INT4 values per iteration using NEON intrinsics:
+/// 1. Load 8 bytes = 16 INT4 values
+/// 2. Extract nibbles via VAND + VSHR
+/// 3. Zero-extend u8 -> u16 -> u32 -> f32
+/// 4. Dequantize: scale * (q - zero)
+/// 5. Multiply-accumulate with input values
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn q4_dot_neon(
+    input: &[f32],
+    packed_row: &[u8],
+    row_scales: &[f32],
+    row_zeros: &[f32],
+    group_size: usize,
+    in_features: usize,
+) -> f32 {
+    let num_groups = (in_features + group_size - 1) / group_size;
+    let mask_0f = vdup_n_u8(0x0F);
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+    let mut scalar_acc = 0.0f32;
+
+    for g in 0..num_groups {
+        let col_start = g * group_size;
+        let col_end = (col_start + group_size).min(in_features);
+        let group_len = col_end - col_start;
+
+        let scale_v = vdupq_n_f32(row_scales[g]);
+        let zero_v = vdupq_n_f32(row_zeros[g]);
+
+        let mut c = 0;
+
+        // Process 16 values per iteration (8 packed bytes)
+        while c + 16 <= group_len {
+            let byte_offset = (col_start + c) / 2;
+
+            // Load 8 bytes = 16 INT4 values
+            let packed = vld1_u8(packed_row.as_ptr().add(byte_offset));
+
+            // Extract low and high nibbles
+            let low = vand_u8(packed, mask_0f);
+            let high = vshr_n_u8(packed, 4);
+
+            // Interleave: [lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3, ...]
+            let interleaved = vzip_u8(low, high);
+            // interleaved.0: first 8 bytes, interleaved.1: next 8 bytes
+
+            // Convert first 4 u8 -> f32
+            let u8_lo = interleaved.0;
+            let u16_0 = vmovl_u8(u8_lo); // u8x8 -> u16x8
+            let u32_0 = vmovl_u16(vget_low_u16(u16_0));  // first 4: u16x4 -> u32x4
+            let u32_1 = vmovl_u16(vget_high_u16(u16_0)); // next 4: u16x4 -> u32x4
+            let f32_0 = vcvtq_f32_u32(u32_0);
+            let f32_1 = vcvtq_f32_u32(u32_1);
+
+            // Convert next 4 u8 -> f32
+            let u8_hi = interleaved.1;
+            let u16_1 = vmovl_u8(u8_hi);
+            let u32_2 = vmovl_u16(vget_low_u16(u16_1));
+            let u32_3 = vmovl_u16(vget_high_u16(u16_1));
+            let f32_2 = vcvtq_f32_u32(u32_2);
+            let f32_3 = vcvtq_f32_u32(u32_3);
+
+            // Dequantize: scale * (q - zero)
+            let dq_0 = vmulq_f32(scale_v, vsubq_f32(f32_0, zero_v));
+            let dq_1 = vmulq_f32(scale_v, vsubq_f32(f32_1, zero_v));
+            let dq_2 = vmulq_f32(scale_v, vsubq_f32(f32_2, zero_v));
+            let dq_3 = vmulq_f32(scale_v, vsubq_f32(f32_3, zero_v));
+
+            // Load input values (4 floats at a time)
+            let inp_0 = vld1q_f32(input.as_ptr().add(col_start + c));
+            let inp_1 = vld1q_f32(input.as_ptr().add(col_start + c + 4));
+            let inp_2 = vld1q_f32(input.as_ptr().add(col_start + c + 8));
+            let inp_3 = vld1q_f32(input.as_ptr().add(col_start + c + 12));
+
+            // Fused multiply-accumulate
+            acc0 = vfmaq_f32(acc0, dq_0, inp_0);
+            acc1 = vfmaq_f32(acc1, dq_1, inp_1);
+            acc2 = vfmaq_f32(acc2, dq_2, inp_2);
+            acc3 = vfmaq_f32(acc3, dq_3, inp_3);
+
+            c += 16;
+        }
+
+        // Handle remaining 4-at-a-time
+        while c + 4 <= group_len {
+            let abs_col = col_start + c;
+            let byte_offset = abs_col / 2;
+            // Extract 4 INT4 values (2 bytes)
+            let b0 = packed_row[byte_offset];
+            let b1 = packed_row[byte_offset + 1];
+            let vals = [
+                (b0 & 0x0F) as f32,
+                (b0 >> 4) as f32,
+                (b1 & 0x0F) as f32,
+                (b1 >> 4) as f32,
+            ];
+            let q_v = vld1q_f32(vals.as_ptr());
+            let dq = vmulq_f32(scale_v, vsubq_f32(q_v, zero_v));
+            let inp = vld1q_f32(input.as_ptr().add(abs_col));
+            acc0 = vfmaq_f32(acc0, dq, inp);
+            c += 4;
+        }
+
+        // Scalar remainder
+        while c < group_len {
+            let abs_col = col_start + c;
+            let byte_idx = abs_col / 2;
+            let q = if abs_col % 2 == 0 {
+                (packed_row[byte_idx] & 0x0F) as f32
+            } else {
+                (packed_row[byte_idx] >> 4) as f32
+            };
+            scalar_acc += row_scales[g] * (q - row_zeros[g]) * input[abs_col];
+            c += 1;
+        }
+    }
+
+    // Combine accumulators: horizontal sum of 4x float32x4
+    let sum01 = vaddq_f32(acc0, acc1);
+    let sum23 = vaddq_f32(acc2, acc3);
+    let sum = vaddq_f32(sum01, sum23);
+    vaddvq_f32(sum) + scalar_acc
 }
 
 // ============================================================================
@@ -351,7 +487,13 @@ pub fn quantized_linear_ref(
                         q4_dot_avx2(input, packed_row, row_scales, row_zeros, group_size, in_feat)
                     };
                 }
-                #[cfg(not(target_arch = "x86_64"))]
+                #[cfg(target_arch = "aarch64")]
+                {
+                    *out_val = unsafe {
+                        q4_dot_neon(input, packed_row, row_scales, row_zeros, group_size, in_feat)
+                    };
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 {
                     *out_val = q4_dot_scalar(input, packed_row, row_scales, row_zeros, group_size, in_feat);
                 }
@@ -377,7 +519,13 @@ pub fn quantized_linear_ref(
                             q4_dot_avx2(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
                         };
                     }
-                    #[cfg(not(target_arch = "x86_64"))]
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        out_row[o] = unsafe {
+                            q4_dot_neon(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
+                        };
+                    }
+                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                     {
                         out_row[o] = q4_dot_scalar(input_row, packed_row, row_scales, row_zeros, group_size, in_feat);
                     }
@@ -470,6 +618,101 @@ pub fn quantization_error(original: &[f32], quantized: &QuantizedTensor) -> f32 
     }
 
     (sum_sq / (rows * cols) as f64).sqrt() as f32
+}
+
+// ============================================================================
+// Quantization-Aware Training (QAT) with Straight-Through Estimator
+// ============================================================================
+
+/// Single QAT training step:
+/// 1. Quantize f32 weights to INT4 -> forward with quantized weights
+/// 2. Compute MSE loss
+/// 3. Backward using f32 weights (straight-through estimator)
+/// 4. SGD update on f32 weights
+///
+/// Returns the loss value.
+pub fn quantized_train_step_sgd(
+    input: &[f32],
+    target: &[f32],
+    batch: usize,
+    in_features: usize,
+    out_features_final: usize,
+    weights: &mut [Vec<f32>],
+    biases: &mut [Option<Vec<f32>>],
+    layer_dims: &[(usize, usize, bool)], // (in_feat, out_feat, is_relu) per layer
+    group_size: usize,
+    lr: f32,
+) -> f32 {
+    let num_layers = weights.len();
+
+    // === QUANTIZED FORWARD PASS ===
+    // Quantize weights and run forward, saving intermediates for backward
+    let mut intermediates: Vec<Vec<f32>> = Vec::with_capacity(num_layers + 1);
+    intermediates.push(input.to_vec());
+
+    let mut current_feat = in_features;
+    for i in 0..num_layers {
+        let (_, out_feat, is_relu) = layer_dims[i];
+
+        // Quantize this layer's weights
+        let qt = QuantizedTensor::quantize(&weights[i], out_feat, current_feat, group_size);
+
+        // Forward with quantized weights
+        let bias_slice = biases[i].as_deref();
+        let output = quantized_linear(&intermediates[i], &qt, bias_slice, batch, is_relu);
+
+        intermediates.push(output);
+        current_feat = out_feat;
+    }
+
+    let final_output = &intermediates[num_layers];
+
+    // === MSE LOSS ===
+    let n = (batch * out_features_final) as f32;
+    let mut loss = 0.0f32;
+    let mut grad_loss = vec![0.0f32; batch * out_features_final];
+    for i in 0..batch * out_features_final {
+        let diff = final_output[i] - target[i];
+        loss += diff * diff;
+        grad_loss[i] = 2.0 * diff / n;
+    }
+    loss /= n;
+
+    // === BACKWARD PASS (STE: use f32 weights for gradients) ===
+    let mut grad_output = grad_loss;
+
+    for i in (0..num_layers).rev() {
+        let (in_f, out_f, is_relu) = layer_dims[i];
+        let needs_input_grad = i > 0;
+
+        let (grad_input, grad_weight, grad_bias) = crate::native_ops::fused_linear_backward(
+            &grad_output,
+            &intermediates[i],
+            &weights[i], // Use f32 weights for gradient computation (STE)
+            &intermediates[i + 1],
+            batch,
+            in_f,
+            out_f,
+            is_relu,
+            needs_input_grad,
+        );
+
+        // === SGD UPDATE on f32 weights ===
+        for j in 0..weights[i].len() {
+            weights[i][j] -= lr * grad_weight[j];
+        }
+        if let Some(ref mut bias) = biases[i] {
+            for j in 0..bias.len() {
+                bias[j] -= lr * grad_bias[j];
+            }
+        }
+
+        if let Some(gi) = grad_input {
+            grad_output = gi;
+        }
+    }
+
+    loss
 }
 
 #[cfg(test)]

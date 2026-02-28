@@ -1043,3 +1043,263 @@ pub fn transformer_forward_py<'py>(
     PyArray2::from_vec2_bound(py, &result_2d)
         .map_err(|e| HypatiaError::new_err(format!("Failed to create transformer output: {}", e)))
 }
+
+/// Quantization-Aware Training step.
+/// Forward with INT4 quantized weights, backward with f32 weights (STE).
+///
+/// Args:
+///   input: [batch, in_features] f32 array
+///   target: [batch, out_features] f32 array
+///   weights: list of [out, in] f32 arrays (mutable, updated in-place)
+///   biases: list of [out] f32 arrays or None (mutable)
+///   activations: list of activation name strings ("relu" or "none")
+///   lr: learning rate
+///   group_size: INT4 quantization group size (default 128)
+///
+/// Returns: loss value (float)
+#[pyfunction]
+pub fn quantized_train_step<'py>(
+    _py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    target: PyReadonlyArray2<'py, f32>,
+    weights: &Bound<'py, PyList>,
+    biases: &Bound<'py, PyList>,
+    activations: &Bound<'py, PyList>,
+    lr: f32,
+    group_size: Option<usize>,
+) -> PyResult<f32> {
+    let gs = group_size.unwrap_or(128);
+    let batch = input.shape()[0];
+    let in_features = input.shape()[1];
+
+    let x = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let y = target.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Target: {}", e)))?;
+
+    let out_features = target.shape()[1];
+
+    // Extract mutable weights
+    let n_layers = weights.len();
+    let mut w_vecs: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
+    let mut b_vecs: Vec<Option<Vec<f32>>> = Vec::with_capacity(n_layers);
+    let mut layer_dims: Vec<(usize, usize, bool)> = Vec::with_capacity(n_layers);
+    let mut current_in = in_features;
+
+    for i in 0..n_layers {
+        let w_arr: numpy::PyReadonlyArray2<f32> = weights.get_item(i)?.extract()?;
+        let out_f = w_arr.shape()[0];
+        let in_f = w_arr.shape()[1];
+        w_vecs.push(w_arr.as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Weight {}: {}", i, e)))?
+            .to_vec());
+
+        let bias_obj = biases.get_item(i)?;
+        if bias_obj.is_none() {
+            b_vecs.push(None);
+        } else {
+            let b_arr: PyReadonlyArray1<f32> = bias_obj.extract()?;
+            b_vecs.push(Some(b_arr.as_slice()
+                .map_err(|e| HypatiaError::new_err(format!("Bias {}: {}", i, e)))?
+                .to_vec()));
+        }
+
+        let act: String = activations.get_item(i)?.extract()?;
+        let is_relu = act == "relu";
+        layer_dims.push((in_f, out_f, is_relu));
+        current_in = out_f;
+    }
+
+    // Run QAT training step
+    let loss = crate::quantize::quantized_train_step_sgd(
+        x, y, batch, in_features, out_features,
+        &mut w_vecs, &mut b_vecs, &layer_dims, gs, lr,
+    );
+
+    // Copy updated weights back to numpy arrays
+    for i in 0..n_layers {
+        let w_obj = weights.get_item(i)?;
+        let mut w_arr: numpy::PyReadwriteArray2<f32> = w_obj.extract()?;
+        let w_slice = w_arr.as_slice_mut()
+            .map_err(|e| HypatiaError::new_err(format!("Write weight {}: {}", i, e)))?;
+        w_slice.copy_from_slice(&w_vecs[i]);
+
+        let bias_obj = biases.get_item(i)?;
+        if !bias_obj.is_none() {
+            if let Some(ref b_data) = b_vecs[i] {
+                let mut b_arr: PyReadwriteArray1<f32> = bias_obj.extract()?;
+                let b_slice = b_arr.as_slice_mut()
+                    .map_err(|e| HypatiaError::new_err(format!("Write bias {}: {}", i, e)))?;
+                b_slice.copy_from_slice(b_data);
+            }
+        }
+    }
+
+    Ok(loss)
+}
+
+/// Batch 2D rotation using geometric algebra rotor.
+/// input: [batch, 2], theta: rotation angle in radians
+/// Returns: [batch, 2] rotated vectors
+#[pyfunction]
+pub fn ga_batch_rotate_2d<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    theta: f32,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    let cols = input.shape()[1];
+    if cols != 2 {
+        return Err(HypatiaError::new_err("Input must have 2 columns (e1, e2)"));
+    }
+    let data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+
+    let result = crate::geometric_ops::batch_rotor_2d(data, batch, theta);
+
+    let result_2d: Vec<Vec<f32>> = result.chunks(2).map(|c| c.to_vec()).collect();
+    PyArray2::from_vec2_bound(py, &result_2d)
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+/// Batch 3D rotation using geometric algebra rotor.
+/// input: [batch, 3], axis: [3] normalized rotation axis, theta: rotation angle
+/// Returns: [batch, 3] rotated vectors
+#[pyfunction]
+pub fn ga_batch_rotate_3d<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    axis: PyReadonlyArray1<'py, f32>,
+    theta: f32,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    if input.shape()[1] != 3 {
+        return Err(HypatiaError::new_err("Input must have 3 columns (e1, e2, e3)"));
+    }
+    let ax_slice = axis.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Axis: {}", e)))?;
+    if ax_slice.len() != 3 {
+        return Err(HypatiaError::new_err("Axis must have 3 elements"));
+    }
+    let data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let axis_arr = [ax_slice[0], ax_slice[1], ax_slice[2]];
+
+    let result = crate::geometric_ops::batch_rotor_3d(data, batch, &axis_arr, theta);
+
+    let result_2d: Vec<Vec<f32>> = result.chunks(3).map(|c| c.to_vec()).collect();
+    PyArray2::from_vec2_bound(py, &result_2d)
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+/// 2D Geometric Product layer: computes geometric product of input multivectors
+/// with learned weight multivectors.
+/// input: [batch, 4] (s, e1, e2, e12), weights: [out_features, 4]
+/// Returns: [batch, out_features * 4]
+#[pyfunction]
+pub fn ga2d_product_layer<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    weights: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    if input.shape()[1] != 4 {
+        return Err(HypatiaError::new_err("Input must have 4 columns (s, e1, e2, e12)"));
+    }
+    let out_features = weights.shape()[0];
+    if weights.shape()[1] != 4 {
+        return Err(HypatiaError::new_err("Weights must have 4 columns"));
+    }
+
+    let in_data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let w_data = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+
+    let result = crate::geometric_ops::ga2d_geometric_product_layer(in_data, w_data, batch, out_features);
+
+    let out_cols = out_features * 4;
+    let result_2d: Vec<Vec<f32>> = result.chunks(out_cols).map(|c| c.to_vec()).collect();
+    PyArray2::from_vec2_bound(py, &result_2d)
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+/// 3D Geometric Product layer.
+/// input: [batch, 8] (s, e1, e2, e3, e12, e23, e31, e123)
+/// weights: [out_features, 8]
+/// Returns: [batch, out_features * 8]
+#[pyfunction]
+pub fn ga3d_product_layer<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    weights: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    if input.shape()[1] != 8 {
+        return Err(HypatiaError::new_err("Input must have 8 columns"));
+    }
+    let out_features = weights.shape()[0];
+    if weights.shape()[1] != 8 {
+        return Err(HypatiaError::new_err("Weights must have 8 columns"));
+    }
+
+    let in_data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let w_data = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+
+    let result = crate::geometric_ops::ga3d_geometric_product_layer(in_data, w_data, batch, out_features);
+
+    let out_cols = out_features * 8;
+    let result_2d: Vec<Vec<f32>> = result.chunks(out_cols).map(|c| c.to_vec()).collect();
+    PyArray2::from_vec2_bound(py, &result_2d)
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+/// Normalize 2D multivectors.
+/// input: [batch, 4] -> output: [batch, 4] (unit multivectors)
+#[pyfunction]
+pub fn ga2d_normalize<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    if input.shape()[1] != 4 {
+        return Err(HypatiaError::new_err("Input must have 4 columns"));
+    }
+    let data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+
+    let result = crate::geometric_ops::ga2d_normalize(data, batch);
+
+    let result_2d: Vec<Vec<f32>> = result.chunks(4).map(|c| c.to_vec()).collect();
+    PyArray2::from_vec2_bound(py, &result_2d)
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+/// Normalize 3D multivectors.
+/// input: [batch, 8] -> output: [batch, 8] (unit multivectors)
+#[pyfunction]
+pub fn ga3d_normalize<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    if input.shape()[1] != 8 {
+        return Err(HypatiaError::new_err("Input must have 8 columns"));
+    }
+    let data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+
+    let result = crate::geometric_ops::ga3d_normalize(data, batch);
+
+    let result_2d: Vec<Vec<f32>> = result.chunks(8).map(|c| c.to_vec()).collect();
+    PyArray2::from_vec2_bound(py, &result_2d)
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+/// Get GPU backend info
+#[pyfunction]
+pub fn gpu_info() -> String {
+    crate::gpu_backend::gpu_info()
+}

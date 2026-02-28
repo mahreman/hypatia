@@ -14,6 +14,8 @@ mod egraph_optimizer;  // E-graph mod declare
 mod fx_bridge;  // ✅ YENİ: FX Graph bridge module
 mod native_ops;  // Native fused GEMM operations
 mod quantize;    // INT4 block quantization for large models
+mod gpu_backend; // GPU acceleration (CUDA/Metal)
+mod geometric_ops; // Geometric algebra neural network operations
 
 use pyo3::prelude::*;
 
@@ -81,6 +83,20 @@ pub fn _hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Transformer forward (LayerNorm + Attention + MLP)
     m.add_function(wrap_pyfunction!(crate::python_bindings::transformer_forward_py, m)?)?;
+
+    // Quantization-Aware Training (QAT)
+    m.add_function(wrap_pyfunction!(crate::python_bindings::quantized_train_step, m)?)?;
+
+    // Geometric Algebra neural network operations
+    m.add_function(wrap_pyfunction!(crate::python_bindings::ga_batch_rotate_2d, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::ga_batch_rotate_3d, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::ga2d_product_layer, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::ga3d_product_layer, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::ga2d_normalize, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::ga3d_normalize, m)?)?;
+
+    // GPU backend info
+    m.add_function(wrap_pyfunction!(crate::python_bindings::gpu_info, m)?)?;
 
     Ok(())
 }

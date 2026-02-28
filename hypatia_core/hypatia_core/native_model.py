@@ -32,13 +32,17 @@ import numpy as np
 from typing import List, Tuple, Optional
 
 try:
-    from _hypatia_core import native_forward, native_train_step, quantize_weights, quantized_forward, transformer_forward_py
+    from _hypatia_core import (
+        native_forward, native_train_step, quantize_weights,
+        quantized_forward, transformer_forward_py, quantized_train_step,
+    )
 except ImportError:
     native_forward = None
     native_train_step = None
     quantize_weights = None
     quantized_forward = None
     transformer_forward_py = None
+    quantized_train_step = None
 
 
 class NativeModel(nn.Module):
@@ -222,6 +226,91 @@ class NativeTrainer:
             if b is not None:
                 state.append(torch.from_numpy(b.copy()))
         return state
+
+
+class QuantizedTrainer:
+    """Quantization-Aware Training (QAT) with INT4 forward + f32 backward.
+
+    Training with quantization noise: forward pass uses INT4 quantized weights
+    (SIMD accelerated), backward pass uses f32 weights (straight-through estimator).
+    After training, the model is calibrated for INT4 inference with minimal accuracy loss.
+
+    Usage:
+        trainer = QuantizedTrainer(model, lr=0.001, group_size=128)
+        for x, y in dataloader:
+            loss = trainer.step(x, y)
+        # Get trained model for INT4 inference
+        fast_model = trainer.to_quantized_model()
+    """
+
+    def __init__(self, model: nn.Module, lr: float = 0.001, group_size: int = 128):
+        if quantized_train_step is None:
+            raise RuntimeError(
+                "quantized_train_step not available. Rebuild with: maturin develop --release"
+            )
+
+        self.lr = lr
+        self.group_size = group_size
+        layer_info = _extract_layers(model)
+        if not layer_info:
+            raise ValueError("Could not extract MLP layers from model")
+
+        self.weights = []
+        self.biases = []
+        self.activations = []
+
+        for weight, bias, activation in layer_info:
+            self.weights.append(weight.detach().float().contiguous().numpy().copy())
+            self.biases.append(
+                bias.detach().float().contiguous().numpy().copy() if bias is not None else None
+            )
+            self.activations.append(activation)
+
+        self._in_features = layer_info[0][0].shape[1]
+        self._out_features = layer_info[-1][0].shape[0]
+        self._n_params = sum(w.size for w in self.weights)
+
+    def step(self, inputs: torch.Tensor, targets: torch.Tensor) -> float:
+        """Single QAT training step. Returns loss value."""
+        x_np = inputs.detach().float().contiguous().numpy()
+        y_np = targets.detach().float().contiguous().numpy()
+
+        loss = quantized_train_step(
+            x_np, y_np,
+            self.weights, self.biases, self.activations,
+            self.lr, self.group_size,
+        )
+        return loss
+
+    def to_quantized_model(self) -> 'QuantizedModel':
+        """Convert trained weights to a QuantizedModel for fast INT4 inference."""
+        # Build a temporary Sequential model from current weights
+        layers = []
+        for i, (w, b, act) in enumerate(zip(self.weights, self.biases, self.activations)):
+            out_f, in_f = w.shape
+            linear = nn.Linear(in_f, out_f, bias=(b is not None))
+            with torch.no_grad():
+                linear.weight.copy_(torch.from_numpy(w))
+                if b is not None:
+                    linear.bias.copy_(torch.from_numpy(b))
+            layers.append(linear)
+            if act == "relu":
+                layers.append(nn.ReLU())
+        model = nn.Sequential(*layers)
+        model.eval()
+        return QuantizedModel(model, group_size=self.group_size)
+
+    def get_model_state(self):
+        """Return current weights as torch tensors."""
+        state = []
+        for w, b in zip(self.weights, self.biases):
+            state.append(torch.from_numpy(w.copy()))
+            if b is not None:
+                state.append(torch.from_numpy(b.copy()))
+        return state
+
+    def __repr__(self):
+        return f"QuantizedTrainer(INT4 QAT, group_size={self.group_size}, {self._n_params/1e6:.1f}M params)"
 
 
 class TransformerModel(nn.Module):
