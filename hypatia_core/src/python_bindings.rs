@@ -904,5 +904,142 @@ pub fn quantized_forward<'py>(
         .collect();
 
     PyArray2::from_vec2_bound(py, &result_2d)
-        .map_err(|e| HypatiaError::new_err(format!("Failed to create output array: {}", e)))
+        .map_err(|e| HypatiaError::new_err(format!("Failed to create quantized output: {}", e)))
+}
+
+/// Execute a transformer forward pass with mixed operation types.
+///
+/// ops_list: List of operation tuples:
+///   ("linear", weight_np, bias_np_or_None, activation_str)
+///   ("layernorm", gamma_np, beta_np, eps_float)
+///   ("attention", wq, bq, wk, bk, wv, bv, wo, bo, n_heads)
+///   ("residual_start",)
+///   ("residual_end",)
+///   ("gelu",)
+#[pyfunction]
+pub fn transformer_forward_py<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    ops_list: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    let features = input.shape()[1];
+    let input_slice = input
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
+
+    let mut current = input_slice.to_vec();
+    let mut current_feat = features;
+    let mut residual_stack: Vec<Vec<f32>> = Vec::new();
+
+    for item in ops_list.iter() {
+        let tuple = item
+            .downcast::<PyTuple>()
+            .map_err(|_| HypatiaError::new_err("Op must be a tuple"))?;
+
+        let op_type: String = tuple.get_item(0)?.extract()?;
+
+        match op_type.as_str() {
+            "linear" => {
+                let weight: PyReadonlyArray2<f32> = tuple.get_item(1)?.extract()?;
+                let bias_obj = tuple.get_item(2)?;
+                let activation: String = tuple.get_item(3)?.extract()?;
+
+                let w_slice = weight.as_slice()
+                    .map_err(|e| HypatiaError::new_err(format!("Weight not contiguous: {}", e)))?;
+                let out_feat = weight.shape()[0];
+                let in_feat = weight.shape()[1];
+                let is_relu = activation == "relu";
+
+                if bias_obj.is_none() {
+                    current = native_ops::fused_linear(&current, w_slice, None, batch, in_feat, out_feat, is_relu);
+                } else {
+                    let bias: PyReadonlyArray1<f32> = bias_obj.extract()?;
+                    let b_slice = bias.as_slice()
+                        .map_err(|e| HypatiaError::new_err(format!("Bias not contiguous: {}", e)))?;
+                    current = native_ops::fused_linear(&current, w_slice, Some(b_slice), batch, in_feat, out_feat, is_relu);
+                }
+                current_feat = out_feat;
+            }
+            "layernorm" => {
+                let gamma: PyReadonlyArray1<f32> = tuple.get_item(1)?.extract()?;
+                let beta: PyReadonlyArray1<f32> = tuple.get_item(2)?.extract()?;
+                let eps: f32 = tuple.get_item(3)?.extract()?;
+
+                let g_slice = gamma.as_slice()
+                    .map_err(|e| HypatiaError::new_err(format!("Gamma not contiguous: {}", e)))?;
+                let b_slice = beta.as_slice()
+                    .map_err(|e| HypatiaError::new_err(format!("Beta not contiguous: {}", e)))?;
+                let feat = gamma.shape()[0];
+
+                current = native_ops::layer_norm(&current, g_slice, b_slice, batch, feat, eps);
+                current_feat = feat;
+            }
+            "attention" => {
+                let wq: PyReadonlyArray2<f32> = tuple.get_item(1)?.extract()?;
+                let bq_obj = tuple.get_item(2)?;
+                let wk: PyReadonlyArray2<f32> = tuple.get_item(3)?.extract()?;
+                let bk_obj = tuple.get_item(4)?;
+                let wv: PyReadonlyArray2<f32> = tuple.get_item(5)?.extract()?;
+                let bv_obj = tuple.get_item(6)?;
+                let wo: PyReadonlyArray2<f32> = tuple.get_item(7)?.extract()?;
+                let bo_obj = tuple.get_item(8)?;
+                let n_heads: usize = tuple.get_item(9)?.extract()?;
+
+                let wq_s = wq.as_slice().map_err(|e| HypatiaError::new_err(format!("{}", e)))?;
+                let wk_s = wk.as_slice().map_err(|e| HypatiaError::new_err(format!("{}", e)))?;
+                let wv_s = wv.as_slice().map_err(|e| HypatiaError::new_err(format!("{}", e)))?;
+                let wo_s = wo.as_slice().map_err(|e| HypatiaError::new_err(format!("{}", e)))?;
+
+                let hidden = wq.shape()[0];
+
+                let extract_bias = |obj: Bound<'py, PyAny>| -> PyResult<Option<Vec<f32>>> {
+                    if obj.is_none() {
+                        Ok(None)
+                    } else {
+                        let b: PyReadonlyArray1<f32> = obj.extract()?;
+                        Ok(Some(b.as_slice()
+                            .map_err(|e| HypatiaError::new_err(format!("{}", e)))?.to_vec()))
+                    }
+                };
+
+                let bq_v = extract_bias(bq_obj)?;
+                let bk_v = extract_bias(bk_obj)?;
+                let bv_v = extract_bias(bv_obj)?;
+                let bo_v = extract_bias(bo_obj)?;
+
+                current = native_ops::multi_head_attention(
+                    &current,
+                    wq_s, bq_v.as_deref(), wk_s, bk_v.as_deref(),
+                    wv_s, bv_v.as_deref(), wo_s, bo_v.as_deref(),
+                    batch, hidden, n_heads,
+                );
+                current_feat = hidden;
+            }
+            "residual_start" => {
+                residual_stack.push(current.clone());
+            }
+            "residual_end" => {
+                if let Some(residual) = residual_stack.pop() {
+                    for (c, r) in current.iter_mut().zip(residual.iter()) {
+                        *c += r;
+                    }
+                }
+            }
+            "gelu" => {
+                native_ops::gelu(&mut current);
+            }
+            _ => {
+                return Err(HypatiaError::new_err(format!("Unknown op type: {}", op_type)));
+            }
+        }
+    }
+
+    let result_2d: Vec<Vec<f32>> = current
+        .chunks(current_feat)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+
+    PyArray2::from_vec2_bound(py, &result_2d)
+        .map_err(|e| HypatiaError::new_err(format!("Failed to create transformer output: {}", e)))
 }

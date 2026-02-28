@@ -79,5 +79,8 @@ pub fn _hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::python_bindings::quantize_weights, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::quantized_forward, m)?)?;
 
+    // Transformer forward (LayerNorm + Attention + MLP)
+    m.add_function(wrap_pyfunction!(crate::python_bindings::transformer_forward_py, m)?)?;
+
     Ok(())
 }

@@ -244,7 +244,7 @@ def optimize(
         # Just layer fusion
         fast_model = hypatia.optimize(model, mode='fusion')
     """
-    from .native_model import NativeModel, QuantizedModel, _extract_layers
+    from .native_model import NativeModel, QuantizedModel, TransformerModel, _extract_layers, _find_transformer_blocks
 
     if not inplace:
         import copy
@@ -274,19 +274,38 @@ def optimize(
 
     # Determine mode
     if mode == 'auto':
-        # Try to extract layers for native/quantized path
-        layers = _extract_layers(model)
-        if layers is None:
-            # Can't extract layers, fall back to fusion
-            mode = 'fusion'
-        elif use_int4:
-            mode = 'quantized'
-        elif n_params >= 10_000_000:
-            mode = 'quantized'
+        # First check if this is a transformer model
+        blocks = _find_transformer_blocks(model)
+        if blocks is not None:
+            mode = 'transformer'
         else:
-            mode = 'native'
+            # Try to extract layers for native/quantized path
+            layers = _extract_layers(model)
+            if layers is None:
+                # Can't extract layers, fall back to fusion
+                mode = 'fusion'
+            elif use_int4:
+                mode = 'quantized'
+            elif n_params >= 10_000_000:
+                mode = 'quantized'
+            else:
+                mode = 'native'
 
     # Apply optimization
+    if mode == 'transformer':
+        try:
+            # Auto-detect n_heads from model config
+            n_heads = 12  # default
+            config = getattr(model, 'config', None)
+            if config is not None:
+                n_heads = getattr(config, 'n_head', getattr(config, 'num_attention_heads', 12))
+            result = TransformerModel(model, n_heads=n_heads)
+            print(f"[Hypatia] Transformer: {result}")
+            return result
+        except Exception as e:
+            print(f"[Hypatia] Transformer extraction failed ({e}), trying MLP path")
+            mode = 'quantized' if use_int4 else 'native'
+
     if mode == 'quantized':
         try:
             result = QuantizedModel(model)
