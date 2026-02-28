@@ -453,75 +453,97 @@ pub fn softmax_inplace(input: &mut [f32], rows: usize, cols: usize) {
 // Multi-Head Attention
 // ============================================================================
 
-/// Multi-head attention: output = Concat(head_1, ..., head_h) @ Wo + bo
-/// Each head: softmax(Q_i @ K_i.T / sqrt(d_k)) @ V_i
+/// Multi-head self-attention with causal masking.
 ///
-/// input: [batch, seq_len, hidden_dim] flattened as [batch*seq_len, hidden_dim]
-/// wq, wk, wv: [hidden_dim, hidden_dim]  (Q/K/V projections)
-/// wo: [hidden_dim, hidden_dim]  (output projection)
+/// input: [total_rows, hidden] where total_rows = batch * seq_len
+/// wq, wk, wv: [hidden, hidden]  (Q/K/V projections)
+/// wo: [hidden, hidden]  (output projection)
+/// batch: number of independent sequences
+/// seq_len: tokens per sequence (total_rows / batch)
 ///
-/// For single-token (seq_len=1) this reduces to standard matrix multiplies.
+/// For single-token (seq_len=1) this reduces to identity after V projection.
+/// For multi-token, computes full causal self-attention per batch element.
 pub fn multi_head_attention(
-    input: &[f32],           // [batch, hidden]
+    input: &[f32],           // [batch*seq_len, hidden]
     wq: &[f32], bq: Option<&[f32]>,  // [hidden, hidden]
     wk: &[f32], bk: Option<&[f32]>,
     wv: &[f32], bv: Option<&[f32]>,
     wo: &[f32], bo: Option<&[f32]>,
     batch: usize,
+    seq_len: usize,
     hidden: usize,
     n_heads: usize,
 ) -> Vec<f32> {
     let head_dim = hidden / n_heads;
+    let total_rows = batch * seq_len;
     debug_assert_eq!(hidden % n_heads, 0);
+    debug_assert_eq!(input.len(), total_rows * hidden);
 
-    // Q, K, V projections: [batch, hidden] @ [hidden, hidden].T = [batch, hidden]
-    let q = fused_linear(input, wq, bq, batch, hidden, hidden, false);
-    let k = fused_linear(input, wk, bk, batch, hidden, hidden, false);
-    let v = fused_linear(input, wv, bv, batch, hidden, hidden, false);
+    // Q, K, V projections: [total_rows, hidden] @ [hidden, hidden].T = [total_rows, hidden]
+    let q = fused_linear(input, wq, bq, total_rows, hidden, hidden, false);
+    let k = fused_linear(input, wk, bk, total_rows, hidden, hidden, false);
+    let v = fused_linear(input, wv, bv, total_rows, hidden, hidden, false);
 
-    // Multi-head attention scores + weighted sum
-    // For batch=1, seq_len=1: each head computes a scalar attention (trivial softmax)
-    // For general case: Q[b,h] @ K[b,h].T / sqrt(d_k) -> softmax -> @ V[b,h]
-    //
-    // Since we operate on [batch, hidden] (not [batch, seq_len, hidden]),
-    // this is batch-of-single-token attention (common in LLM inference).
-    // Each token's attention across heads: just a projection + mix.
-    // Self-attention with seq_len=1 is trivial: softmax([q@k/sqrt(d)]) = [1.0], so attn = v.
-    //
-    // For seq_len > 1, we'd need KV cache. For now, support the simple case:
-    // output = concat_heads(V_projected) for single-token, OR full attention for multi-token.
+    let mut attn_output = vec![0.0f32; total_rows * hidden];
+    let scale = 1.0 / (head_dim as f32).sqrt();
 
-    // General multi-head attention (works for any batch, supports future seq_len extension)
-    let mut attn_output = vec![0.0f32; batch * hidden];
+    if seq_len == 1 {
+        // Single-token fast path: softmax([q.k/sqrt(d)]) = [1.0], so attn = v
+        for b in 0..batch {
+            attn_output[b * hidden..(b + 1) * hidden]
+                .copy_from_slice(&v[b * hidden..(b + 1) * hidden]);
+        }
+    } else {
+        // Full causal self-attention for each batch element
+        for b in 0..batch {
+            let b_start = b * seq_len; // start row for this batch in Q/K/V
 
-    for b in 0..batch {
-        for h in 0..n_heads {
-            let q_offset = b * hidden + h * head_dim;
-            let k_offset = b * hidden + h * head_dim;
-            let v_offset = b * hidden + h * head_dim;
+            for h in 0..n_heads {
+                let h_off = h * head_dim;
 
-            // For single-token: score = q.dot(k) / sqrt(head_dim)
-            // softmax of single value = 1.0
-            // So output = v
-            //
-            // But for correctness of the projection chain, this is the right path.
-            // With KV cache or multi-token, this extends naturally.
+                // Compute scores: Q_h @ K_h.T  -> [seq_len, seq_len]
+                let mut scores = vec![0.0f32; seq_len * seq_len];
 
-            let q_head = &q[q_offset..q_offset + head_dim];
-            let v_head = &v[v_offset..v_offset + head_dim];
+                for i in 0..seq_len {
+                    let q_row = &q[(b_start + i) * hidden + h_off..
+                                   (b_start + i) * hidden + h_off + head_dim];
+                    for j in 0..seq_len {
+                        if j > i {
+                            // Causal mask: future tokens get -inf
+                            scores[i * seq_len + j] = f32::NEG_INFINITY;
+                        } else {
+                            let k_row = &k[(b_start + j) * hidden + h_off..
+                                           (b_start + j) * hidden + h_off + head_dim];
+                            let mut dot = 0.0f32;
+                            for d in 0..head_dim {
+                                dot += q_row[d] * k_row[d];
+                            }
+                            scores[i * seq_len + j] = dot * scale;
+                        }
+                    }
+                }
 
-            // Copy v_head to output (single-token attention = identity)
-            let out_offset = b * hidden + h * head_dim;
-            attn_output[out_offset..out_offset + head_dim].copy_from_slice(v_head);
+                // Softmax each row of scores
+                softmax_inplace(&mut scores, seq_len, seq_len);
 
-            // Note: for multi-token attention, replace with:
-            // scores = Q @ K.T / sqrt(d_k), attn = softmax(scores), out = attn @ V
-            let _ = q_head; // suppress unused warning
+                // attn @ V_h: [seq_len, seq_len] @ [seq_len, head_dim] -> [seq_len, head_dim]
+                for i in 0..seq_len {
+                    let out_offset = (b_start + i) * hidden + h_off;
+                    for d in 0..head_dim {
+                        let mut acc = 0.0f32;
+                        for j in 0..seq_len {
+                            acc += scores[i * seq_len + j]
+                                * v[(b_start + j) * hidden + h_off + d];
+                        }
+                        attn_output[out_offset + d] = acc;
+                    }
+                }
+            }
         }
     }
 
-    // Output projection
-    fused_linear(&attn_output, wo, bo, batch, hidden, hidden, false)
+    // Output projection: [total_rows, hidden] @ [hidden, hidden].T + bo
+    fused_linear(&attn_output, wo, bo, total_rows, hidden, hidden, false)
 }
 
 // ============================================================================
@@ -558,12 +580,18 @@ pub enum TransformerOp<'a> {
 
 /// Execute a sequence of transformer operations.
 /// Supports residual connections via ResidualStart/ResidualEnd markers.
+///
+/// input: [total_rows, features] where total_rows = batch * seq_len
+/// batch: number of independent sequences
+/// seq_len: tokens per sequence
 pub fn transformer_forward(
     input: &[f32],
     batch: usize,
+    seq_len: usize,
     features: usize,
     ops: &[TransformerOp],
 ) -> Vec<f32> {
+    let total_rows = batch * seq_len;
     let mut current = input.to_vec();
     let mut current_feat = features;
     let mut residual_stack: Vec<Vec<f32>> = Vec::new();
@@ -572,17 +600,17 @@ pub fn transformer_forward(
         match op {
             TransformerOp::Linear { weight, bias, in_feat, out_feat, activation } => {
                 let is_relu = *activation == "relu";
-                current = fused_linear(&current, weight, *bias, batch, *in_feat, *out_feat, is_relu);
+                current = fused_linear(&current, weight, *bias, total_rows, *in_feat, *out_feat, is_relu);
                 current_feat = *out_feat;
             }
             TransformerOp::LayerNorm { gamma, beta, features, eps } => {
-                current = layer_norm(&current, gamma, beta, batch, *features, *eps);
+                current = layer_norm(&current, gamma, beta, total_rows, *features, *eps);
                 current_feat = *features;
             }
             TransformerOp::Attention { wq, bq, wk, bk, wv, bv, wo, bo, hidden, n_heads } => {
                 current = multi_head_attention(
                     &current, wq, *bq, wk, *bk, wv, *bv, wo, *bo,
-                    batch, *hidden, *n_heads,
+                    batch, seq_len, *hidden, *n_heads,
                 );
                 current_feat = *hidden;
             }

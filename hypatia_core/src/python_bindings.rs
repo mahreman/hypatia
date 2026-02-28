@@ -917,13 +917,16 @@ pub fn quantized_forward<'py>(
 ///   ("residual_end",)
 ///   ("gelu",)
 #[pyfunction]
+#[pyo3(signature = (input, ops_list, seq_len=1))]
 pub fn transformer_forward_py<'py>(
     py: Python<'py>,
     input: PyReadonlyArray2<'py, f32>,
     ops_list: &Bound<'py, PyList>,
+    seq_len: usize,
 ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-    let batch = input.shape()[0];
+    let total_rows = input.shape()[0];
     let features = input.shape()[1];
+    let batch = total_rows / seq_len;
     let input_slice = input
         .as_slice()
         .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
@@ -952,12 +955,12 @@ pub fn transformer_forward_py<'py>(
                 let is_relu = activation == "relu";
 
                 if bias_obj.is_none() {
-                    current = native_ops::fused_linear(&current, w_slice, None, batch, in_feat, out_feat, is_relu);
+                    current = native_ops::fused_linear(&current, w_slice, None, total_rows, in_feat, out_feat, is_relu);
                 } else {
                     let bias: PyReadonlyArray1<f32> = bias_obj.extract()?;
                     let b_slice = bias.as_slice()
                         .map_err(|e| HypatiaError::new_err(format!("Bias not contiguous: {}", e)))?;
-                    current = native_ops::fused_linear(&current, w_slice, Some(b_slice), batch, in_feat, out_feat, is_relu);
+                    current = native_ops::fused_linear(&current, w_slice, Some(b_slice), total_rows, in_feat, out_feat, is_relu);
                 }
                 current_feat = out_feat;
             }
@@ -972,7 +975,7 @@ pub fn transformer_forward_py<'py>(
                     .map_err(|e| HypatiaError::new_err(format!("Beta not contiguous: {}", e)))?;
                 let feat = gamma.shape()[0];
 
-                current = native_ops::layer_norm(&current, g_slice, b_slice, batch, feat, eps);
+                current = native_ops::layer_norm(&current, g_slice, b_slice, total_rows, feat, eps);
                 current_feat = feat;
             }
             "attention" => {
@@ -1012,7 +1015,7 @@ pub fn transformer_forward_py<'py>(
                     &current,
                     wq_s, bq_v.as_deref(), wk_s, bk_v.as_deref(),
                     wv_s, bv_v.as_deref(), wo_s, bo_v.as_deref(),
-                    batch, hidden, n_heads,
+                    batch, seq_len, hidden, n_heads,
                 );
                 current_feat = hidden;
             }

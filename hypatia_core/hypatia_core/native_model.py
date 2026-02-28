@@ -359,9 +359,10 @@ class TransformerModel(nn.Module):
             # [batch, seq_len, hidden] -> flatten to [batch*seq_len, hidden]
             b, s, h = x_np.shape
             x_np = x_np.reshape(b * s, h)
-            out_np = transformer_forward_py(x_np, self._ops)
+            out_np = transformer_forward_py(x_np, self._ops, s)
             return torch.from_numpy(out_np).reshape(b, s, -1)
-        out_np = transformer_forward_py(x_np, self._ops)
+        # 2D input: treat as [batch, hidden] with seq_len=1
+        out_np = transformer_forward_py(x_np, self._ops, 1)
         return torch.from_numpy(out_np)
 
     def __repr__(self):

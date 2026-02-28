@@ -136,7 +136,7 @@ pub fn ga2d_geometric_product_layer(
 }
 
 /// Multivector norm for 2D GA.
-/// Computes ||mv|| = sqrt(|s^2 + e1^2 + e2^2 - e12^2|) for each multivector.
+/// Uses reverse norm: ||x||^2 = <x * ~x>_0 = s^2 + e1^2 + e2^2 + e12^2
 ///
 /// input: [batch, 4] (s, e1, e2, e12)
 /// output: [batch, 4] normalized multivectors (each divided by its norm)
@@ -149,10 +149,8 @@ pub fn ga2d_normalize(input: &[f32], batch: usize) -> Vec<f32> {
         let e2 = input[b * 4 + 2];
         let e12 = input[b * 4 + 3];
 
-        // Reverse norm: ||x||^2 = x * ~x (reversion)
-        // For Cl(2,0): ~x = s + e1 - e12 (reverse the bivector sign)
-        // ||x||^2 = s^2 + e1^2 + e2^2 - e12^2
-        let norm_sq = (s * s + e1 * e1 + e2 * e2 - e12 * e12).abs();
+        // Reverse norm: all components squared (Euclidean norm of coefficients)
+        let norm_sq = s * s + e1 * e1 + e2 * e2 + e12 * e12;
         let norm = if norm_sq > 1e-10 { norm_sq.sqrt() } else { 1.0 };
         let inv_norm = 1.0 / norm;
 
@@ -231,16 +229,21 @@ pub fn ga3d_geometric_product_layer(
 }
 
 /// Multivector norm for 3D GA.
+///
+/// Uses the reverse norm: ||x||^2 = <x * ~x>_0
+/// In Cl(3,0), the reverse flips signs of grade-2 and grade-3 elements.
+/// The scalar part of x * ~x gives:
+///   s^2 + e1^2 + e2^2 + e3^2 + e12^2 + e23^2 + e31^2 + e123^2
+/// (all positive, because grade-k reverse sign (-1)^(k(k-1)/2) cancels with e_I^2 sign)
 pub fn ga3d_normalize(input: &[f32], batch: usize) -> Vec<f32> {
     let mut output = vec![0.0f32; batch * 8];
 
     for b in 0..batch {
         let mv = &input[b * 8..(b + 1) * 8];
 
-        // ||x||^2 = x * ~x, where ~ reverses bivectors and trivectors
-        // ~x = s + e1 + e2 + e3 - e12 - e23 - e31 - e123
-        let norm_sq = (mv[0]*mv[0] + mv[1]*mv[1] + mv[2]*mv[2] + mv[3]*mv[3]
-                      - mv[4]*mv[4] - mv[5]*mv[5] - mv[6]*mv[6] - mv[7]*mv[7]).abs();
+        // Reverse norm: all components squared (Euclidean norm of coefficients)
+        let norm_sq = mv[0]*mv[0] + mv[1]*mv[1] + mv[2]*mv[2] + mv[3]*mv[3]
+                    + mv[4]*mv[4] + mv[5]*mv[5] + mv[6]*mv[6] + mv[7]*mv[7];
         let norm = if norm_sq > 1e-10 { norm_sq.sqrt() } else { 1.0 };
         let inv_norm = 1.0 / norm;
 
