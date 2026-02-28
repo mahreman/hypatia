@@ -499,38 +499,50 @@ pub fn quantized_linear_ref(
                 }
             });
     } else {
-        // Multiple batches: parallelize over batch rows to reduce Rayon overhead.
-        // Each batch row does all output values sequentially with SIMD.
-        output
-            .par_chunks_mut(out_feat)
-            .enumerate()
-            .for_each(|(b, out_row)| {
-                let input_row = &input[b * in_feat..(b + 1) * in_feat];
-                for o in 0..out_feat {
-                    let packed_start = o * packed_cols;
-                    let packed_row = &packed_data[packed_start..packed_start + packed_cols];
-                    let scales_start = o * num_groups_per_row;
-                    let row_scales = &scales[scales_start..scales_start + num_groups_per_row];
-                    let row_zeros = &zeros[scales_start..scales_start + num_groups_per_row];
+        // Multiple batches: parallelize over OUTPUT ROWS (not batch rows).
+        // This gives out_feat parallel tasks (e.g. 11008 for LLaMA-7B),
+        // fully saturating all CPU cores. Each task loads one weight row
+        // (~2KB, fits in L1) and computes dot products against all batch inputs.
+        //
+        // Previous approach (parallelize over batch rows) only gave `batch`
+        // tasks (e.g. 4), leaving most cores idle and re-reading the entire
+        // weight matrix per thread.
+        use rayon::prelude::*;
+        (0..out_feat).into_par_iter().for_each(|o| {
+            let packed_start = o * packed_cols;
+            let packed_row = &packed_data[packed_start..packed_start + packed_cols];
+            let scales_start = o * num_groups_per_row;
+            let row_scales = &scales[scales_start..scales_start + num_groups_per_row];
+            let row_zeros = &zeros[scales_start..scales_start + num_groups_per_row];
 
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        out_row[o] = unsafe {
-                            q4_dot_avx2(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
-                        };
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        out_row[o] = unsafe {
-                            q4_dot_neon(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
-                        };
-                    }
-                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                    {
-                        out_row[o] = q4_dot_scalar(input_row, packed_row, row_scales, row_zeros, group_size, in_feat);
-                    }
+            for b in 0..batch {
+                let input_row = &input[b * in_feat..(b + 1) * in_feat];
+                let val;
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    val = unsafe {
+                        q4_dot_avx2(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
+                    };
                 }
-            });
+                #[cfg(target_arch = "aarch64")]
+                {
+                    val = unsafe {
+                        q4_dot_neon(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
+                    };
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                {
+                    val = q4_dot_scalar(input_row, packed_row, row_scales, row_zeros, group_size, in_feat);
+                }
+
+                // Safety: each (b, o) pair maps to a unique output[b * out_feat + o]
+                unsafe {
+                    let ptr = output.as_ptr() as *mut f32;
+                    *ptr.add(b * out_feat + o) = val;
+                }
+            }
+        });
     }
 
     // Fused bias + activation

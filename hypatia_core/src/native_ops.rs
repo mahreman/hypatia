@@ -494,31 +494,45 @@ pub fn multi_head_attention(
                 .copy_from_slice(&v[b * hidden..(b + 1) * hidden]);
         }
     } else {
-        // Full causal self-attention for each batch element
+        // Full causal self-attention using GEMM for Q@K^T and attn@V.
+        //
+        // The Q/K/V are stored as [total_rows, hidden] with heads interleaved.
+        // We extract contiguous per-head buffers for GEMM efficiency.
+        let mut q_head = vec![0.0f32; seq_len * head_dim];
+        let mut k_head = vec![0.0f32; seq_len * head_dim];
+        let mut v_head = vec![0.0f32; seq_len * head_dim];
+        let mut scores = vec![0.0f32; seq_len * seq_len];
+        let mut attn_v = vec![0.0f32; seq_len * head_dim];
+
         for b in 0..batch {
-            let b_start = b * seq_len; // start row for this batch in Q/K/V
+            let b_start = b * seq_len;
 
             for h in 0..n_heads {
                 let h_off = h * head_dim;
 
-                // Compute scores: Q_h @ K_h.T  -> [seq_len, seq_len]
-                let mut scores = vec![0.0f32; seq_len * seq_len];
-
+                // Extract contiguous Q_h, K_h, V_h: [seq_len, head_dim]
                 for i in 0..seq_len {
-                    let q_row = &q[(b_start + i) * hidden + h_off..
-                                   (b_start + i) * hidden + h_off + head_dim];
+                    let src_off = (b_start + i) * hidden + h_off;
+                    let dst_off = i * head_dim;
+                    q_head[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&q[src_off..src_off + head_dim]);
+                    k_head[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&k[src_off..src_off + head_dim]);
+                    v_head[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&v[src_off..src_off + head_dim]);
+                }
+
+                // scores = Q_h @ K_h^T * scale -> [seq_len, seq_len]
+                // Using GEMM: C = A @ B^T where A=[seq,head_dim], B=[seq,head_dim]
+                gemm_nt(&q_head, &k_head, &mut scores, seq_len, head_dim, seq_len);
+
+                // Apply scale and causal mask
+                for i in 0..seq_len {
                     for j in 0..seq_len {
                         if j > i {
-                            // Causal mask: future tokens get -inf
                             scores[i * seq_len + j] = f32::NEG_INFINITY;
                         } else {
-                            let k_row = &k[(b_start + j) * hidden + h_off..
-                                           (b_start + j) * hidden + h_off + head_dim];
-                            let mut dot = 0.0f32;
-                            for d in 0..head_dim {
-                                dot += q_row[d] * k_row[d];
-                            }
-                            scores[i * seq_len + j] = dot * scale;
+                            scores[i * seq_len + j] *= scale;
                         }
                     }
                 }
@@ -526,17 +540,16 @@ pub fn multi_head_attention(
                 // Softmax each row of scores
                 softmax_inplace(&mut scores, seq_len, seq_len);
 
-                // attn @ V_h: [seq_len, seq_len] @ [seq_len, head_dim] -> [seq_len, head_dim]
+                // attn_v = scores @ V_h -> [seq_len, head_dim]
+                // GEMM: C = A @ B where A=[seq,seq], B=[seq,head_dim]
+                gemm_nn(&scores, &v_head, &mut attn_v, seq_len, seq_len, head_dim);
+
+                // Write back to interleaved output
                 for i in 0..seq_len {
-                    let out_offset = (b_start + i) * hidden + h_off;
-                    for d in 0..head_dim {
-                        let mut acc = 0.0f32;
-                        for j in 0..seq_len {
-                            acc += scores[i * seq_len + j]
-                                * v[(b_start + j) * hidden + h_off + d];
-                        }
-                        attn_output[out_offset + d] = acc;
-                    }
+                    let src_off = i * head_dim;
+                    let dst_off = (b_start + i) * hidden + h_off;
+                    attn_output[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&attn_v[src_off..src_off + head_dim]);
                 }
             }
         }

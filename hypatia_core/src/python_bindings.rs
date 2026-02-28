@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyAny, PyList, PyTuple}; // PyAny eklendi
 use pyo3::Bound;
-use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray1, PyReadwriteArray2, PyArray2, PyUntypedArrayMethods, PyArrayMethods};
+use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray1, PyReadwriteArray2, PyArray1, PyArray2, PyUntypedArrayMethods, PyArrayMethods};
 
 use crate::multivector2d::MultiVector2D;
 use crate::multivector3d::MultiVector3D;
@@ -642,14 +642,10 @@ pub fn native_forward<'py>(
         current_feat = out_feat;
     }
 
-    // Convert to numpy 2D array
-    let result_2d: Vec<Vec<f32>> = current
-        .chunks(current_feat)
-        .map(|chunk| chunk.to_vec())
-        .collect();
-
-    PyArray2::from_vec2_bound(py, &result_2d)
-        .map_err(|e| HypatiaError::new_err(format!("Failed to create output array: {}", e)))
+    // Zero-copy: transfer Vec ownership directly to numpy, then reshape
+    let flat = PyArray1::from_vec_bound(py, current);
+    flat.reshape([batch, current_feat])
+        .map_err(|e| HypatiaError::new_err(format!("Failed to reshape output: {}", e)))
 }
 
 /// Native training step: forward -> MSE loss -> backward -> SGD update.
@@ -898,13 +894,10 @@ pub fn quantized_forward<'py>(
         current_feat = rows;
     }
 
-    let result_2d: Vec<Vec<f32>> = current
-        .chunks(current_feat)
-        .map(|chunk| chunk.to_vec())
-        .collect();
-
-    PyArray2::from_vec2_bound(py, &result_2d)
-        .map_err(|e| HypatiaError::new_err(format!("Failed to create quantized output: {}", e)))
+    // Zero-copy: transfer Vec ownership directly to numpy
+    let flat = PyArray1::from_vec_bound(py, current);
+    flat.reshape([batch, current_feat])
+        .map_err(|e| HypatiaError::new_err(format!("Failed to reshape quantized output: {}", e)))
 }
 
 /// Execute a transformer forward pass with mixed operation types.
@@ -1038,13 +1031,10 @@ pub fn transformer_forward_py<'py>(
         }
     }
 
-    let result_2d: Vec<Vec<f32>> = current
-        .chunks(current_feat)
-        .map(|chunk| chunk.to_vec())
-        .collect();
-
-    PyArray2::from_vec2_bound(py, &result_2d)
-        .map_err(|e| HypatiaError::new_err(format!("Failed to create transformer output: {}", e)))
+    // Zero-copy: transfer Vec ownership directly to numpy
+    let flat = PyArray1::from_vec_bound(py, current);
+    flat.reshape([total_rows, current_feat])
+        .map_err(|e| HypatiaError::new_err(format!("Failed to reshape transformer output: {}", e)))
 }
 
 /// Quantization-Aware Training step.
@@ -1160,8 +1150,8 @@ pub fn ga_batch_rotate_2d<'py>(
 
     let result = crate::geometric_ops::batch_rotor_2d(data, batch, theta);
 
-    let result_2d: Vec<Vec<f32>> = result.chunks(2).map(|c| c.to_vec()).collect();
-    PyArray2::from_vec2_bound(py, &result_2d)
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([batch, 2])
         .map_err(|e| HypatiaError::new_err(format!("{}", e)))
 }
 
@@ -1190,8 +1180,8 @@ pub fn ga_batch_rotate_3d<'py>(
 
     let result = crate::geometric_ops::batch_rotor_3d(data, batch, &axis_arr, theta);
 
-    let result_2d: Vec<Vec<f32>> = result.chunks(3).map(|c| c.to_vec()).collect();
-    PyArray2::from_vec2_bound(py, &result_2d)
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([batch, 3])
         .map_err(|e| HypatiaError::new_err(format!("{}", e)))
 }
 
@@ -1222,8 +1212,8 @@ pub fn ga2d_product_layer<'py>(
     let result = crate::geometric_ops::ga2d_geometric_product_layer(in_data, w_data, batch, out_features);
 
     let out_cols = out_features * 4;
-    let result_2d: Vec<Vec<f32>> = result.chunks(out_cols).map(|c| c.to_vec()).collect();
-    PyArray2::from_vec2_bound(py, &result_2d)
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([batch, out_cols])
         .map_err(|e| HypatiaError::new_err(format!("{}", e)))
 }
 
@@ -1254,8 +1244,8 @@ pub fn ga3d_product_layer<'py>(
     let result = crate::geometric_ops::ga3d_geometric_product_layer(in_data, w_data, batch, out_features);
 
     let out_cols = out_features * 8;
-    let result_2d: Vec<Vec<f32>> = result.chunks(out_cols).map(|c| c.to_vec()).collect();
-    PyArray2::from_vec2_bound(py, &result_2d)
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([batch, out_cols])
         .map_err(|e| HypatiaError::new_err(format!("{}", e)))
 }
 
@@ -1275,8 +1265,8 @@ pub fn ga2d_normalize<'py>(
 
     let result = crate::geometric_ops::ga2d_normalize(data, batch);
 
-    let result_2d: Vec<Vec<f32>> = result.chunks(4).map(|c| c.to_vec()).collect();
-    PyArray2::from_vec2_bound(py, &result_2d)
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([batch, 4])
         .map_err(|e| HypatiaError::new_err(format!("{}", e)))
 }
 
@@ -1296,8 +1286,8 @@ pub fn ga3d_normalize<'py>(
 
     let result = crate::geometric_ops::ga3d_normalize(data, batch);
 
-    let result_2d: Vec<Vec<f32>> = result.chunks(8).map(|c| c.to_vec()).collect();
-    PyArray2::from_vec2_bound(py, &result_2d)
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([batch, 8])
         .map_err(|e| HypatiaError::new_err(format!("{}", e)))
 }
 
