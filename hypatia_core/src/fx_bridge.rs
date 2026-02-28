@@ -740,11 +740,13 @@ fn handle_call_function(
     else if cleaned_target.contains("mul") { "mul" }
     else if cleaned_target.contains("sub") { "sub" }
     else if cleaned_target.contains("div") { "div" }
-    else if cleaned_target.contains("mean") { "mean" } 
-    else if cleaned_target.contains("relu") { "relu" } // `.contains` geri geldi
-    else if cleaned_target.contains("sigmoid") { "sigmoid" } // `.contains` geri geldi
-    else if cleaned_target.contains("tanh") { "tanh" } // `.contains` geri geldi
-    else if cleaned_target.contains("softmax") { "softmax" } // `.contains` geri geldi
+    else if cleaned_target.contains("mean") { "mean" }
+    else if cleaned_target.contains("gelu") { "gelu" }
+    else if cleaned_target.contains("silu") { "silu" }
+    else if cleaned_target.contains("relu") { "relu" }
+    else if cleaned_target.contains("sigmoid") { "sigmoid" }
+    else if cleaned_target.contains("tanh") { "tanh" }
+    else if cleaned_target.contains("softmax") { "softmax" }
     // --- YENİ EKLENEN OPERATÖRLER (Adım 0.1) ---
     else if cleaned_target.contains("linear") { "linear" } // `.contains` geri geldi
     else if cleaned_target.contains("conv2d") { "conv2d" } // `.contains` geri geldi
@@ -768,7 +770,7 @@ fn handle_call_function(
                 Err(HypatiaError::new_err(format!("{} node needs 2 inputs", func_name))) 
             }
         },
-        "relu" | "sigmoid" | "tanh" | "softmax" | "mean" => {
+        "gelu" | "silu" | "relu" | "sigmoid" | "tanh" | "softmax" | "mean" => {
             if let Some(input) = inputs.first().and_then(|n| node_exprs.get(n)) {
                 Ok(format!("({} {})", func_name, input))
             } else { 
@@ -1615,13 +1617,12 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let torch_module = PyModule::import_bound(self.py, "torch")?;
         let nn_functional = PyModule::import_bound(self.py, "torch.nn.functional")?;
 
-        let target_fn = if target == "linear" {
-            nn_functional.getattr("linear")?
-        } else if target == "relu" {
-            // 🟢 ADIM 4: F.relu'yu (call_function) desteklemek için eklendi
-            nn_functional.getattr("relu")?
-        } else {
-             torch_module.getattr(target)?
+        // Most activation and NN functions live in torch.nn.functional
+        let target_fn = match target {
+            "linear" | "relu" | "gelu" | "silu" | "sigmoid" | "tanh" | "softmax" |
+            "conv2d" | "batch_norm" | "layer_norm" | "dropout" =>
+                nn_functional.getattr(target)?,
+            _ => torch_module.getattr(target)?,
         };
 
         if target == "flatten" {
