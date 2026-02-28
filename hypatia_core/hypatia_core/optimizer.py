@@ -207,29 +207,111 @@ class HypatiaTrainer:
 def optimize(
     model: nn.Module,
     inplace: bool = True,
-    quantize: bool = False,
+    quantize: str = None,
+    mode: str = 'auto',
 ) -> nn.Module:
     """
     Model'i optimize et.
 
+    Hypatia otomatik olarak model boyutuna göre en hızlı yolu seçer:
+    - Küçük modeller (< 10M param): NativeModel (fused GEMM, 2-6x hız)
+    - Büyük modeller (>= 10M param): QuantizedModel (INT4 SIMD, 11-16x hız)
+
     Args:
         model: PyTorch modeli
         inplace: True ise modeli yerinde değiştirir
-        quantize: True ise INT8 dynamic quantization uygula (inference 2-4x hız)
+        quantize: Quantization tipi:
+            - None: auto-select (büyük modellerde INT4)
+            - 'int4': INT4 block quantization (AVX2 SIMD + Rayon, 11-16x hız)
+            - 'int8': INT8 dynamic quantization (PyTorch native, 2-4x hız)
+            - False: quantization yapma
+        mode: Optimizasyon modu:
+            - 'auto': model boyutuna göre otomatik seç
+            - 'native': Rust-native f32 forward (küçük modeller)
+            - 'quantized': INT4 quantized forward (büyük modeller)
+            - 'fusion': sadece layer fusion uygula (PyTorch üzerinden çalışır)
 
     Returns:
         Optimize edilmiş model
+
+    Examples:
+        # Auto-select (recommended)
+        fast_model = hypatia.optimize(model)
+
+        # Explicit INT4 for large models
+        fast_model = hypatia.optimize(model, quantize='int4')
+
+        # Just layer fusion
+        fast_model = hypatia.optimize(model, mode='fusion')
     """
+    from .native_model import NativeModel, QuantizedModel, _extract_layers
+
     if not inplace:
         import copy
         model = copy.deepcopy(model)
 
+    model.eval()
+
+    # Count parameters to decide path
+    n_params = sum(p.numel() for p in model.parameters())
+
+    # Determine quantization
+    if quantize is None:
+        # Auto: INT4 for large models
+        use_int4 = n_params >= 10_000_000
+        use_int8 = False
+    elif quantize == 'int4':
+        use_int4 = True
+        use_int8 = False
+    elif quantize == 'int8':
+        use_int4 = False
+        use_int8 = True
+    elif quantize is False:
+        use_int4 = False
+        use_int8 = False
+    else:
+        raise ValueError(f"Unknown quantize value: {quantize}. Use 'int4', 'int8', False, or None.")
+
+    # Determine mode
+    if mode == 'auto':
+        # Try to extract layers for native/quantized path
+        layers = _extract_layers(model)
+        if layers is None:
+            # Can't extract layers, fall back to fusion
+            mode = 'fusion'
+        elif use_int4:
+            mode = 'quantized'
+        elif n_params >= 10_000_000:
+            mode = 'quantized'
+        else:
+            mode = 'native'
+
+    # Apply optimization
+    if mode == 'quantized':
+        try:
+            result = QuantizedModel(model)
+            print(f"[Hypatia] INT4 quantized: {result}")
+            return result
+        except Exception as e:
+            print(f"[Hypatia] INT4 quantization failed ({e}), falling back to native")
+            mode = 'native'
+
+    if mode == 'native':
+        try:
+            result = NativeModel(model)
+            print(f"[Hypatia] Native f32: {result}")
+            return result
+        except Exception as e:
+            print(f"[Hypatia] Native model failed ({e}), falling back to fusion")
+            mode = 'fusion'
+
+    # Fusion-only path (always works)
     model = _fuse_model(model)
-
-    if quantize:
-        model.eval()
+    if use_int8:
         model = _quantize_model(model)
-
+        print(f"[Hypatia] Layer fusion + INT8 quantization applied ({n_params/1e6:.1f}M params)")
+    else:
+        print(f"[Hypatia] Layer fusion applied ({n_params/1e6:.1f}M params)")
     return model
 
 

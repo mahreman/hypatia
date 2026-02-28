@@ -33,7 +33,7 @@ from .fused_modules import HypatiaFusedLinearReLU, create_fused_linear_relu_from
 from .optimizer import optimize, count_optimizations, HypatiaTrainer
 
 # Import Rust-native forward pass (bypasses PyTorch dispatch)
-from .native_model import NativeModel, NativeTrainer
+from .native_model import NativeModel, NativeTrainer, QuantizedModel
 
 # Feature flag for verbose FX debugging
 DEBUG_FX = os.environ.get("HYPATIA_DEBUG_FX", "0") == "1"
@@ -153,6 +153,7 @@ __all__ = [
     # Rust-native forward pass
     "NativeModel",
     "NativeTrainer",
+    "QuantizedModel",
     "native_forward",
     "native_train_step",
 ]
