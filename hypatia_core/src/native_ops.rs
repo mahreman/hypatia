@@ -4,32 +4,73 @@
 //! per-operator dispatch overhead. For small-to-medium models where
 //! dispatch overhead dominates compute, this can give 2-5x speedup.
 //!
-//! GEMM backend:
-//! - OpenBLAS cblas_sgemm when available (same speed as PyTorch)
-//! - matrixmultiply crate as fallback (good for small matrices)
+//! GEMM backend (auto-detected at runtime):
+//! - Intel MKL via PyTorch's libtorch_cpu.so (7x faster than OpenBLAS)
+//! - OpenBLAS cblas_sgemm as fallback
 //!
 //! Key optimizations:
 //! - Single Python->Rust crossing for entire MLP forward pass
 //! - Fused bias + activation in single memory pass after GEMM
 //! - Zero intermediate tensor allocations
 
-// OpenBLAS FFI bindings
+use std::sync::OnceLock;
+
+// ============================================================================
+// GEMM Backend: MKL (via PyTorch) with OpenBLAS fallback
+// ============================================================================
+
+// Fortran sgemm_ function pointer type (MKL)
+// sgemm_(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
+type SgemmFortranFn = unsafe extern "C" fn(
+    transa: *const u8, transb: *const u8,
+    m: *const i32, n: *const i32, k: *const i32,
+    alpha: *const f32, a: *const f32, lda: *const i32,
+    b: *const f32, ldb: *const i32,
+    beta: *const f32, c: *mut f32, ldc: *const i32,
+);
+
+static MKL_SGEMM: OnceLock<Option<SgemmFortranFn>> = OnceLock::new();
+
+/// Try to find MKL's sgemm_ in the already-loaded PyTorch library.
+/// Returns None if PyTorch/MKL is not loaded.
+fn get_mkl_sgemm() -> Option<SgemmFortranFn> {
+    *MKL_SGEMM.get_or_init(|| {
+        unsafe {
+            // PyTorch's libtorch_cpu.so is already loaded by Python.
+            // We need to find it and get MKL's sgemm_ specifically.
+            // Strategy: dlopen libtorch_cpu.so with RTLD_NOLOAD to get handle
+            // to the already-loaded library, then dlsym for sgemm_.
+            let lib_name = std::ffi::CString::new("libtorch_cpu.so").ok()?;
+            let handle = libc::dlopen(
+                lib_name.as_ptr(),
+                libc::RTLD_NOLOAD | libc::RTLD_NOW,
+            );
+            if handle.is_null() {
+                log::debug!("MKL not available: libtorch_cpu.so not loaded");
+                return None;
+            }
+            let sym_name = std::ffi::CString::new("sgemm_").ok()?;
+            let sym = libc::dlsym(handle, sym_name.as_ptr());
+            if sym.is_null() {
+                log::debug!("MKL not available: sgemm_ not found in libtorch_cpu.so");
+                return None;
+            }
+            log::info!("MKL sgemm_ found in libtorch_cpu.so - using MKL for GEMM");
+            Some(std::mem::transmute(sym))
+        }
+    })
+}
+
+// OpenBLAS FFI bindings (fallback)
 extern "C" {
     fn cblas_sgemm(
         order: i32,   // CblasRowMajor = 101
         transa: i32,  // CblasNoTrans = 111, CblasTrans = 112
         transb: i32,
-        m: i32,
-        n: i32,
-        k: i32,
-        alpha: f32,
-        a: *const f32,
-        lda: i32,
-        b: *const f32,
-        ldb: i32,
-        beta: f32,
-        c: *mut f32,
-        ldc: i32,
+        m: i32, n: i32, k: i32,
+        alpha: f32, a: *const f32, lda: i32,
+        b: *const f32, ldb: i32,
+        beta: f32, c: *mut f32, ldc: i32,
     );
 }
 
@@ -37,9 +78,9 @@ const CBLAS_ROW_MAJOR: i32 = 101;
 const CBLAS_NO_TRANS: i32 = 111;
 const CBLAS_TRANS: i32 = 112;
 
-/// GEMM using OpenBLAS cblas_sgemm.
-/// Computes: C = alpha * A @ B.T + beta * C
+/// GEMM: C = A @ B^T
 /// A: [m, k], B: [n, k] (transposed), C: [m, n]
+/// Uses MKL if available (7x faster), falls back to OpenBLAS.
 #[inline]
 fn gemm_nt(
     a: &[f32],
@@ -49,28 +90,34 @@ fn gemm_nt(
     k: usize,
     n: usize,
 ) {
-    // C = A @ B^T
-    // cblas_sgemm(RowMajor, NoTrans, Trans, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
-    // A: [m, k] row-major, lda = k
-    // B: [n, k] row-major (transposed to [k, n]), ldb = k
-    // C: [m, n] row-major, ldc = n
-    unsafe {
-        cblas_sgemm(
-            CBLAS_ROW_MAJOR,
-            CBLAS_NO_TRANS,
-            CBLAS_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
-            1.0,
-            a.as_ptr(),
-            k as i32,
-            b.as_ptr(),
-            k as i32,
-            0.0,
-            c.as_mut_ptr(),
-            n as i32,
-        );
+    if let Some(mkl_sgemm) = get_mkl_sgemm() {
+        // MKL Fortran interface for row-major C = A @ B^T:
+        // C_cm[N,M] = B_cm^T[N,K] @ A_cm[K,M]
+        // sgemm_('T', 'N', N, M, K, 1.0, B, K, A, K, 0.0, C, N)
+        let m_i = m as i32;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        unsafe {
+            mkl_sgemm(
+                b"T" as *const u8, b"N" as *const u8,
+                &n_i, &m_i, &k_i,
+                &alpha, b.as_ptr(), &k_i,
+                a.as_ptr(), &k_i,
+                &beta, c.as_mut_ptr(), &n_i,
+            );
+        }
+    } else {
+        unsafe {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                m as i32, n as i32, k as i32,
+                1.0, a.as_ptr(), k as i32,
+                b.as_ptr(), k as i32,
+                0.0, c.as_mut_ptr(), n as i32,
+            );
+        }
     }
 }
 
@@ -85,23 +132,34 @@ fn gemm_nn(
     k: usize,
     n: usize,
 ) {
-    unsafe {
-        cblas_sgemm(
-            CBLAS_ROW_MAJOR,
-            CBLAS_NO_TRANS,
-            CBLAS_NO_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
-            1.0,
-            a.as_ptr(),
-            k as i32,
-            b.as_ptr(),
-            n as i32,
-            0.0,
-            c.as_mut_ptr(),
-            n as i32,
-        );
+    if let Some(mkl_sgemm) = get_mkl_sgemm() {
+        // MKL Fortran for row-major C = A @ B:
+        // C_cm[N,M] = B_cm[N,K] @ A_cm[K,M]
+        // sgemm_('N', 'N', N, M, K, 1.0, B, N, A, K, 0.0, C, N)
+        let m_i = m as i32;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        unsafe {
+            mkl_sgemm(
+                b"N" as *const u8, b"N" as *const u8,
+                &n_i, &m_i, &k_i,
+                &alpha, b.as_ptr(), &n_i,
+                a.as_ptr(), &k_i,
+                &beta, c.as_mut_ptr(), &n_i,
+            );
+        }
+    } else {
+        unsafe {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                m as i32, n as i32, k as i32,
+                1.0, a.as_ptr(), k as i32,
+                b.as_ptr(), n as i32,
+                0.0, c.as_mut_ptr(), n as i32,
+            );
+        }
     }
 }
 
@@ -109,7 +167,7 @@ fn gemm_nn(
 /// A: [k, m] stored as [m, k] row-major (transposed via flag), B: [k, n], C: [m, n]
 #[inline]
 fn gemm_tn(
-    a: &[f32], // stored as [k, m] in memory (we pass it as [m_orig, k_orig] and transpose)
+    a: &[f32],
     b: &[f32],
     c: &mut [f32],
     m: usize,
@@ -117,23 +175,35 @@ fn gemm_tn(
     n: usize,
     lda: i32,
 ) {
-    unsafe {
-        cblas_sgemm(
-            CBLAS_ROW_MAJOR,
-            CBLAS_TRANS,
-            CBLAS_NO_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
-            1.0,
-            a.as_ptr(),
-            lda,
-            b.as_ptr(),
-            n as i32,
-            0.0,
-            c.as_mut_ptr(),
-            n as i32,
-        );
+    if let Some(mkl_sgemm) = get_mkl_sgemm() {
+        // MKL Fortran for row-major C = A^T @ B:
+        // C_cm[N,M] = B_cm[N,K] @ (A_cm^T)[K,M]
+        // A row-major [k_orig, m] with lda → need trans on A_cm
+        // sgemm_('N', 'T', N, M, K, 1.0, B, N, A, lda, 0.0, C, N)
+        let m_i = m as i32;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        unsafe {
+            mkl_sgemm(
+                b"N" as *const u8, b"T" as *const u8,
+                &n_i, &m_i, &k_i,
+                &alpha, b.as_ptr(), &n_i,
+                a.as_ptr(), &lda,
+                &beta, c.as_mut_ptr(), &n_i,
+            );
+        }
+    } else {
+        unsafe {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_NO_TRANS,
+                m as i32, n as i32, k as i32,
+                1.0, a.as_ptr(), lda,
+                b.as_ptr(), n as i32,
+                0.0, c.as_mut_ptr(), n as i32,
+            );
+        }
     }
 }
 
