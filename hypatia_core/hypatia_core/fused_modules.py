@@ -1,9 +1,12 @@
 # hypatia_core/fused_modules.py
+#
+# GPU-aware fused modules with JIT-compiled CUDA kernels + CPU fallback.
+# Supports: FusedLinearReLU, FusedGeluMLP, FusedAttention, FusedLayerNorm
 
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, Dict
 
 import torch
 import torch.nn as nn
@@ -15,47 +18,71 @@ except ImportError:
     _load_ext = None
 
 # -----------------------------------------------------------------------------
-# C++/CUDA extension yükleme (opsiyonel)
+# C++/CUDA extension loading (lazy, with CPU fallback)
 # -----------------------------------------------------------------------------
 
+_CSRC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "csrc")
+
+# Extension cache: name -> (module_or_None, loaded_flag)
+_EXT_CACHE: Dict[str, object] = {}
+_EXT_LOADED: Dict[str, bool] = {}
+
+# Legacy aliases
 _FUSED_LINEAR_RELU_EXT = None
 _HAS_CUDA_KERNEL = False
 
-def _load_fused_linear_relu_ext() -> None:
-    global _FUSED_LINEAR_RELU_EXT, _HAS_CUDA_KERNEL
 
-    if _FUSED_LINEAR_RELU_EXT is not None:
-        return
+def _load_cuda_ext(name: str, cpp_file: str, cu_file: str) -> Optional[object]:
+    """Load a CUDA extension by name. Returns module or None on failure."""
+    if name in _EXT_CACHE:
+        return _EXT_CACHE[name]
 
     if _load_ext is None:
-        _FUSED_LINEAR_RELU_EXT = None
-        _HAS_CUDA_KERNEL = False
-        return
+        _EXT_CACHE[name] = None
+        _EXT_LOADED[name] = False
+        return None
 
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    # Go up one level to hypatia_core root, then into csrc
-    parent_dir = os.path.dirname(this_dir)
-    src_cpp = os.path.join(parent_dir, "csrc", "fused_linear_relu.cpp")
-    src_cu  = os.path.join(parent_dir, "csrc", "fused_linear_relu_kernel.cu")
+    src_cpp = os.path.join(_CSRC_DIR, cpp_file)
+    src_cu = os.path.join(_CSRC_DIR, cu_file)
 
     if not (os.path.exists(src_cpp) and os.path.exists(src_cu)):
-        _FUSED_LINEAR_RELU_EXT = None
-        _HAS_CUDA_KERNEL = False
-        return
+        _EXT_CACHE[name] = None
+        _EXT_LOADED[name] = False
+        return None
 
     try:
-        _FUSED_LINEAR_RELU_EXT = _load_ext(
-            name="hypatia_fused_linear_relu",
+        ext = _load_ext(
+            name=f"hypatia_{name}",
             sources=[src_cpp, src_cu],
-            verbose=True,  # Show compilation output for debugging
+            verbose=False,
         )
-        _HAS_CUDA_KERNEL = True
-        print(f"[Hypatia] ✅ CUDA extension loaded successfully")
+        _EXT_CACHE[name] = ext
+        _EXT_LOADED[name] = True
+        print(f"[Hypatia] CUDA extension '{name}' loaded successfully")
+        return ext
     except Exception as exc:
-        # Build sırasında hata olursa, sessizce fallback'e geç
-        print(f"[Hypatia] ⚠️  Warning: failed to build fused_linear_relu CUDA extension: {exc}")
-        _FUSED_LINEAR_RELU_EXT = None
-        _HAS_CUDA_KERNEL = False
+        print(f"[Hypatia] Warning: failed to build {name} CUDA extension: {exc}")
+        _EXT_CACHE[name] = None
+        _EXT_LOADED[name] = False
+        return None
+
+
+def _get_ext(name: str) -> Optional[object]:
+    """Get a cached extension, or None if not available."""
+    return _EXT_CACHE.get(name)
+
+
+def _has_ext(name: str) -> bool:
+    """Check if a CUDA extension is available."""
+    return _EXT_LOADED.get(name, False)
+
+
+def _load_fused_linear_relu_ext() -> None:
+    """Legacy loader for backward compatibility."""
+    global _FUSED_LINEAR_RELU_EXT, _HAS_CUDA_KERNEL
+    ext = _load_cuda_ext("fused_linear_relu", "fused_linear_relu.cpp", "fused_linear_relu_kernel.cu")
+    _FUSED_LINEAR_RELU_EXT = ext
+    _HAS_CUDA_KERNEL = ext is not None
 
 
 # -----------------------------------------------------------------------------
@@ -289,9 +316,288 @@ def create_fused_mlp_from_tensors(
     return FusedMLP(weight1, bias1, weight2, bias2, device=device, dtype=dtype)
 
 
-__all__ = ["FusedLinearReLU", "HypatiaFusedLinearReLU", "FusedLinearReLUFunction",
-           "create_fused_linear_relu_from_tensors", "FusedMLP", "create_fused_mlp_from_tensors"]
+# =============================================================================
+# FusedGeluMLP: GPU-aware Linear -> GELU -> Linear fusion
+# =============================================================================
 
-# ✅ Eager load CUDA extension when module is imported
-# This ensures JIT compilation happens immediately, not lazily
+class FusedGeluMLPFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, w1, b1, w2, b2):
+        ext = _get_ext("fused_gelu_mlp")
+        use_cuda = (
+            ext is not None
+            and input.is_cuda
+            and w1.is_cuda
+            and w2.is_cuda
+        )
+
+        if use_cuda:
+            y = ext.forward(input, w1, b1, w2, b2)
+        else:
+            # CPU fallback
+            h = F.linear(input, w1, b1)
+            h = F.gelu(h)
+            y = F.linear(h, w2, b2)
+
+        ctx.save_for_backward(input, w1, b1 if b1 is not None else torch.tensor([]),
+                              w2, b2 if b2 is not None else torch.tensor([]))
+        ctx.had_b1 = b1 is not None
+        ctx.had_b2 = b2 is not None
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, w1, b1, w2, b2 = ctx.saved_tensors
+        if not ctx.had_b1:
+            b1 = None
+        if not ctx.had_b2:
+            b2 = None
+
+        # Forward recomputation for GELU gradient
+        h = F.linear(input, w1, b1)
+        # GELU derivative: gelu'(x) ~= 0.5 * (1 + tanh(s)) + 0.5 * x * (1 - tanh(s)^2) * s'
+        # Use PyTorch autograd for correctness
+        h.requires_grad_(True)
+        h_gelu = F.gelu(h)
+        output = F.linear(h_gelu, w2, b2)
+
+        output.backward(grad_output)
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            grad_input = torch.autograd.grad(output, input, grad_output, retain_graph=True)[0] if input.requires_grad else None
+
+        # Simplified: return None for weight/bias gradients (inference-focused)
+        return grad_input, None, None, None, None
+
+
+class FusedGeluMLP(nn.Module):
+    """GPU-aware fused Linear -> GELU -> Linear.
+
+    Uses custom CUDA kernel on GPU (cuBLAS GEMM + in-place GELU),
+    falls back to PyTorch ops on CPU.
+    """
+
+    def __init__(self, in_features: int, hidden_features: int, out_features: int,
+                 bias: bool = True, device=None, dtype=None):
+        super().__init__()
+        factory = {'device': device, 'dtype': dtype}
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias, **factory)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias, **factory)
+        # Lazy-load extension
+        _load_cuda_ext("fused_gelu_mlp", "fused_gelu_mlp.cpp", "fused_gelu_mlp_kernel.cu")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda and _has_ext("fused_gelu_mlp"):
+            return FusedGeluMLPFunction.apply(
+                x, self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias)
+        # CPU fallback
+        h = F.gelu(self.fc1(x))
+        return self.fc2(h)
+
+
+# =============================================================================
+# FusedAttention: GPU-aware multi-head causal self-attention
+# =============================================================================
+
+class FusedAttention(nn.Module):
+    """GPU-aware fused multi-head causal self-attention.
+
+    Fuses Q/K/V projection -> reshape -> scaled dot-product -> causal mask
+    -> softmax -> V aggregation -> output projection into a single CUDA call.
+
+    On CPU, uses standard PyTorch ops.
+    """
+
+    def __init__(self, hidden: int, n_heads: int, bias: bool = True, device=None, dtype=None):
+        super().__init__()
+        self.hidden = hidden
+        self.n_heads = n_heads
+        self.head_dim = hidden // n_heads
+        factory = {'device': device, 'dtype': dtype}
+
+        self.q_proj = nn.Linear(hidden, hidden, bias=bias, **factory)
+        self.k_proj = nn.Linear(hidden, hidden, bias=bias, **factory)
+        self.v_proj = nn.Linear(hidden, hidden, bias=bias, **factory)
+        self.o_proj = nn.Linear(hidden, hidden, bias=bias, **factory)
+
+        _load_cuda_ext("fused_attention", "fused_attention.cpp", "fused_attention_kernel.cu")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda and _has_ext("fused_attention"):
+            ext = _get_ext("fused_attention")
+            return ext.forward(
+                x,
+                self.q_proj.weight, self.q_proj.bias,
+                self.k_proj.weight, self.k_proj.bias,
+                self.v_proj.weight, self.v_proj.bias,
+                self.o_proj.weight, self.o_proj.bias,
+                self.n_heads)
+
+        # CPU fallback
+        return self._forward_cpu(x)
+
+    def _forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.size(0)  # batch*seq_len
+        q = self.q_proj(x).view(B, self.n_heads, self.head_dim).permute(1, 0, 2)
+        k = self.k_proj(x).view(B, self.n_heads, self.head_dim).permute(1, 0, 2)
+        v = self.v_proj(x).view(B, self.n_heads, self.head_dim).permute(1, 0, 2)
+
+        scale = 1.0 / (self.head_dim ** 0.5)
+        scores = torch.bmm(q, k.transpose(1, 2)) * scale
+
+        # Causal mask
+        mask = torch.ones(B, B, device=x.device, dtype=x.dtype).triu(1) * (-1e9)
+        scores = scores + mask.unsqueeze(0)
+        scores = F.softmax(scores, dim=-1)
+
+        attn_out = torch.bmm(scores, v)
+        attn_out = attn_out.permute(1, 0, 2).contiguous().view(B, self.hidden)
+        return self.o_proj(attn_out)
+
+    @classmethod
+    def from_gpt2_attn(cls, attn_module, n_heads: int) -> 'FusedAttention':
+        """Create from GPT-2 style attention (c_attn + c_proj)."""
+        from .native_model import _get_linear_weight_bias
+        c_attn = attn_module.c_attn
+        c_proj = attn_module.c_proj
+
+        weight, bias = _get_linear_weight_bias(c_attn)
+        hidden = weight.shape[1]
+
+        fused = cls(hidden, n_heads, bias=(bias is not None),
+                    device=weight.device, dtype=weight.dtype)
+
+        with torch.no_grad():
+            fused.q_proj.weight.copy_(weight[:hidden])
+            fused.k_proj.weight.copy_(weight[hidden:2*hidden])
+            fused.v_proj.weight.copy_(weight[2*hidden:])
+            if bias is not None:
+                fused.q_proj.bias.copy_(bias[:hidden])
+                fused.k_proj.bias.copy_(bias[hidden:2*hidden])
+                fused.v_proj.bias.copy_(bias[2*hidden:])
+
+            wo, bo = _get_linear_weight_bias(c_proj)
+            fused.o_proj.weight.copy_(wo)
+            if bo is not None:
+                fused.o_proj.bias.copy_(bo)
+
+        return fused
+
+
+# =============================================================================
+# FusedLayerNorm: GPU-aware LayerNorm with warp-reduction
+# =============================================================================
+
+class FusedLayerNorm(nn.Module):
+    """GPU-aware fused LayerNorm.
+
+    Single kernel: mean + variance reduction + normalize + affine transform.
+    Uses warp shuffle reduction for minimal shared memory usage.
+
+    On CPU, delegates to PyTorch's optimized LayerNorm.
+    """
+
+    def __init__(self, normalized_shape: int, eps: float = 1e-5, device=None, dtype=None):
+        super().__init__()
+        factory = {'device': device, 'dtype': dtype}
+        self.normalized_shape = normalized_shape
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(normalized_shape, **factory))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape, **factory))
+
+        _load_cuda_ext("fused_layernorm", "fused_layernorm.cpp", "fused_layernorm_kernel.cu")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda and _has_ext("fused_layernorm"):
+            ext = _get_ext("fused_layernorm")
+            return ext.forward(x, self.weight, self.bias, self.eps)
+        # CPU fallback
+        return F.layer_norm(x, [self.normalized_shape], self.weight, self.bias, self.eps)
+
+    @classmethod
+    def from_torch_layernorm(cls, ln: nn.LayerNorm) -> 'FusedLayerNorm':
+        """Create from an existing PyTorch LayerNorm."""
+        normalized_shape = ln.normalized_shape[0] if isinstance(ln.normalized_shape, (list, tuple)) else ln.normalized_shape
+        fused = cls(normalized_shape, eps=ln.eps,
+                    device=ln.weight.device, dtype=ln.weight.dtype)
+        with torch.no_grad():
+            fused.weight.copy_(ln.weight)
+            fused.bias.copy_(ln.bias)
+        return fused
+
+
+# =============================================================================
+# GPU TransformerBlock: Full fused transformer block
+# =============================================================================
+
+class FusedTransformerBlock(nn.Module):
+    """GPU-aware fused transformer block.
+
+    Combines FusedLayerNorm + FusedAttention + FusedGeluMLP with residual connections.
+    Automatically dispatches to CUDA kernels on GPU, PyTorch ops on CPU.
+    """
+
+    def __init__(self, hidden: int, n_heads: int, mlp_hidden: int,
+                 bias: bool = True, eps: float = 1e-5, device=None, dtype=None):
+        super().__init__()
+        self.ln_1 = FusedLayerNorm(hidden, eps=eps, device=device, dtype=dtype)
+        self.attn = FusedAttention(hidden, n_heads, bias=bias, device=device, dtype=dtype)
+        self.ln_2 = FusedLayerNorm(hidden, eps=eps, device=device, dtype=dtype)
+        self.mlp = FusedGeluMLP(hidden, mlp_hidden, hidden, bias=bias, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pre-norm attention with residual
+        x = x + self.attn(self.ln_1(x))
+        # Pre-norm MLP with residual
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+# =============================================================================
+# Auto-dispatch functions for torch.compile Phase 3 reconstruction
+# =============================================================================
+# These are the target functions used by fx_bridge.rs Phase 3.
+# They auto-detect device and dispatch to CUDA kernels or Rust native ops.
+
+def dispatch_fused_gelu_mlp(input, w1, b1, w2, b2):
+    """Auto-dispatch fused GELU MLP: GPU -> CUDA kernel, CPU -> Rust native."""
+    if input.is_cuda and _has_ext("fused_gelu_mlp"):
+        ext = _get_ext("fused_gelu_mlp")
+        return ext.forward(input, w1, b1, w2, b2)
+    # CPU: try Rust native kernel (faster than PyTorch for small/medium)
+    try:
+        from _hypatia_core import fused_gelu_mlp_forward
+        return fused_gelu_mlp_forward(input, w1, b1, w2, b2)
+    except (ImportError, RuntimeError):
+        pass
+    # Final fallback: PyTorch ops
+    h = F.linear(input, w1, b1)
+    h = F.gelu(h)
+    return F.linear(h, w2, b2)
+
+
+def dispatch_fused_linear_relu(input, weight, bias):
+    """Auto-dispatch fused Linear+ReLU: GPU -> CUDA kernel, CPU -> Rust native."""
+    if input.is_cuda and _has_ext("fused_linear_relu"):
+        ext = _get_ext("fused_linear_relu")
+        return ext.forward(input, weight, bias)
+    # CPU: try Rust native kernel
+    try:
+        from _hypatia_core import fused_linear_relu_forward
+        return fused_linear_relu_forward(input, weight, bias)
+    except (ImportError, RuntimeError):
+        pass
+    # Final fallback
+    return F.relu(F.linear(input, weight, bias))
+
+
+__all__ = [
+    "FusedLinearReLU", "HypatiaFusedLinearReLU", "FusedLinearReLUFunction",
+    "create_fused_linear_relu_from_tensors", "FusedMLP", "create_fused_mlp_from_tensors",
+    "FusedGeluMLP", "FusedGeluMLPFunction",
+    "FusedAttention", "FusedLayerNorm", "FusedTransformerBlock",
+    "dispatch_fused_gelu_mlp", "dispatch_fused_linear_relu",
+]
+
+# Eager load CUDA extensions when module is imported
 _load_fused_linear_relu_ext()

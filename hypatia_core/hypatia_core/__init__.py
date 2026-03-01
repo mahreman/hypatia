@@ -33,7 +33,10 @@ from .fused_modules import HypatiaFusedLinearReLU, create_fused_linear_relu_from
 from .optimizer import optimize, count_optimizations, HypatiaTrainer
 
 # Import Rust-native forward pass (bypasses PyTorch dispatch)
-from .native_model import NativeModel, NativeTrainer, QuantizedModel, QuantizedTrainer, TransformerModel
+from .native_model import NativeModel, NativeTrainer, QuantizedModel, QuantizedTrainer, TransformerModel, GpuTransformerModel
+
+# Import GPU-aware fused modules
+from .fused_modules import FusedGeluMLP, FusedAttention, FusedLayerNorm, FusedTransformerBlock
 
 # Feature flag for verbose FX debugging
 DEBUG_FX = os.environ.get("HYPATIA_DEBUG_FX", "0") == "1"
@@ -156,6 +159,12 @@ __all__ = [
     "QuantizedModel",
     "QuantizedTrainer",
     "TransformerModel",
+    "GpuTransformerModel",
     "native_forward",
     "native_train_step",
+    # GPU-aware fused modules
+    "FusedGeluMLP",
+    "FusedAttention",
+    "FusedLayerNorm",
+    "FusedTransformerBlock",
 ]

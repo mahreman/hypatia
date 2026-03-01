@@ -1,29 +1,34 @@
 """
 Hypatia NativeModel & QuantizedModel - Fast inference bypassing PyTorch dispatch.
 
-Two acceleration paths, auto-selected based on model size:
+Three acceleration paths:
 
-1. NativeModel (small/medium models, < 10M params):
+1. NativeModel (small/medium models, < 10M params, CPU):
    - Single Python->Rust call for entire forward pass
    - OpenBLAS GEMM with fused bias + activation
    - 2-6x speedup over PyTorch
 
-2. QuantizedModel (large models, >= 10M params):
+2. QuantizedModel (large models, >= 10M params, CPU):
    - INT4 block quantization (7.1x memory reduction)
    - AVX2 SIMD fused dequant+dot product (16 values per cycle)
    - Rayon multi-core parallelism (all CPU cores)
    - 11-16x speedup over PyTorch on LLaMA-7B/13B
 
+3. GpuTransformerModel (GPU):
+   - Fused CUDA kernels: cuBLAS GEMM + custom GELU/LayerNorm/Attention
+   - Single CUDA stream, minimal intermediate allocations
+   - Auto-detects GPU and falls back to CPU TransformerModel
+
 Usage:
     import hypatia_core
 
-    # Auto-select best path
+    # CPU: Auto-select best path
     fast_model = hypatia_core.optimize(model)
     output = fast_model(input_tensor)
 
-    # Explicit quantized model
-    fast_model = hypatia_core.QuantizedModel(model)
-    output = fast_model(input_tensor)  # 11-16x faster for large models
+    # GPU: Auto-detect device
+    fast_model = hypatia_core.GpuTransformerModel(model, n_heads=12)
+    output = fast_model(input_tensor.cuda())
 """
 
 import torch
@@ -766,3 +771,180 @@ def _extract_layers(
         i += 1
 
     return layers if layers else None
+
+
+# =============================================================================
+# GpuTransformerModel: GPU-aware transformer using fused CUDA kernels
+# =============================================================================
+
+class GpuTransformerModel(nn.Module):
+    """GPU-accelerated transformer using fused CUDA kernels.
+
+    Extracts structure from HuggingFace GPT-2 / LLaMA style models and
+    builds a GPU-optimized forward pass using:
+    - FusedLayerNorm: warp-reduction mean/var + affine (single kernel)
+    - FusedAttention: cuBLAS Q/K/V + fused causal mask + softmax
+    - FusedGeluMLP: cuBLAS GEMM + in-place GELU + cuBLAS GEMM
+
+    Auto-detects GPU and falls back to CPU TransformerModel if CUDA unavailable.
+
+    Usage:
+        model = GPT2Model.from_pretrained('gpt2')
+        fast = GpuTransformerModel(model, n_heads=12)
+        output = fast(input_tensor.cuda())
+    """
+
+    def __init__(self, model: nn.Module, n_heads: int = 12, device=None):
+        super().__init__()
+        from .fused_modules import FusedLayerNorm, FusedAttention, FusedGeluMLP
+
+        self._n_heads = n_heads
+        self._n_params = 0
+
+        # Determine target device
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._device = device
+
+        # Extract transformer blocks
+        blocks = _find_transformer_blocks(model)
+        if not blocks:
+            raise ValueError("Could not find transformer blocks in model.")
+
+        self._blocks = nn.ModuleList()
+        hidden_dim = None
+
+        for block in blocks:
+            ln_1 = getattr(block, 'ln_1', None) or getattr(block, 'input_layernorm', None)
+            ln_2 = getattr(block, 'ln_2', None) or getattr(block, 'post_attention_layernorm', None)
+            attn = getattr(block, 'attn', None) or getattr(block, 'self_attn', None)
+            mlp = getattr(block, 'mlp', None)
+
+            if ln_1 is None or attn is None or mlp is None:
+                raise ValueError("Block missing LayerNorm/Attention/MLP components.")
+
+            # Build fused LayerNorm 1
+            fused_ln1 = FusedLayerNorm.from_torch_layernorm(ln_1).to(device)
+            hidden_dim = ln_1.weight.shape[0]
+
+            # Build fused attention
+            c_attn = getattr(attn, 'c_attn', None)
+            if c_attn is not None:
+                # GPT-2 style combined Q/K/V
+                fused_attn = FusedAttention(hidden_dim, n_heads, device=device)
+                weight, bias = _get_linear_weight_bias(c_attn)
+                c_proj = attn.c_proj
+                wo, bo = _get_linear_weight_bias(c_proj)
+                with torch.no_grad():
+                    fused_attn.q_proj.weight.copy_(weight[:hidden_dim].to(device))
+                    fused_attn.k_proj.weight.copy_(weight[hidden_dim:2*hidden_dim].to(device))
+                    fused_attn.v_proj.weight.copy_(weight[2*hidden_dim:].to(device))
+                    if bias is not None:
+                        fused_attn.q_proj.bias.copy_(bias[:hidden_dim].to(device))
+                        fused_attn.k_proj.bias.copy_(bias[hidden_dim:2*hidden_dim].to(device))
+                        fused_attn.v_proj.bias.copy_(bias[2*hidden_dim:].to(device))
+                    fused_attn.o_proj.weight.copy_(wo.to(device))
+                    if bo is not None:
+                        fused_attn.o_proj.bias.copy_(bo.to(device))
+            else:
+                # LLaMA style separate projections
+                fused_attn = FusedAttention(hidden_dim, n_heads, device=device)
+                for src_name, dst_name in [('q_proj', 'q_proj'), ('k_proj', 'k_proj'),
+                                            ('v_proj', 'v_proj'), ('o_proj', 'o_proj')]:
+                    src = getattr(attn, src_name)
+                    dst = getattr(fused_attn, dst_name)
+                    w, b = _get_linear_weight_bias(src)
+                    with torch.no_grad():
+                        dst.weight.copy_(w.to(device))
+                        if b is not None and dst.bias is not None:
+                            dst.bias.copy_(b.to(device))
+
+            # Build fused MLP
+            c_fc = getattr(mlp, 'c_fc', None)
+            c_proj_mlp = getattr(mlp, 'c_proj', None)
+
+            if c_fc is not None and c_proj_mlp is not None:
+                w1, b1 = _get_linear_weight_bias(c_fc)
+                w2, b2 = _get_linear_weight_bias(c_proj_mlp)
+                mlp_hidden = w1.shape[0]
+                fused_mlp = FusedGeluMLP(hidden_dim, mlp_hidden, hidden_dim, device=device)
+                with torch.no_grad():
+                    fused_mlp.fc1.weight.copy_(w1.to(device))
+                    if b1 is not None:
+                        fused_mlp.fc1.bias.copy_(b1.to(device))
+                    fused_mlp.fc2.weight.copy_(w2.to(device))
+                    if b2 is not None:
+                        fused_mlp.fc2.bias.copy_(b2.to(device))
+            else:
+                raise ValueError("Could not extract MLP structure from block.")
+
+            # Build fused LayerNorm 2
+            fused_ln2 = FusedLayerNorm.from_torch_layernorm(ln_2).to(device) if ln_2 else None
+
+            block_module = _FusedBlock(fused_ln1, fused_attn, fused_ln2, fused_mlp)
+            self._blocks.append(block_module)
+
+            # Count params
+            for p in block_module.parameters():
+                self._n_params += p.numel()
+
+        # Final LayerNorm
+        final_ln = _find_final_layernorm(model)
+        if final_ln is not None:
+            self._final_ln = FusedLayerNorm.from_torch_layernorm(final_ln).to(device)
+            self._n_params += sum(p.numel() for p in self._final_ln.parameters())
+        else:
+            self._final_ln = None
+
+        self._hidden_dim = hidden_dim
+        self._n_blocks = len(blocks)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure input is on the right device
+        if x.device != self._device:
+            x = x.to(self._device)
+
+        # Handle 3D input: [batch, seq, hidden] -> [batch*seq, hidden]
+        orig_shape = x.shape
+        if x.ndim == 3:
+            x = x.view(-1, x.size(-1))
+
+        for block in self._blocks:
+            x = block(x)
+
+        if self._final_ln is not None:
+            x = self._final_ln(x)
+
+        # Restore original batch dims
+        if len(orig_shape) == 3:
+            x = x.view(orig_shape[0], orig_shape[1], -1)
+        return x
+
+    def __repr__(self):
+        device_str = str(self._device)
+        return (
+            f"GpuTransformerModel(hidden={self._hidden_dim}, heads={self._n_heads}, "
+            f"blocks={self._n_blocks}, {self._n_params/1e6:.1f}M params, device={device_str})"
+        )
+
+
+class _FusedBlock(nn.Module):
+    """Internal fused transformer block with residual connections."""
+
+    def __init__(self, ln_1, attn, ln_2, mlp):
+        super().__init__()
+        self.ln_1 = ln_1
+        self.attn = attn
+        self.ln_2 = ln_2
+        self.mlp = mlp
+
+    def forward(self, x):
+        # Pre-norm attention + residual
+        x = x + self.attn(self.ln_1(x))
+        # Pre-norm MLP + residual
+        if self.ln_2 is not None:
+            x = x + self.mlp(self.ln_2(x))
+        else:
+            x = x + self.mlp(x)
+        return x

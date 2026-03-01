@@ -1336,9 +1336,8 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         }
     }
 
-    // ✅ FIX: Fused Linear+ReLU reconstruction using call_function
-    // Uses Hypatia's fused_linear_relu_forward which calls MKL sgemm_ with
-    // fused bias + ReLU in a single memory pass, bypassing PyTorch dispatch.
+    // Fused Linear+ReLU reconstruction using auto-dispatch wrapper.
+    // Routes to CUDA kernel on GPU, Rust native on CPU automatically.
     fn reconstruct_fused_linear_relu(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
         let weight_node = self.reconstruct_node(w_id, expr)?;
@@ -1350,9 +1349,9 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             self.reconstruct_node(b_id, expr)?
         };
 
-        // Call Hypatia's native fused kernel
-        let hypatia = PyModule::import_bound(self.py, "_hypatia_core")?;
-        let target_fn = hypatia.getattr("fused_linear_relu_forward")?;
+        // Use auto-dispatch wrapper (GPU: CUDA kernel, CPU: Rust native)
+        let fused_modules = PyModule::import_bound(self.py, "hypatia_core.fused_modules")?;
+        let target_fn = fused_modules.getattr("dispatch_fused_linear_relu")?;
 
         let args_tuple = PyTuple::new_bound(
             self.py,
@@ -1399,9 +1398,8 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         }
     }
 
-    /// Reconstruct FusedGeluMLP: (fused_gelu_mlp w1 b1 w2 b2 x) → hypatia native kernel
-    /// Uses Hypatia's fused_gelu_mlp_forward which calls MKL sgemm_ + MKL VML vsTanh
-    /// in a single Rust call, bypassing PyTorch dispatch overhead entirely.
+    /// Reconstruct FusedGeluMLP: (fused_gelu_mlp w1 b1 w2 b2 x) → auto-dispatch
+    /// Routes to CUDA kernel on GPU, Rust native (MKL sgemm_ + VML vsTanh) on CPU.
     fn reconstruct_fused_gelu_mlp(
         &mut self,
         w1_id: Id, b1_id: Id,
@@ -1427,9 +1425,9 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
             self.reconstruct_node(b2_id, expr)?
         };
 
-        // Call Hypatia's native fused kernel instead of PyTorch ops
-        let hypatia = PyModule::import_bound(self.py, "_hypatia_core")?;
-        let target_fn = hypatia.getattr("fused_gelu_mlp_forward")?;
+        // Use auto-dispatch wrapper (GPU: CUDA kernel, CPU: Rust native)
+        let fused_modules = PyModule::import_bound(self.py, "hypatia_core.fused_modules")?;
+        let target_fn = fused_modules.getattr("dispatch_fused_gelu_mlp")?;
 
         let args_tuple = PyTuple::new_bound(
             self.py,
