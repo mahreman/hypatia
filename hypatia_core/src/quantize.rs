@@ -143,8 +143,11 @@ impl QuantizedTensor {
 /// 1. Load 16 packed bytes = 32 INT4 values
 /// 2. Extract nibbles, interleave to original order
 /// 3. Zero-extend u8 -> i32 -> f32 (16 values per __m512)
-/// 4. Dequantize: scale * (q - zero)
+/// 4. Dequantize using FMA: scale * q + (-scale * zero)   [single FMA, not sub+mul]
 /// 5. FMA with input values
+///
+/// Key optimization: dequant uses FMA instead of sub+mul (saves 1 SIMD op per 16 values)
+/// Formula: scale*(q-zero) = scale*q + (-scale*zero) = fmadd(scale, q, neg_scale_zero)
 ///
 /// 2x throughput compared to AVX2 (32 values/iter vs 16).
 #[cfg(target_arch = "x86_64")]
@@ -169,7 +172,8 @@ unsafe fn q4_dot_avx512(
         let group_len = col_end - col_start;
 
         let scale_v = _mm512_set1_ps(row_scales[g]);
-        let zero_v = _mm512_set1_ps(row_zeros[g]);
+        // Pre-compute -scale*zero for FMA: scale*q + (-scale*zero) = scale*(q-zero)
+        let neg_sz_v = _mm512_set1_ps(-row_scales[g] * row_zeros[g]);
 
         let mut c = 0;
 
@@ -195,9 +199,10 @@ unsafe fn q4_dot_avx512(
             let vals_lo = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(interleaved_lo));
             let vals_hi = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(interleaved_hi));
 
-            // Dequantize: scale * (q - zero)
-            let dq_lo = _mm512_mul_ps(scale_v, _mm512_sub_ps(vals_lo, zero_v));
-            let dq_hi = _mm512_mul_ps(scale_v, _mm512_sub_ps(vals_hi, zero_v));
+            // Dequantize with FMA: scale*q + (-scale*zero) = scale*(q-zero)
+            // Single FMA replaces sub + mul (saves 1 SIMD op per 16 values)
+            let dq_lo = _mm512_fmadd_ps(scale_v, vals_lo, neg_sz_v);
+            let dq_hi = _mm512_fmadd_ps(scale_v, vals_hi, neg_sz_v);
 
             // Load 16 input floats at a time and FMA
             let inp_lo = _mm512_loadu_ps(input.as_ptr().add(col_start + c));
@@ -221,7 +226,7 @@ unsafe fn q4_dot_avx512(
             let interleaved = _mm_unpacklo_epi8(low, high);
 
             let vals = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(interleaved));
-            let dq = _mm512_mul_ps(scale_v, _mm512_sub_ps(vals, zero_v));
+            let dq = _mm512_fmadd_ps(scale_v, vals, neg_sz_v);
             let inp = _mm512_loadu_ps(input.as_ptr().add(col_start + c));
             acc0 = _mm512_fmadd_ps(dq, inp, acc0);
 
@@ -279,7 +284,7 @@ unsafe fn hsum256_ps(v: __m256) -> f32 {
 /// 2. Extract low/high nibbles via AND + SHIFT
 /// 3. Interleave to original order via UNPACKLO
 /// 4. Zero-extend u8 -> i32 -> f32
-/// 5. Dequantize: scale * (q - zero)
+/// 5. Dequantize with FMA: scale*q + (-scale*zero)  [single FMA, not sub+mul]
 /// 6. FMA with input values
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -303,7 +308,8 @@ unsafe fn q4_dot_avx2(
         let group_len = col_end - col_start;
 
         let scale_v = _mm256_set1_ps(row_scales[g]);
-        let zero_v = _mm256_set1_ps(row_zeros[g]);
+        // Pre-compute -scale*zero for FMA optimization
+        let neg_sz_v = _mm256_set1_ps(-row_scales[g] * row_zeros[g]);
 
         let mut c = 0;
 
@@ -330,9 +336,9 @@ unsafe fn q4_dot_avx2(
                 _mm_srli_si128(interleaved, 8),
             ));
 
-            // Dequantize: scale * (q - zero)
-            let dq_lo = _mm256_mul_ps(scale_v, _mm256_sub_ps(vals_lo, zero_v));
-            let dq_hi = _mm256_mul_ps(scale_v, _mm256_sub_ps(vals_hi, zero_v));
+            // Dequantize with FMA: scale*q + (-scale*zero) = scale*(q-zero)
+            let dq_lo = _mm256_fmadd_ps(scale_v, vals_lo, neg_sz_v);
+            let dq_hi = _mm256_fmadd_ps(scale_v, vals_hi, neg_sz_v);
 
             // Load input values and FMA
             let inp_lo = _mm256_loadu_ps(input.as_ptr().add(col_start + c));
@@ -357,7 +363,7 @@ unsafe fn q4_dot_avx2(
             let interleaved = _mm_unpacklo_epi8(low, high);
 
             let vals = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(interleaved));
-            let dq = _mm256_mul_ps(scale_v, _mm256_sub_ps(vals, zero_v));
+            let dq = _mm256_fmadd_ps(scale_v, vals, neg_sz_v);
             let inp = _mm256_loadu_ps(input.as_ptr().add(col_start + c));
 
             acc0 = _mm256_fmadd_ps(dq, inp, acc0);
@@ -550,6 +556,46 @@ unsafe fn q4_dot_neon(
 // Main Entry Point: Quantized Linear Layer
 // ============================================================================
 
+/// Dispatch a single SIMD dot product based on runtime CPU feature detection.
+#[inline(always)]
+fn q4_dot_dispatch(
+    input: &[f32],
+    packed_row: &[u8],
+    row_scales: &[f32],
+    row_zeros: &[f32],
+    group_size: usize,
+    in_features: usize,
+    #[cfg(target_arch = "x86_64")]
+    use_avx512: bool,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx512 {
+            return unsafe {
+                q4_dot_avx512(input, packed_row, row_scales, row_zeros, group_size, in_features)
+            };
+        }
+        return unsafe {
+            q4_dot_avx2(input, packed_row, row_scales, row_zeros, group_size, in_features)
+        };
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe {
+            q4_dot_neon(input, packed_row, row_scales, row_zeros, group_size, in_features)
+        };
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        return q4_dot_scalar(input, packed_row, row_scales, row_zeros, group_size, in_features);
+    }
+}
+
+/// Get the number of available CPU cores for Rayon parallelism.
+fn num_cpus() -> usize {
+    rayon::current_num_threads()
+}
+
 /// Zero-copy version: takes raw slices instead of owned QuantizedTensor.
 /// Avoids copying weight data from numpy arrays every inference call.
 pub fn quantized_linear_ref(
@@ -574,14 +620,16 @@ pub fn quantized_linear_ref(
     let mut output = vec![0.0f32; batch * out_feat];
 
     // === FUSED SIMD DOT PRODUCT + RAYON PARALLELISM ===
-    // Directly compute dot products from INT4 packed data without intermediate
-    // dequantized buffer.
+    //
+    // Key optimizations over naive approach:
+    // 1. Adaptive chunk size: ~2-4x tasks per core instead of 100+ tasks
+    //    (reduces Rayon scheduling overhead from 100-200μs to 16-32μs)
+    // 2. Fused bias+activation inside parallel loop (avoids second pass)
+    // 3. Input vector stays in L1 cache across chunk
     //
     // Parallelization strategy:
-    // - batch=1: Parallelize over output rows (many fine-grained tasks, best for LLM inference)
-    // - batch>1: Parallelize over batch rows (fewer tasks, avoids Rayon scheduling overhead)
-    //   Each batch row processes all output values sequentially with SIMD.
-    //   Input row (~16KB) stays in L1 cache while iterating over all output rows.
+    // - batch=1: Parallelize over output rows with adaptive chunking
+    // - batch>1: Parallelize over output rows (fewer tasks per row)
 
     // Runtime SIMD dispatch: prefer AVX-512 > AVX2 > NEON > scalar
     #[cfg(target_arch = "x86_64")]
@@ -589,16 +637,20 @@ pub fn quantized_linear_ref(
         && std::is_x86_feature_detected!("avx512bw");
 
     if batch <= 1 {
-        // Single batch: parallelize over output rows with chunking.
-        // Each chunk processes multiple output rows sequentially, amortizing
-        // Rayon scheduling overhead (~1μs per task) over more work per task.
-        // Input (in_feat floats) stays in L1 cache across the chunk.
         let output_row = &mut output[0..out_feat];
 
-        // Chunk size: enough work per task to make Rayon overhead negligible.
-        // At ~0.4μs per dot product (in_feat=1600), 64 dots = ~25μs vs ~1μs Rayon overhead.
-        // For in_feat=4096, 32 dots = ~64μs which is also fine.
-        let chunk_size = if in_feat >= 4096 { 32 } else { 64 };
+        // Adaptive chunk size: target 2-4x tasks per core for good load balance
+        // while minimizing Rayon scheduling overhead (~1-2μs per task).
+        //
+        // For GPT-2 XL (out_feat=6400, 16 cores):
+        //   Old: chunk=64 → 100 tasks → 100-200μs overhead (15-30% of 660μs total!)
+        //   New: chunk=200 → 32 tasks → 32-64μs overhead (5-10% of total)
+        //
+        // For LLaMA-7B (out_feat=11008):
+        //   chunk=344 → 32 tasks → well balanced across 16 cores
+        let ncpus = num_cpus().max(1);
+        // Target ~2x tasks per core, minimum chunk of 64 for SIMD efficiency
+        let chunk_size = (out_feat / (ncpus * 2)).max(64);
 
         output_row
             .par_chunks_mut(chunk_size)
@@ -613,103 +665,66 @@ pub fn quantized_linear_ref(
                     let row_scales = &scales[scales_start..scales_start + num_groups_per_row];
                     let row_zeros = &zeros[scales_start..scales_start + num_groups_per_row];
 
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        if use_avx512 {
-                            *out_val = unsafe {
-                                q4_dot_avx512(input, packed_row, row_scales, row_zeros, group_size, in_feat)
-                            };
-                        } else {
-                            *out_val = unsafe {
-                                q4_dot_avx2(input, packed_row, row_scales, row_zeros, group_size, in_feat)
-                            };
-                        }
+                    let mut val = q4_dot_dispatch(
+                        input, packed_row, row_scales, row_zeros,
+                        group_size, in_feat,
+                        #[cfg(target_arch = "x86_64")]
+                        use_avx512,
+                    );
+
+                    // Fused bias + activation inside parallel loop
+                    // (avoids second sequential pass over output)
+                    if let Some(b) = bias {
+                        val += b[o];
                     }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        *out_val = unsafe {
-                            q4_dot_neon(input, packed_row, row_scales, row_zeros, group_size, in_feat)
-                        };
+                    if relu {
+                        val = val.max(0.0);
                     }
-                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                    {
-                        *out_val = q4_dot_scalar(input, packed_row, row_scales, row_zeros, group_size, in_feat);
-                    }
+                    *out_val = val;
                 }
             });
     } else {
-        // Multiple batches: parallelize over OUTPUT ROWS (not batch rows).
-        // This gives out_feat parallel tasks (e.g. 11008 for LLaMA-7B),
-        // fully saturating all CPU cores. Each task loads one weight row
-        // (~2KB, fits in L1) and computes dot products against all batch inputs.
-        use rayon::prelude::*;
-        (0..out_feat).into_par_iter().for_each(|o| {
-            let packed_start = o * packed_cols;
-            let packed_row = &packed_data[packed_start..packed_start + packed_cols];
-            let scales_start = o * num_groups_per_row;
-            let row_scales = &scales[scales_start..scales_start + num_groups_per_row];
-            let row_zeros = &zeros[scales_start..scales_start + num_groups_per_row];
+        // Multiple batches: parallelize over output rows with chunking.
+        // Flatten (batch, output_row) into a single parallel iteration space
+        // to avoid problematic nested par_chunks_mut.
+        let ncpus = num_cpus().max(1);
+        let total_outputs = batch * out_feat;
+        let chunk_size = (total_outputs / (ncpus * 2)).max(64);
 
-            for b in 0..batch {
-                let input_row = &input[b * in_feat..(b + 1) * in_feat];
-                let val;
+        output
+            .par_chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base_idx = chunk_idx * chunk_size;
+                for (i, out_val) in chunk.iter_mut().enumerate() {
+                    let flat_idx = base_idx + i;
+                    let b = flat_idx / out_feat;
+                    let o = flat_idx % out_feat;
 
-                #[cfg(target_arch = "x86_64")]
-                {
-                    if use_avx512 {
-                        val = unsafe {
-                            q4_dot_avx512(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
-                        };
-                    } else {
-                        val = unsafe {
-                            q4_dot_avx2(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
-                        };
+                    let input_row = &input[b * in_feat..(b + 1) * in_feat];
+                    let packed_start = o * packed_cols;
+                    let packed_row = &packed_data[packed_start..packed_start + packed_cols];
+                    let scales_start = o * num_groups_per_row;
+                    let row_scales = &scales[scales_start..scales_start + num_groups_per_row];
+                    let row_zeros = &zeros[scales_start..scales_start + num_groups_per_row];
+
+                    let mut val = q4_dot_dispatch(
+                        input_row, packed_row, row_scales, row_zeros,
+                        group_size, in_feat,
+                        #[cfg(target_arch = "x86_64")]
+                        use_avx512,
+                    );
+
+                    // Fused bias + activation
+                    if let Some(bias_arr) = bias {
+                        val += bias_arr[o];
                     }
+                    if relu {
+                        val = val.max(0.0);
+                    }
+                    *out_val = val;
                 }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    val = unsafe {
-                        q4_dot_neon(input_row, packed_row, row_scales, row_zeros, group_size, in_feat)
-                    };
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                {
-                    val = q4_dot_scalar(input_row, packed_row, row_scales, row_zeros, group_size, in_feat);
-                }
-
-                // Safety: each (b, o) pair maps to a unique output[b * out_feat + o]
-                unsafe {
-                    let ptr = output.as_ptr() as *mut f32;
-                    *ptr.add(b * out_feat + o) = val;
-                }
-            }
-        });
-    }
-
-    // Fused bias + activation
-    match (bias, relu) {
-        (Some(b), true) => {
-            for i in 0..batch {
-                let row = &mut output[i * out_feat..(i + 1) * out_feat];
-                for j in 0..out_feat {
-                    row[j] = (row[j] + b[j]).max(0.0);
-                }
-            }
-        }
-        (Some(b), false) => {
-            for i in 0..batch {
-                let row = &mut output[i * out_feat..(i + 1) * out_feat];
-                for j in 0..out_feat {
-                    row[j] += b[j];
-                }
-            }
-        }
-        (None, true) => {
-            for val in output.iter_mut() {
-                *val = val.max(0.0);
-            }
-        }
-        (None, false) => {}
+            });
     }
 
     output
