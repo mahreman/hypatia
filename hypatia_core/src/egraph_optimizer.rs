@@ -81,6 +81,7 @@ define_language! {
         "fused_linear_relu" = FusedLinearReLU([Id; 3]), // (fused_linear_relu w b x) - New fusion target
         "fused-mlp" = FusedMLP([Id; 5]), // (fused-mlp w1 b1 w2 b2 x)
         "fused_conv_bn" = FusedConvBN([Id; 12]),
+        "fused_gelu_mlp" = FusedGeluMLP([Id; 5]), // (fused_gelu_mlp w1 b1 w2 b2 x)
 
         // --- Temel ---
         Constant(NotNan<f64>), 
@@ -180,6 +181,7 @@ impl CostFunction<HypatiaLang> for HardwareAwareCost {
             HypatiaLang::LinearReLU(_) => (100.0, 8.0, 0.0), // Less memory than separate
             HypatiaLang::FusedLinearReLU(_) => (100.0, 7.0, 0.0), // Single kernel, better memory locality
             HypatiaLang::FusedMLP(_) => (200.0, 12.0, 0.0), // Two linear + ReLU fused
+            HypatiaLang::FusedGeluMLP(_) => (200.0, 10.0, 0.0), // Two linear + GELU fused (MKL VML vectorized)
 
             // --- YENİ EKLENEN MALİYETLER (SNIPPET 5) ---
             // Modern aktivasyonlar için maliyet
@@ -315,7 +317,17 @@ fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantF
     // --- YENİ EKLENEN KURALLAR (SNIPPET 3) ---
     // --- Modern Aktivasyon Optimizasyonları ---
     rules.extend(vec![
-        rewrite!("gelu-approx";     "(gelu ?x)"     =>     "(mul ?x (sigmoid (mul 1.702 ?x)))"),  // Fast GELU approximation
+        // NOTE: GELU decomposition (gelu → sigmoid approximation) intentionally removed.
+        // Our Rust runtime uses MKL VML vsTanh for 12x faster exact GELU.
+        // Decomposing to sigmoid would bypass this optimization and lose accuracy.
+
+        // GELU MLP Fusion: common transformer pattern (Linear → GELU → Linear)
+        // This fuses two linear layers + GELU activation into a single optimized op.
+        rewrite!("gelu-mlp-fusion";
+            "(linear ?w2 ?b2 (gelu (linear ?w1 ?b1 ?x)))"
+            =>
+            "(fused_gelu_mlp ?w1 ?b1 ?w2 ?b2 ?x)"),
+
         rewrite!("silu-expand";    "(silu ?x)"    =>    "(mul ?x (sigmoid ?x))"),  // SiLU = x * sigmoid(x)
 
         // --- Ardışık Normalization Optimizasyonu ---
@@ -551,7 +563,8 @@ fn build_symbol(node_id: Id, rec_expr: &RecExpr<HypatiaLang>) -> Symbol {
         
         HypatiaLang::Attention([q, _k, _v]) => build_symbol(*q, rec_expr), 
         HypatiaLang::LinearReLU([_w, _b, x]) => Symbol::ReLU(Box::new(build_symbol(*x, rec_expr))), 
-        HypatiaLang::FusedMLP([_w1, _b1, _w2, _b2, x]) => build_symbol(*x, rec_expr), 
+        HypatiaLang::FusedMLP([_w1, _b1, _w2, _b2, x]) => build_symbol(*x, rec_expr),
+        HypatiaLang::FusedGeluMLP([_w1, _b1, _w2, _b2, x]) => build_symbol(*x, rec_expr),
 
         HypatiaLang::FusedConvBN([_w_c, _b_c, _w_bn, _b_bn, _m, _v, x, ..]) => build_symbol(*x, rec_expr),
         

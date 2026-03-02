@@ -264,7 +264,37 @@ pub fn sexpr_to_fx_graph<'py>(
         }
     };
 
-    rebuilder.new_graph.call_method1("output", (final_node_obj,))?;
+    // ✅ FIX: Preserve original output format (torch._dynamo expects tuple output)
+    // The original graph returns (result,) as a tuple, so we must match that format.
+    // Detect original output format by checking the original graph's output node.
+    let original_graph = original_gm.getattr("graph")?;
+    let mut output_is_tuple = true; // default: wrap in tuple (safe default for torch.compile)
+    for node in original_graph.getattr("nodes")?.iter()? {
+        let node = node?;
+        let op = node.getattr("op")?.extract::<String>()?;
+        if op == "output" {
+            // Check if original output args is a tuple of nodes
+            if let Ok(args) = node.getattr("args") {
+                if let Ok(args_tuple) = args.downcast::<PyTuple>() {
+                    if args_tuple.len() == 1 {
+                        // Check if the single arg is itself a tuple/list (wrapped output)
+                        let first = args_tuple.get_item(0)?;
+                        output_is_tuple = first.downcast::<PyTuple>().is_ok()
+                            || first.is_instance_of::<pyo3::types::PyList>();
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if output_is_tuple {
+        // Wrap output in a tuple to match torch._dynamo's expected format
+        let output_tuple = PyTuple::new_bound(py, &[final_node_obj]);
+        rebuilder.new_graph.call_method1("output", (output_tuple,))?;
+    } else {
+        rebuilder.new_graph.call_method1("output", (final_node_obj,))?;
+    }
 
     // Fused modüller (LinearReLU vb.) için submodule'leri ekle
     for (name, module) in rebuilder.param_map {
@@ -710,11 +740,13 @@ fn handle_call_function(
     else if cleaned_target.contains("mul") { "mul" }
     else if cleaned_target.contains("sub") { "sub" }
     else if cleaned_target.contains("div") { "div" }
-    else if cleaned_target.contains("mean") { "mean" } 
-    else if cleaned_target.contains("relu") { "relu" } // `.contains` geri geldi
-    else if cleaned_target.contains("sigmoid") { "sigmoid" } // `.contains` geri geldi
-    else if cleaned_target.contains("tanh") { "tanh" } // `.contains` geri geldi
-    else if cleaned_target.contains("softmax") { "softmax" } // `.contains` geri geldi
+    else if cleaned_target.contains("mean") { "mean" }
+    else if cleaned_target.contains("gelu") { "gelu" }
+    else if cleaned_target.contains("silu") { "silu" }
+    else if cleaned_target.contains("relu") { "relu" }
+    else if cleaned_target.contains("sigmoid") { "sigmoid" }
+    else if cleaned_target.contains("tanh") { "tanh" }
+    else if cleaned_target.contains("softmax") { "softmax" }
     // --- YENİ EKLENEN OPERATÖRLER (Adım 0.1) ---
     else if cleaned_target.contains("linear") { "linear" } // `.contains` geri geldi
     else if cleaned_target.contains("conv2d") { "conv2d" } // `.contains` geri geldi
@@ -738,7 +770,7 @@ fn handle_call_function(
                 Err(HypatiaError::new_err(format!("{} node needs 2 inputs", func_name))) 
             }
         },
-        "relu" | "sigmoid" | "tanh" | "softmax" | "mean" => {
+        "gelu" | "silu" | "relu" | "sigmoid" | "tanh" | "softmax" | "mean" => {
             if let Some(input) = inputs.first().and_then(|n| node_exprs.get(n)) {
                 Ok(format!("({} {})", func_name, input))
             } else { 
@@ -1132,9 +1164,18 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 Ok(relu)
             }
             
+            HypatiaLang::FusedLinearReLU(ids) => {
+                // Same as LinearReLU: F.linear + F.relu
+                let w_id = ids[0];
+                let b_id = ids[1];
+                let x_id = ids[2];
+                let linear_node = self.reconstruct_linear(w_id, b_id, x_id, expr)?;
+                let relu = self.build_call_function("relu", &[linear_node], None)?;
+                Ok(relu)
+            }
+
             HypatiaLang::FusedMLP(ids) => {
-                // ✅ REFACTORED: Use FusedMLP module with kernel fusion
-                // Pattern: (fused-mlp w1 b1 w2 b2 x)
+                // Pattern: (fused-mlp w1 b1 w2 b2 x) → F.linear(F.relu(F.linear(x, w1, b1)), w2, b2)
                 let w1_id = ids[0];
                 let b1_id = ids[1];
                 let w2_id = ids[2];
@@ -1142,6 +1183,17 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 let x_id = ids[4];
 
                 self.reconstruct_fused_mlp(w1_id, b1_id, w2_id, b2_id, x_id, expr)
+            },
+
+            HypatiaLang::FusedGeluMLP(ids) => {
+                // Pattern: (fused_gelu_mlp w1 b1 w2 b2 x) → F.linear(F.gelu(F.linear(x, w1, b1)), w2, b2)
+                let w1_id = ids[0];
+                let b1_id = ids[1];
+                let w2_id = ids[2];
+                let b2_id = ids[3];
+                let x_id = ids[4];
+
+                self.reconstruct_fused_gelu_mlp(w1_id, b1_id, w2_id, b2_id, x_id, expr)
             },
             
             HypatiaLang::Mul([a, b]) => {
@@ -1267,110 +1319,54 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
 
     // ✅ REFACTORED: reconstruct_linear() - get_tensor kullanarak
     fn reconstruct_linear(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
+        // ✅ FIX: Use call_function with placeholder FX nodes instead of call_module.
+        // This preserves dynamic parameter passing so torch._dynamo can correctly
+        // pass updated parameters when reusing compiled graphs across model instances.
         let input_node = self.reconstruct_node(x_id, expr)?;
-
-        // 1. Tensörleri get_tensor ile al
-        let w_name = self.get_var_name(w_id, expr)?;
-        let weight_tensor = self.get_tensor(&w_name)?;
+        let weight_node = self.reconstruct_node(w_id, expr)?;
 
         let b_name = self.get_var_name(b_id, expr)?;
-
-        // DEBUG: Log linear node arguments (only if HYPATIA_DEBUG_FX=1)
-        // x_id might be a nested expression (e.g., ReLU(...)), not just Var/Const
-        if is_debug_fx_enabled() {
-            let x_desc = match self.get_var_name(x_id, expr) {
-                Ok(name) => name,
-                Err(_) => format!("{:?}", expr[x_id])  // Fallback to debug repr for expressions
-            };
-            eprintln!("[DEBUG] Linear node args: w='{}', b='{}', x={}", w_name, b_name, x_desc);
-        }
-
-        let has_bias = b_name != "none";
-        let bias_tensor = if has_bias {
-            Some(self.get_tensor(&b_name)?)
+        if b_name == "none" {
+            // F.linear(input, weight) - no bias
+            self.build_call_function("linear", &[input_node, weight_node], None)
         } else {
-            None
-        };
-
-        // 2. Shape bilgisini TENSÖRDEN çıkar
-        let weight_shape = weight_tensor.getattr("shape")?;
-        let out_features: i64 = weight_shape.get_item(0)?.extract()?;
-        let in_features: i64 = weight_shape.get_item(1)?.extract()?;
-
-        // 3. Yeni Linear modül oluştur
-        let torch_nn = PyModule::import_bound(self.py, "torch.nn")?;
-        let linear_module = torch_nn.getattr("Linear")?.call1((in_features, out_features))?;
-
-        // 3.5. ✅ CRITICAL: Modülü weight'in device'ına taşı (CUDA support için)
-        self.move_module_to_tensor_device(&linear_module, &weight_tensor)?;
-
-        // 4. ✅ PARAMETRELERİ (Tensörleri) KOPYALA (artık aynı device'tayız!)
-        linear_module.getattr("weight")?.call_method1("copy_", (weight_tensor,))?;
-        if let Some(bias_t) = bias_tensor {
-            linear_module.getattr("bias")?.call_method1("copy_", (bias_t,))?;
+            let bias_node = self.reconstruct_node(b_id, expr)?;
+            // F.linear(input, weight, bias)
+            self.build_call_function("linear", &[input_node, weight_node, bias_node], None)
         }
-
-        // 5. Module map'e ekle ve node oluştur
-        let module_target_name = format!("linear_{}", self.param_map.len());
-        self.param_map.insert(module_target_name.clone(), linear_module.to_object(self.py));
-
-        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
-        let new_node = self.new_graph.call_method(
-            "create_node", ("call_module", module_target_name, args_tuple), None
-        )?;
-        Ok(new_node.to_object(self.py))
     }
 
-    // ✅ NEW: Fused Linear+ReLU reconstruction
+    // Fused Linear+ReLU reconstruction using auto-dispatch wrapper.
+    // Routes to CUDA kernel on GPU, Rust native on CPU automatically.
     fn reconstruct_fused_linear_relu(&mut self, w_id: Id, b_id: Id, x_id: Id, expr: &RecExpr<HypatiaLang>) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
-
-        // 1. Get weight and bias tensors
-        let w_name = self.get_var_name(w_id, expr)?;
-        let weight_tensor = self.get_tensor(&w_name)?;
+        let weight_node = self.reconstruct_node(w_id, expr)?;
 
         let b_name = self.get_var_name(b_id, expr)?;
-        let bias_tensor = if b_name != "none" {
-            Some(self.get_tensor(&b_name)?)
+        let bias_node = if b_name == "none" {
+            self.py.None().into_bound(self.py).to_object(self.py)
         } else {
-            None
+            self.reconstruct_node(b_id, expr)?
         };
 
-        // 2. Import Python helper
-        let hypatia_core = PyModule::import_bound(self.py, "hypatia_core")?;
-        let create_fn = hypatia_core.getattr("create_fused_linear_relu_from_tensors")?;
+        // Use auto-dispatch wrapper (GPU: CUDA kernel, CPU: Rust native)
+        let fused_modules = PyModule::import_bound(self.py, "hypatia_core.fused_modules")?;
+        let target_fn = fused_modules.getattr("dispatch_fused_linear_relu")?;
 
-        // 3. Create fused module (weight/bias already on correct device from get_tensor)
-        let none_obj = self.py.None();
-        let none_value = none_obj.bind(self.py);
-        let bias_arg = match bias_tensor {
-            Some(ref b) => b.as_any(),
-            None => none_value.as_any()
-        };
-
-        let fused_module = create_fn.call1((weight_tensor.as_any(), bias_arg))?;
-
-        // 4. Move module to input's device (for CUDA compatibility)
-        let input_tensor = input_node.bind(self.py);
-        if let Ok(device_attr) = input_tensor.getattr("device") {
-            fused_module.call_method1("to", (device_attr,))?;
-        }
-
-        // 5. Add to module map and create FX node
-        let module_target_name = format!("fused_linear_relu_{}", self.param_map.len());
-        self.param_map.insert(module_target_name.clone(), fused_module.to_object(self.py));
-
-        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
-        let new_node = self.new_graph.call_method(
-            "create_node", ("call_module", module_target_name.clone(), args_tuple), None
+        let args_tuple = PyTuple::new_bound(
+            self.py,
+            &[input_node, weight_node, bias_node],
+        );
+        let new_node = self.new_graph.call_method1(
+            "create_node",
+            ("call_function", target_fn, args_tuple, self.py.None()),
         )?;
-
-        log::info!("✅ Created fused Linear+ReLU module: {}", module_target_name);
         Ok(new_node.to_object(self.py))
     }
 
-    /// ✅ NEW: Reconstruct FusedMLP (2-layer MLP with kernel fusion)
-    /// Pattern: (fused-mlp w1 b1 w2 b2 x) -> FusedMLP module
+    /// ✅ FIX: Reconstruct FusedMLP using call_function nodes
+    /// Pattern: (fused-mlp w1 b1 w2 b2 x) -> F.linear(F.relu(F.linear(x, w1, b1)), w2, b2)
+    /// Uses placeholder FX nodes for parameters to support dynamic parameter passing.
     fn reconstruct_fused_mlp(
         &mut self,
         w1_id: Id, b1_id: Id,
@@ -1379,69 +1375,68 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         expr: &RecExpr<HypatiaLang>
     ) -> PyResult<PyObject> {
         let input_node = self.reconstruct_node(x_id, expr)?;
+        let weight1_node = self.reconstruct_node(w1_id, expr)?;
+        let weight2_node = self.reconstruct_node(w2_id, expr)?;
 
-        // 1. Get weight and bias tensors for both layers
-        let w1_name = self.get_var_name(w1_id, expr)?;
-        let weight1_tensor = self.get_tensor(&w1_name)?;
+        // Layer 1: F.linear(input, w1, b1) + F.relu
+        let b1_name = self.get_var_name(b1_id, expr)?;
+        let linear1 = if b1_name == "none" {
+            self.build_call_function("linear", &[input_node, weight1_node], None)?
+        } else {
+            let bias1_node = self.reconstruct_node(b1_id, expr)?;
+            self.build_call_function("linear", &[input_node, weight1_node, bias1_node], None)?
+        };
+        let relu1 = self.build_call_function("relu", &[linear1], None)?;
+
+        // Layer 2: F.linear(relu1, w2, b2)
+        let b2_name = self.get_var_name(b2_id, expr)?;
+        if b2_name == "none" {
+            self.build_call_function("linear", &[relu1, weight2_node], None)
+        } else {
+            let bias2_node = self.reconstruct_node(b2_id, expr)?;
+            self.build_call_function("linear", &[relu1, weight2_node, bias2_node], None)
+        }
+    }
+
+    /// Reconstruct FusedGeluMLP: (fused_gelu_mlp w1 b1 w2 b2 x) → auto-dispatch
+    /// Routes to CUDA kernel on GPU, Rust native (MKL sgemm_ + VML vsTanh) on CPU.
+    fn reconstruct_fused_gelu_mlp(
+        &mut self,
+        w1_id: Id, b1_id: Id,
+        w2_id: Id, b2_id: Id,
+        x_id: Id,
+        expr: &RecExpr<HypatiaLang>
+    ) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+        let weight1_node = self.reconstruct_node(w1_id, expr)?;
+        let weight2_node = self.reconstruct_node(w2_id, expr)?;
 
         let b1_name = self.get_var_name(b1_id, expr)?;
-        let bias1_tensor = if b1_name != "none" {
-            Some(self.get_tensor(&b1_name)?)
+        let bias1_node = if b1_name == "none" {
+            self.py.None().into_bound(self.py).to_object(self.py)
         } else {
-            None
+            self.reconstruct_node(b1_id, expr)?
         };
-
-        let w2_name = self.get_var_name(w2_id, expr)?;
-        let weight2_tensor = self.get_tensor(&w2_name)?;
 
         let b2_name = self.get_var_name(b2_id, expr)?;
-        let bias2_tensor = if b2_name != "none" {
-            Some(self.get_tensor(&b2_name)?)
+        let bias2_node = if b2_name == "none" {
+            self.py.None().into_bound(self.py).to_object(self.py)
         } else {
-            None
+            self.reconstruct_node(b2_id, expr)?
         };
 
-        // 2. Import Python helper
-        let hypatia_core = PyModule::import_bound(self.py, "hypatia_core")?;
-        let create_fn = hypatia_core.getattr("create_fused_mlp_from_tensors")?;
+        // Use auto-dispatch wrapper (GPU: CUDA kernel, CPU: Rust native)
+        let fused_modules = PyModule::import_bound(self.py, "hypatia_core.fused_modules")?;
+        let target_fn = fused_modules.getattr("dispatch_fused_gelu_mlp")?;
 
-        // 3. Create fused MLP module
-        let none_obj = self.py.None();
-        let none_value = none_obj.bind(self.py);
-
-        let bias1_arg = match bias1_tensor {
-            Some(ref b) => b.as_any(),
-            None => none_value.as_any()
-        };
-
-        let bias2_arg = match bias2_tensor {
-            Some(ref b) => b.as_any(),
-            None => none_value.as_any()
-        };
-
-        let fused_module = create_fn.call1((
-            weight1_tensor.as_any(),
-            bias1_arg,
-            weight2_tensor.as_any(),
-            bias2_arg
-        ))?;
-
-        // 4. Move module to input's device (for CUDA compatibility)
-        let input_tensor = input_node.bind(self.py);
-        if let Ok(device_attr) = input_tensor.getattr("device") {
-            fused_module.call_method1("to", (device_attr,))?;
-        }
-
-        // 5. Add to module map and create FX node
-        let module_target_name = format!("fused_mlp_{}", self.param_map.len());
-        self.param_map.insert(module_target_name.clone(), fused_module.to_object(self.py));
-
-        let args_tuple = PyTuple::new_bound(self.py, &[input_node]);
-        let new_node = self.new_graph.call_method(
-            "create_node", ("call_module", module_target_name.clone(), args_tuple), None
+        let args_tuple = PyTuple::new_bound(
+            self.py,
+            &[input_node, weight1_node, bias1_node, weight2_node, bias2_node],
+        );
+        let new_node = self.new_graph.call_method1(
+            "create_node",
+            ("call_function", target_fn, args_tuple, self.py.None()),
         )?;
-
-        log::info!("✅ Created fused MLP module: {}", module_target_name);
         Ok(new_node.to_object(self.py))
     }
 
@@ -1636,13 +1631,12 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let torch_module = PyModule::import_bound(self.py, "torch")?;
         let nn_functional = PyModule::import_bound(self.py, "torch.nn.functional")?;
 
-        let target_fn = if target == "linear" {
-            nn_functional.getattr("linear")?
-        } else if target == "relu" {
-            // 🟢 ADIM 4: F.relu'yu (call_function) desteklemek için eklendi
-            nn_functional.getattr("relu")?
-        } else {
-             torch_module.getattr(target)?
+        // Most activation and NN functions live in torch.nn.functional
+        let target_fn = match target {
+            "linear" | "relu" | "gelu" | "silu" | "sigmoid" | "tanh" | "softmax" |
+            "conv2d" | "batch_norm" | "layer_norm" | "dropout" =>
+                nn_functional.getattr(target)?,
+            _ => torch_module.getattr(target)?,
         };
 
         if target == "flatten" {
@@ -2024,7 +2018,9 @@ fn is_supported_node(node: &HypatiaLang) -> bool {
         }
 
         // ========== Fusion Operations ==========
-        HypatiaLang::LinearReLU(_) | HypatiaLang::FusedMLP(_) | HypatiaLang::FusedConvBN(_) => true,
+        HypatiaLang::LinearReLU(_) | HypatiaLang::FusedLinearReLU(_) |
+        HypatiaLang::FusedMLP(_) | HypatiaLang::FusedGeluMLP(_) |
+        HypatiaLang::FusedConvBN(_) => true,
 
         // ========== Statistical Operations ==========
         HypatiaLang::Mean(_) => true,
@@ -2073,13 +2069,15 @@ mod tests {
     fn test_unsanitize_value_f64() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
+            let placeholder_map_owned: HashMap<String, Bound<'_, PyAny>> = HashMap::new();
+            let dummy = PyDict::new_bound(py);
             let rebuilder = FxRebuilder {
                 py,
-                model: PyDict::new_bound(py).as_any(),
-                original_gm: PyDict::new_bound(py).as_any(), // Dummy
-                new_graph: PyDict::new_bound(py).as_any(), // Dummy
+                original_gm: dummy.as_any(),
+                new_graph: dummy.as_any(),
                 node_map: HashMap::new(),
-                placeholder_map: HashMap::new(),
+                fx_placeholder_map: HashMap::new(),
+                placeholder_map: &placeholder_map_owned,
                 param_map: HashMap::new(),
             };
 
@@ -2104,16 +2102,18 @@ mod tests {
     fn test_unsanitize_tuple() {
          pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
+            let placeholder_map_owned: HashMap<String, Bound<'_, PyAny>> = HashMap::new();
+            let dummy = PyDict::new_bound(py);
             let rebuilder = FxRebuilder {
                 py,
-                model: PyDict::new_bound(py).as_any(),
-                original_gm: PyDict::new_bound(py).as_any(),
-                new_graph: PyDict::new_bound(py).as_any(),
+                original_gm: dummy.as_any(),
+                new_graph: dummy.as_any(),
                 node_map: HashMap::new(),
-                placeholder_map: HashMap::new(),
+                fx_placeholder_map: HashMap::new(),
+                placeholder_map: &placeholder_map_owned,
                 param_map: HashMap::new(),
             };
-            
+
             let val = rebuilder.unsanitize_tuple("1_1").unwrap();
             let tuple = val.downcast_bound::<PyTuple>(py).unwrap();
             assert_eq!(tuple.len(), 2);

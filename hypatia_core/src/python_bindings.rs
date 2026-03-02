@@ -1,10 +1,12 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyAny}; // PyAny eklendi
+use pyo3::types::{PyDict, PyAny, PyList, PyTuple}; // PyAny eklendi
 use pyo3::Bound;
+use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray1, PyReadwriteArray2, PyArray1, PyArray2, PyUntypedArrayMethods, PyArrayMethods};
 
 use crate::multivector2d::MultiVector2D;
 use crate::multivector3d::MultiVector3D;
 use crate::symbolic::Symbol;
+use crate::native_ops;
 use std::collections::HashMap;
 
 // Hypatia özel hata sınıfı
@@ -573,4 +575,885 @@ pub fn set_log_level(level: &str) -> PyResult<()> {
         .ok();
 
     Ok(())
+}
+
+// ============================================================================
+// Native Forward Pass - Bypasses PyTorch dispatch overhead
+// ============================================================================
+
+/// Native MLP forward pass: all layers fused in a single Rust call.
+/// ZERO-COPY: weight and bias data is read directly from numpy arrays.
+///
+/// Args:
+///     input: numpy array [batch, in_features] f32
+///     layers: Python list of (weight_np, bias_np_or_None, activation_str) tuples
+///
+/// Returns:
+///     numpy array [batch, out_features] f32
+#[pyfunction]
+pub fn native_forward<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    layers: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let input_shape = input.shape();
+    let batch = input_shape[0];
+    let in_features = input_shape[1];
+
+    let input_slice = input
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
+
+    // Process layers with zero-copy weight access
+    let mut current = input_slice.to_vec(); // Only copy input once
+    let mut current_feat = in_features;
+
+    for item in layers.iter() {
+        let tuple = item
+            .downcast::<PyTuple>()
+            .map_err(|_| HypatiaError::new_err("Each layer must be a tuple (weight, bias, activation)"))?;
+
+        // Zero-copy: borrow weight data directly from numpy array
+        let weight: PyReadonlyArray2<f32> = tuple.get_item(0)?.extract()?;
+        let out_feat = weight.shape()[0];
+        let w_slice = weight
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Weight must be C-contiguous: {}", e)))?;
+
+        let bias_obj = tuple.get_item(1)?;
+        let activation: String = tuple.get_item(2)?.extract()?;
+        let is_relu = activation.to_lowercase() == "relu";
+
+        // Call GEMM with zero-copy references - branch on bias presence
+        if bias_obj.is_none() {
+            current = native_ops::fused_linear(
+                &current, w_slice, None, batch, current_feat, out_feat, is_relu,
+            );
+        } else {
+            let bias: PyReadonlyArray1<f32> = bias_obj.extract()?;
+            let b_slice = bias
+                .as_slice()
+                .map_err(|e| HypatiaError::new_err(format!("Bias must be C-contiguous: {}", e)))?;
+            current = native_ops::fused_linear(
+                &current, w_slice, Some(b_slice), batch, current_feat, out_feat, is_relu,
+            );
+        }
+
+        current_feat = out_feat;
+    }
+
+    // Zero-copy: transfer Vec ownership directly to numpy, then reshape
+    let flat = PyArray1::from_vec_bound(py, current);
+    flat.reshape([batch, current_feat])
+        .map_err(|e| HypatiaError::new_err(format!("Failed to reshape output: {}", e)))
+}
+
+/// Native training step: forward -> MSE loss -> backward -> SGD update.
+/// All computation in Rust, single Python crossing.
+///
+/// Args:
+///     input: numpy [batch, in_features] f32
+///     target: numpy [batch, out_features] f32
+///     weights: list of numpy [out, in] f32 arrays (will be modified in-place!)
+///     biases: list of numpy [out] f32 arrays or None (will be modified in-place!)
+///     activations: list of activation strings ("relu" or "none")
+///     lr: learning rate
+///
+/// Returns:
+///     loss value (float)
+#[pyfunction]
+pub fn native_train_step<'py>(
+    _py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    target: PyReadonlyArray2<'py, f32>,
+    weights: &Bound<'py, PyList>,
+    biases: &Bound<'py, PyList>,
+    activations: &Bound<'py, PyList>,
+    lr: f32,
+) -> PyResult<f32> {
+    let batch = input.shape()[0];
+    let in_features = input.shape()[1];
+    let out_features_final = target.shape()[1];
+
+    let input_slice = input
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
+    let target_slice = target
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Target must be C-contiguous: {}", e)))?;
+
+    let num_layers = weights.len();
+
+    // Extract weight/bias data as mutable owned Vecs
+    let mut weight_vecs: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
+    let mut bias_vecs: Vec<Option<Vec<f32>>> = Vec::with_capacity(num_layers);
+    let mut dims: Vec<(usize, usize, bool)> = Vec::with_capacity(num_layers);
+
+    for i in 0..num_layers {
+        let w: PyReadonlyArray2<f32> = weights.get_item(i)?.extract()?;
+        let out_f = w.shape()[0];
+        let in_f = w.shape()[1];
+
+        weight_vecs.push(
+            w.as_slice()
+                .map_err(|e| HypatiaError::new_err(format!("Weight must be C-contiguous: {}", e)))?
+                .to_vec(),
+        );
+
+        let b_obj = biases.get_item(i)?;
+        if b_obj.is_none() {
+            bias_vecs.push(None);
+        } else {
+            let b: PyReadonlyArray1<f32> = b_obj.extract()?;
+            bias_vecs.push(Some(
+                b.as_slice()
+                    .map_err(|e| HypatiaError::new_err(format!("Bias must be C-contiguous: {}", e)))?
+                    .to_vec(),
+            ));
+        }
+
+        let act: String = activations.get_item(i)?.extract()?;
+        let is_relu = act.to_lowercase() == "relu";
+
+        dims.push((in_f, out_f, is_relu));
+    }
+
+    // Run training step
+    let loss = native_ops::train_step_sgd(
+        input_slice,
+        target_slice,
+        batch,
+        in_features,
+        out_features_final,
+        &mut weight_vecs,
+        &mut bias_vecs,
+        &dims,
+        lr,
+    );
+
+    // Write updated weights/biases back to numpy arrays
+    for i in 0..num_layers {
+        let w_py = weights.get_item(i)?;
+        let mut w_arr: PyReadwriteArray2<f32> = w_py.extract()?;
+        let w_slice = w_arr
+            .as_slice_mut()
+            .map_err(|e| HypatiaError::new_err(format!("Weight write-back failed: {}", e)))?;
+        w_slice.copy_from_slice(&weight_vecs[i]);
+
+        if let Some(ref bias_data) = bias_vecs[i] {
+            let b_py = biases.get_item(i)?;
+            if !b_py.is_none() {
+                let mut b_arr: PyReadwriteArray1<f32> = b_py.extract()?;
+                let b_slice = b_arr.as_slice_mut()
+                    .map_err(|e| HypatiaError::new_err(format!("Bias write-back failed: {}", e)))?;
+                b_slice.copy_from_slice(bias_data);
+            }
+        }
+    }
+
+    Ok(loss)
+}
+
+// ============================================================================
+// Fused Native Kernels for torch.compile (Phase 3 Reconstruction)
+// ============================================================================
+
+/// Fast tensor→numpy conversion: tries .numpy() first (zero-copy for contiguous f32 CPU tensors),
+/// falls back to .detach().float().contiguous().numpy() if needed.
+#[inline]
+fn tensor_to_numpy_2d<'py>(tensor: &Bound<'py, PyAny>) -> PyResult<PyReadonlyArray2<'py, f32>> {
+    // Fast path: torch.compile always passes contiguous f32 CPU tensors
+    if let Ok(arr) = tensor.call_method0("numpy").and_then(|a| a.extract::<PyReadonlyArray2<f32>>()) {
+        return Ok(arr);
+    }
+    // Slow path: ensure correct dtype/layout
+    tensor
+        .call_method0("detach")?
+        .call_method0("float")?
+        .call_method0("contiguous")?
+        .call_method0("numpy")?
+        .extract()
+}
+
+/// Fast tensor→numpy conversion for 1D tensors.
+#[inline]
+fn tensor_to_numpy_1d<'py>(tensor: &Bound<'py, PyAny>) -> PyResult<PyReadonlyArray1<'py, f32>> {
+    if let Ok(arr) = tensor.call_method0("numpy").and_then(|a| a.extract::<PyReadonlyArray1<f32>>()) {
+        return Ok(arr);
+    }
+    tensor
+        .call_method0("detach")?
+        .call_method0("contiguous")?
+        .call_method0("numpy")?
+        .extract()
+}
+
+/// Fused GELU MLP: Linear → GELU → Linear in a single Rust call.
+/// Uses MKL sgemm_ for GEMM and MKL VML vsTanh for vectorized GELU.
+///
+/// Called by torch.compile's reconstructed FX graph for the fused_gelu_mlp pattern.
+/// Accepts torch tensors (CPU, f32), returns torch tensor.
+///
+/// Args:
+///     input: torch.Tensor [batch, in_features]
+///     w1: torch.Tensor [hidden, in_features]
+///     b1: torch.Tensor [hidden] or None
+///     w2: torch.Tensor [out_features, hidden]
+///     b2: torch.Tensor [out_features] or None
+///
+/// Returns:
+///     torch.Tensor [batch, out_features]
+#[pyfunction]
+pub fn fused_gelu_mlp_forward<'py>(
+    py: Python<'py>,
+    input: &Bound<'py, PyAny>,
+    w1: &Bound<'py, PyAny>,
+    b1: &Bound<'py, PyAny>,
+    w2: &Bound<'py, PyAny>,
+    b2: &Bound<'py, PyAny>,
+) -> PyResult<PyObject> {
+    let torch = PyModule::import_bound(py, "torch")?;
+
+    let input_np = tensor_to_numpy_2d(input)?;
+    let input_slice = input_np
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
+    let batch = input_np.shape()[0];
+    let in_feat = input_np.shape()[1];
+
+    let w1_np = tensor_to_numpy_2d(w1)?;
+    let w1_slice = w1_np
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("W1 must be C-contiguous: {}", e)))?;
+    let hidden = w1_np.shape()[0];
+
+    // Layer 1: linear(input, w1, b1) — no activation
+    let mut hidden_out = if b1.is_none() {
+        native_ops::fused_linear(input_slice, w1_slice, None, batch, in_feat, hidden, false)
+    } else {
+        let b1_np = tensor_to_numpy_1d(b1)?;
+        let b1_slice = b1_np
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("B1 must be C-contiguous: {}", e)))?;
+        native_ops::fused_linear(input_slice, w1_slice, Some(b1_slice), batch, in_feat, hidden, false)
+    };
+
+    // GELU activation (MKL VML vsTanh vectorized, 12x faster than scalar)
+    native_ops::gelu(&mut hidden_out);
+
+    let w2_np = tensor_to_numpy_2d(w2)?;
+    let w2_slice = w2_np
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("W2 must be C-contiguous: {}", e)))?;
+    let out_feat = w2_np.shape()[0];
+
+    // Layer 2: linear(gelu_out, w2, b2) — no activation
+    let output = if b2.is_none() {
+        native_ops::fused_linear(&hidden_out, w2_slice, None, batch, hidden, out_feat, false)
+    } else {
+        let b2_np = tensor_to_numpy_1d(b2)?;
+        let b2_slice = b2_np
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("B2 must be C-contiguous: {}", e)))?;
+        native_ops::fused_linear(&hidden_out, w2_slice, Some(b2_slice), batch, hidden, out_feat, false)
+    };
+
+    // Zero-copy: Vec ownership → numpy → torch.from_numpy
+    let flat = PyArray1::from_vec_bound(py, output);
+    let reshaped = flat.reshape([batch, out_feat])
+        .map_err(|e| HypatiaError::new_err(format!("Failed to reshape output: {}", e)))?;
+    let result = torch.call_method1("from_numpy", (reshaped,))?;
+    Ok(result.to_object(py))
+}
+
+/// Fused Linear + ReLU in a single Rust call.
+/// Uses MKL sgemm_ for GEMM with fused bias + ReLU in one memory pass.
+///
+/// Args:
+///     input: torch.Tensor [batch, in_features]
+///     weight: torch.Tensor [out_features, in_features]
+///     bias: torch.Tensor [out_features] or None
+///
+/// Returns:
+///     torch.Tensor [batch, out_features]
+#[pyfunction]
+pub fn fused_linear_relu_forward<'py>(
+    py: Python<'py>,
+    input: &Bound<'py, PyAny>,
+    weight: &Bound<'py, PyAny>,
+    bias: &Bound<'py, PyAny>,
+) -> PyResult<PyObject> {
+    let torch = PyModule::import_bound(py, "torch")?;
+
+    let input_np = tensor_to_numpy_2d(input)?;
+    let input_slice = input_np
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
+    let batch = input_np.shape()[0];
+    let in_feat = input_np.shape()[1];
+
+    let w_np = tensor_to_numpy_2d(weight)?;
+    let w_slice = w_np
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weight must be C-contiguous: {}", e)))?;
+    let out_feat = w_np.shape()[0];
+
+    let output = if bias.is_none() {
+        native_ops::fused_linear(input_slice, w_slice, None, batch, in_feat, out_feat, true)
+    } else {
+        let b_np = tensor_to_numpy_1d(bias)?;
+        let b_slice = b_np
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Bias must be C-contiguous: {}", e)))?;
+        native_ops::fused_linear(input_slice, w_slice, Some(b_slice), batch, in_feat, out_feat, true)
+    };
+
+    let flat = PyArray1::from_vec_bound(py, output);
+    let reshaped = flat.reshape([batch, out_feat])
+        .map_err(|e| HypatiaError::new_err(format!("Failed to reshape output: {}", e)))?;
+    let result = torch.call_method1("from_numpy", (reshaped,))?;
+    Ok(result.to_object(py))
+}
+
+// ============================================================================
+// INT4 Quantized Inference - For Large Models (1B+ params)
+// ============================================================================
+
+/// Quantize weight matrices to INT4 block format.
+/// Returns an opaque handle (list of quantized layer data) for use with quantized_forward.
+///
+/// Args:
+///     layers: list of (weight_np, bias_np_or_None, activation_str) tuples
+///     group_size: quantization group size (default: 128)
+///
+/// Returns:
+///     list of (packed_data_bytes, scales_np, zeros_np, bias_np_or_None, activation_str,
+///              rows, cols, group_size, orig_bytes, quant_bytes) tuples
+#[pyfunction]
+#[pyo3(signature = (layers, group_size=128))]
+pub fn quantize_weights<'py>(
+    py: Python<'py>,
+    layers: &Bound<'py, PyList>,
+    group_size: usize,
+) -> PyResult<PyObject> {
+    let result = pyo3::types::PyList::empty_bound(py);
+
+    for item in layers.iter() {
+        let tuple = item
+            .downcast::<PyTuple>()
+            .map_err(|_| HypatiaError::new_err("Each layer must be a tuple"))?;
+
+        let weight: PyReadonlyArray2<f32> = tuple.get_item(0)?.extract()?;
+        let rows = weight.shape()[0];
+        let cols = weight.shape()[1];
+        let w_slice = weight
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Weight must be C-contiguous: {}", e)))?;
+
+        // Quantize to INT4
+        let qt = crate::quantize::QuantizedTensor::quantize(w_slice, rows, cols, group_size);
+
+        let orig_bytes = qt.original_bytes();
+        let quant_bytes = qt.memory_bytes();
+
+        // Convert to Python objects
+        let scales_np = numpy::PyArray1::from_vec_bound(py, qt.scales);
+        let zeros_np = numpy::PyArray1::from_vec_bound(py, qt.zeros);
+        let data_np = numpy::PyArray1::from_vec_bound(py, qt.data);
+
+        let bias_obj = tuple.get_item(1)?;
+        let activation = tuple.get_item(2)?;
+
+        let layer_tuple = PyTuple::new_bound(
+            py,
+            &[
+                data_np.as_any().clone(),
+                scales_np.as_any().clone(),
+                zeros_np.as_any().clone(),
+                bias_obj.clone(),
+                activation.clone(),
+                rows.into_py(py).bind(py).clone(),
+                cols.into_py(py).bind(py).clone(),
+                group_size.into_py(py).bind(py).clone(),
+                orig_bytes.into_py(py).bind(py).clone(),
+                quant_bytes.into_py(py).bind(py).clone(),
+            ],
+        );
+
+        result.append(layer_tuple)?;
+    }
+
+    Ok(result.into())
+}
+
+/// Quantized forward pass: dequantize + GEMM fused, reducing memory bandwidth by ~7x.
+///
+/// Args:
+///     input: numpy [batch, in_features] f32
+///     quantized_layers: output from quantize_weights()
+///
+/// Returns:
+///     numpy [batch, out_features] f32
+#[pyfunction]
+pub fn quantized_forward<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    quantized_layers: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    let input_slice = input
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
+
+    let mut current = input_slice.to_vec();
+    let mut current_feat = input.shape()[1];
+
+    for item in quantized_layers.iter() {
+        let tuple = item
+            .downcast::<PyTuple>()
+            .map_err(|_| HypatiaError::new_err("Invalid quantized layer format"))?;
+
+        // ZERO-COPY: borrow data directly from numpy arrays via as_slice()
+        let data: numpy::PyReadonlyArray1<u8> = tuple.get_item(0)?.extract()?;
+        let scales: PyReadonlyArray1<f32> = tuple.get_item(1)?.extract()?;
+        let zeros: PyReadonlyArray1<f32> = tuple.get_item(2)?.extract()?;
+        let bias_obj = tuple.get_item(3)?;
+        let activation: String = tuple.get_item(4)?.extract()?;
+        let rows: usize = tuple.get_item(5)?.extract()?;
+        let cols: usize = tuple.get_item(6)?.extract()?;
+        let group_size: usize = tuple.get_item(7)?.extract()?;
+
+        let is_relu = activation.to_lowercase() == "relu";
+
+        // Zero-copy slices from numpy
+        let data_slice = data
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Data not contiguous: {}", e)))?;
+        let scales_slice = scales
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Scales not contiguous: {}", e)))?;
+        let zeros_slice = zeros
+            .as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Zeros not contiguous: {}", e)))?;
+
+        // Call quantized_linear_ref with zero-copy slices (no .to_vec()!)
+        if bias_obj.is_none() {
+            current = crate::quantize::quantized_linear_ref(
+                &current, data_slice, scales_slice, zeros_slice,
+                rows, cols, group_size, None, batch, is_relu,
+            );
+        } else {
+            let bias: PyReadonlyArray1<f32> = bias_obj.extract()?;
+            let b_slice = bias
+                .as_slice()
+                .map_err(|e| HypatiaError::new_err(format!("Bias not contiguous: {}", e)))?;
+            current = crate::quantize::quantized_linear_ref(
+                &current, data_slice, scales_slice, zeros_slice,
+                rows, cols, group_size, Some(b_slice), batch, is_relu,
+            );
+        }
+        current_feat = rows;
+    }
+
+    // Zero-copy: transfer Vec ownership directly to numpy
+    let flat = PyArray1::from_vec_bound(py, current);
+    flat.reshape([batch, current_feat])
+        .map_err(|e| HypatiaError::new_err(format!("Failed to reshape quantized output: {}", e)))
+}
+
+/// Execute a transformer forward pass with mixed operation types.
+///
+/// ops_list: List of operation tuples:
+///   ("linear", weight_np, bias_np_or_None, activation_str)
+///   ("layernorm", gamma_np, beta_np, eps_float)
+///   ("attention", wq, bq, wk, bk, wv, bv, wo, bo, n_heads)
+///   ("residual_start",)
+///   ("residual_end",)
+///   ("gelu",)
+#[pyfunction]
+#[pyo3(signature = (input, ops_list, seq_len=1))]
+pub fn transformer_forward_py<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    ops_list: &Bound<'py, PyList>,
+    seq_len: usize,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let total_rows = input.shape()[0];
+    let features = input.shape()[1];
+    let batch = total_rows / seq_len;
+    let input_slice = input
+        .as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input must be C-contiguous: {}", e)))?;
+
+    let mut current = input_slice.to_vec();
+    let mut current_feat = features;
+    let mut residual_stack: Vec<Vec<f32>> = Vec::new();
+
+    for item in ops_list.iter() {
+        let tuple = item
+            .downcast::<PyTuple>()
+            .map_err(|_| HypatiaError::new_err("Op must be a tuple"))?;
+
+        let op_type: String = tuple.get_item(0)?.extract()?;
+
+        match op_type.as_str() {
+            "linear" => {
+                let weight: PyReadonlyArray2<f32> = tuple.get_item(1)?.extract()?;
+                let bias_obj = tuple.get_item(2)?;
+                let activation: String = tuple.get_item(3)?.extract()?;
+
+                let w_slice = weight.as_slice()
+                    .map_err(|e| HypatiaError::new_err(format!("Weight not contiguous: {}", e)))?;
+                let out_feat = weight.shape()[0];
+                let in_feat = weight.shape()[1];
+                let is_relu = activation == "relu";
+
+                if bias_obj.is_none() {
+                    current = native_ops::fused_linear(&current, w_slice, None, total_rows, in_feat, out_feat, is_relu);
+                } else {
+                    let bias: PyReadonlyArray1<f32> = bias_obj.extract()?;
+                    let b_slice = bias.as_slice()
+                        .map_err(|e| HypatiaError::new_err(format!("Bias not contiguous: {}", e)))?;
+                    current = native_ops::fused_linear(&current, w_slice, Some(b_slice), total_rows, in_feat, out_feat, is_relu);
+                }
+                current_feat = out_feat;
+            }
+            "layernorm" => {
+                let gamma: PyReadonlyArray1<f32> = tuple.get_item(1)?.extract()?;
+                let beta: PyReadonlyArray1<f32> = tuple.get_item(2)?.extract()?;
+                let eps: f32 = tuple.get_item(3)?.extract()?;
+
+                let g_slice = gamma.as_slice()
+                    .map_err(|e| HypatiaError::new_err(format!("Gamma not contiguous: {}", e)))?;
+                let b_slice = beta.as_slice()
+                    .map_err(|e| HypatiaError::new_err(format!("Beta not contiguous: {}", e)))?;
+                let feat = gamma.shape()[0];
+
+                current = native_ops::layer_norm(&current, g_slice, b_slice, total_rows, feat, eps);
+                current_feat = feat;
+            }
+            "attention" => {
+                let wq: PyReadonlyArray2<f32> = tuple.get_item(1)?.extract()?;
+                let bq_obj = tuple.get_item(2)?;
+                let wk: PyReadonlyArray2<f32> = tuple.get_item(3)?.extract()?;
+                let bk_obj = tuple.get_item(4)?;
+                let wv: PyReadonlyArray2<f32> = tuple.get_item(5)?.extract()?;
+                let bv_obj = tuple.get_item(6)?;
+                let wo: PyReadonlyArray2<f32> = tuple.get_item(7)?.extract()?;
+                let bo_obj = tuple.get_item(8)?;
+                let n_heads: usize = tuple.get_item(9)?.extract()?;
+
+                let wq_s = wq.as_slice().map_err(|e| HypatiaError::new_err(format!("{}", e)))?;
+                let wk_s = wk.as_slice().map_err(|e| HypatiaError::new_err(format!("{}", e)))?;
+                let wv_s = wv.as_slice().map_err(|e| HypatiaError::new_err(format!("{}", e)))?;
+                let wo_s = wo.as_slice().map_err(|e| HypatiaError::new_err(format!("{}", e)))?;
+
+                let hidden = wq.shape()[0];
+
+                let extract_bias = |obj: Bound<'py, PyAny>| -> PyResult<Option<Vec<f32>>> {
+                    if obj.is_none() {
+                        Ok(None)
+                    } else {
+                        let b: PyReadonlyArray1<f32> = obj.extract()?;
+                        Ok(Some(b.as_slice()
+                            .map_err(|e| HypatiaError::new_err(format!("{}", e)))?.to_vec()))
+                    }
+                };
+
+                let bq_v = extract_bias(bq_obj)?;
+                let bk_v = extract_bias(bk_obj)?;
+                let bv_v = extract_bias(bv_obj)?;
+                let bo_v = extract_bias(bo_obj)?;
+
+                current = native_ops::multi_head_attention(
+                    &current,
+                    wq_s, bq_v.as_deref(), wk_s, bk_v.as_deref(),
+                    wv_s, bv_v.as_deref(), wo_s, bo_v.as_deref(),
+                    batch, seq_len, hidden, n_heads,
+                );
+                current_feat = hidden;
+            }
+            "residual_start" => {
+                residual_stack.push(current.clone());
+            }
+            "residual_end" => {
+                if let Some(residual) = residual_stack.pop() {
+                    for (c, r) in current.iter_mut().zip(residual.iter()) {
+                        *c += r;
+                    }
+                }
+            }
+            "gelu" => {
+                native_ops::gelu(&mut current);
+            }
+            _ => {
+                return Err(HypatiaError::new_err(format!("Unknown op type: {}", op_type)));
+            }
+        }
+    }
+
+    // Zero-copy: transfer Vec ownership directly to numpy
+    let flat = PyArray1::from_vec_bound(py, current);
+    flat.reshape([total_rows, current_feat])
+        .map_err(|e| HypatiaError::new_err(format!("Failed to reshape transformer output: {}", e)))
+}
+
+/// Quantization-Aware Training step.
+/// Forward with INT4 quantized weights, backward with f32 weights (STE).
+///
+/// Args:
+///   input: [batch, in_features] f32 array
+///   target: [batch, out_features] f32 array
+///   weights: list of [out, in] f32 arrays (mutable, updated in-place)
+///   biases: list of [out] f32 arrays or None (mutable)
+///   activations: list of activation name strings ("relu" or "none")
+///   lr: learning rate
+///   group_size: INT4 quantization group size (default 128)
+///
+/// Returns: loss value (float)
+#[pyfunction]
+pub fn quantized_train_step<'py>(
+    _py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    target: PyReadonlyArray2<'py, f32>,
+    weights: &Bound<'py, PyList>,
+    biases: &Bound<'py, PyList>,
+    activations: &Bound<'py, PyList>,
+    lr: f32,
+    group_size: Option<usize>,
+) -> PyResult<f32> {
+    let gs = group_size.unwrap_or(128);
+    let batch = input.shape()[0];
+    let in_features = input.shape()[1];
+
+    let x = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let y = target.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Target: {}", e)))?;
+
+    let out_features = target.shape()[1];
+
+    // Extract mutable weights
+    let n_layers = weights.len();
+    let mut w_vecs: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
+    let mut b_vecs: Vec<Option<Vec<f32>>> = Vec::with_capacity(n_layers);
+    let mut layer_dims: Vec<(usize, usize, bool)> = Vec::with_capacity(n_layers);
+    let mut current_in = in_features;
+
+    for i in 0..n_layers {
+        let w_arr: numpy::PyReadonlyArray2<f32> = weights.get_item(i)?.extract()?;
+        let out_f = w_arr.shape()[0];
+        let in_f = w_arr.shape()[1];
+        w_vecs.push(w_arr.as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Weight {}: {}", i, e)))?
+            .to_vec());
+
+        let bias_obj = biases.get_item(i)?;
+        if bias_obj.is_none() {
+            b_vecs.push(None);
+        } else {
+            let b_arr: PyReadonlyArray1<f32> = bias_obj.extract()?;
+            b_vecs.push(Some(b_arr.as_slice()
+                .map_err(|e| HypatiaError::new_err(format!("Bias {}: {}", i, e)))?
+                .to_vec()));
+        }
+
+        let act: String = activations.get_item(i)?.extract()?;
+        let is_relu = act == "relu";
+        layer_dims.push((in_f, out_f, is_relu));
+        current_in = out_f;
+    }
+
+    // Run QAT training step
+    let loss = crate::quantize::quantized_train_step_sgd(
+        x, y, batch, in_features, out_features,
+        &mut w_vecs, &mut b_vecs, &layer_dims, gs, lr,
+    );
+
+    // Copy updated weights back to numpy arrays
+    for i in 0..n_layers {
+        let w_obj = weights.get_item(i)?;
+        let mut w_arr: numpy::PyReadwriteArray2<f32> = w_obj.extract()?;
+        let w_slice = w_arr.as_slice_mut()
+            .map_err(|e| HypatiaError::new_err(format!("Write weight {}: {}", i, e)))?;
+        w_slice.copy_from_slice(&w_vecs[i]);
+
+        let bias_obj = biases.get_item(i)?;
+        if !bias_obj.is_none() {
+            if let Some(ref b_data) = b_vecs[i] {
+                let mut b_arr: PyReadwriteArray1<f32> = bias_obj.extract()?;
+                let b_slice = b_arr.as_slice_mut()
+                    .map_err(|e| HypatiaError::new_err(format!("Write bias {}: {}", i, e)))?;
+                b_slice.copy_from_slice(b_data);
+            }
+        }
+    }
+
+    Ok(loss)
+}
+
+/// Batch 2D rotation using geometric algebra rotor.
+/// input: [batch, 2], theta: rotation angle in radians
+/// Returns: [batch, 2] rotated vectors
+#[pyfunction]
+pub fn ga_batch_rotate_2d<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    theta: f32,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    let cols = input.shape()[1];
+    if cols != 2 {
+        return Err(HypatiaError::new_err("Input must have 2 columns (e1, e2)"));
+    }
+    let data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+
+    let result = crate::geometric_ops::batch_rotor_2d(data, batch, theta);
+
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([batch, 2])
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+/// Batch 3D rotation using geometric algebra rotor.
+/// input: [batch, 3], axis: [3] normalized rotation axis, theta: rotation angle
+/// Returns: [batch, 3] rotated vectors
+#[pyfunction]
+pub fn ga_batch_rotate_3d<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    axis: PyReadonlyArray1<'py, f32>,
+    theta: f32,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    if input.shape()[1] != 3 {
+        return Err(HypatiaError::new_err("Input must have 3 columns (e1, e2, e3)"));
+    }
+    let ax_slice = axis.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Axis: {}", e)))?;
+    if ax_slice.len() != 3 {
+        return Err(HypatiaError::new_err("Axis must have 3 elements"));
+    }
+    let data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let axis_arr = [ax_slice[0], ax_slice[1], ax_slice[2]];
+
+    let result = crate::geometric_ops::batch_rotor_3d(data, batch, &axis_arr, theta);
+
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([batch, 3])
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+/// 2D Geometric Product layer: computes geometric product of input multivectors
+/// with learned weight multivectors.
+/// input: [batch, 4] (s, e1, e2, e12), weights: [out_features, 4]
+/// Returns: [batch, out_features * 4]
+#[pyfunction]
+pub fn ga2d_product_layer<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    weights: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    if input.shape()[1] != 4 {
+        return Err(HypatiaError::new_err("Input must have 4 columns (s, e1, e2, e12)"));
+    }
+    let out_features = weights.shape()[0];
+    if weights.shape()[1] != 4 {
+        return Err(HypatiaError::new_err("Weights must have 4 columns"));
+    }
+
+    let in_data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let w_data = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+
+    let result = crate::geometric_ops::ga2d_geometric_product_layer(in_data, w_data, batch, out_features);
+
+    let out_cols = out_features * 4;
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([batch, out_cols])
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+/// 3D Geometric Product layer.
+/// input: [batch, 8] (s, e1, e2, e3, e12, e23, e31, e123)
+/// weights: [out_features, 8]
+/// Returns: [batch, out_features * 8]
+#[pyfunction]
+pub fn ga3d_product_layer<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    weights: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    if input.shape()[1] != 8 {
+        return Err(HypatiaError::new_err("Input must have 8 columns"));
+    }
+    let out_features = weights.shape()[0];
+    if weights.shape()[1] != 8 {
+        return Err(HypatiaError::new_err("Weights must have 8 columns"));
+    }
+
+    let in_data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let w_data = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+
+    let result = crate::geometric_ops::ga3d_geometric_product_layer(in_data, w_data, batch, out_features);
+
+    let out_cols = out_features * 8;
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([batch, out_cols])
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+/// Normalize 2D multivectors.
+/// input: [batch, 4] -> output: [batch, 4] (unit multivectors)
+#[pyfunction]
+pub fn ga2d_normalize<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    if input.shape()[1] != 4 {
+        return Err(HypatiaError::new_err("Input must have 4 columns"));
+    }
+    let data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+
+    let result = crate::geometric_ops::ga2d_normalize(data, batch);
+
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([batch, 4])
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+/// Normalize 3D multivectors.
+/// input: [batch, 8] -> output: [batch, 8] (unit multivectors)
+#[pyfunction]
+pub fn ga3d_normalize<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let batch = input.shape()[0];
+    if input.shape()[1] != 8 {
+        return Err(HypatiaError::new_err("Input must have 8 columns"));
+    }
+    let data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+
+    let result = crate::geometric_ops::ga3d_normalize(data, batch);
+
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([batch, 8])
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+/// Get GPU backend info
+#[pyfunction]
+pub fn gpu_info() -> String {
+    crate::gpu_backend::gpu_info()
 }
