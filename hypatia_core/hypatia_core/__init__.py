@@ -47,6 +47,12 @@ from .sparse import SparseLinear, sparsify_model, model_sparsity_report
 # Import Mixed Precision
 from .mixed_precision import MixedPrecisionLinear, convert_to_mixed_precision, model_precision_report
 
+# Import Visualization tools
+from .visualization import (
+    visualize_expr, visualize_optimization, print_expr_tree,
+    compare_optimizations, generate_html_report, model_summary,
+)
+
 # Feature flag for verbose FX debugging
 DEBUG_FX = os.environ.get("HYPATIA_DEBUG_FX", "0") == "1"
 
@@ -187,4 +193,11 @@ __all__ = [
     "MixedPrecisionLinear",
     "convert_to_mixed_precision",
     "model_precision_report",
+    # Visualization
+    "visualize_expr",
+    "visualize_optimization",
+    "print_expr_tree",
+    "compare_optimizations",
+    "generate_html_report",
+    "model_summary",
 ]

@@ -19,6 +19,7 @@ mod geometric_ops; // Geometric algebra neural network operations
 mod neuromorphic;  // Neuromorphic computing: LIF neurons, ANN→SNN conversion
 mod sparse_ops;    // Sparse Tensor IR: CSR format, sparse-dense GEMM
 mod mixed_precision; // Mixed Precision: FP16/BF16 storage with FP32 compute
+mod visualization;   // Visualization: DOT graph export, optimization reports
 
 use pyo3::prelude::*;
 
@@ -124,6 +125,11 @@ pub fn _hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::python_bindings::to_half_precision, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::mixed_precision_forward, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::mixed_precision_stats, m)?)?;
+
+    // Visualization: DOT export, ASCII trees, optimization reports
+    m.add_function(wrap_pyfunction!(crate::python_bindings::expr_to_dot, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::expr_to_ascii_tree, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::optimization_report, m)?)?;
 
     Ok(())
 }

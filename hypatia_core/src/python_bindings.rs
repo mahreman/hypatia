@@ -2053,3 +2053,84 @@ pub fn mixed_precision_stats<'py>(
     dict.set_item("format", format.to_lowercase())?;
     Ok(dict)
 }
+
+// ============================================================================
+// Visualization
+// ============================================================================
+
+/// Convert an S-expression to GraphViz DOT format for visualization.
+///
+/// Args:
+///     expr: S-expression string, e.g. "(relu (linear w b x))"
+///     graph_name: name for the DOT graph (default: "hypatia")
+///
+/// Returns:
+///     DOT format string (can be rendered with `dot -Tpng`)
+#[pyfunction]
+#[pyo3(signature = (expr, graph_name = "hypatia"))]
+pub fn expr_to_dot(
+    expr: &str,
+    graph_name: &str,
+) -> PyResult<String> {
+    crate::visualization::sexpr_to_dot(expr, graph_name)
+        .map_err(|e| HypatiaError::new_err(e))
+}
+
+/// Convert an S-expression to an ASCII tree visualization.
+///
+/// Args:
+///     expr: S-expression string
+///
+/// Returns:
+///     ASCII tree string
+#[pyfunction]
+#[pyo3(signature = (expr,))]
+pub fn expr_to_ascii_tree(
+    expr: &str,
+) -> PyResult<String> {
+    crate::visualization::sexpr_to_ascii_tree(expr)
+        .map_err(|e| HypatiaError::new_err(e))
+}
+
+/// Build an optimization report comparing before/after S-expressions.
+///
+/// Args:
+///     input_expr: original S-expression
+///     output_expr: optimized S-expression
+///
+/// Returns:
+///     dict with report fields: input/output node counts, fusions, rewrites, etc.
+#[pyfunction]
+#[pyo3(signature = (input_expr, output_expr))]
+pub fn optimization_report<'py>(
+    py: Python<'py>,
+    input_expr: &str,
+    output_expr: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let report = crate::visualization::build_optimization_report(input_expr, output_expr)
+        .map_err(|e| HypatiaError::new_err(e))?;
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("input_expr", &report.input_expr)?;
+    dict.set_item("output_expr", &report.output_expr)?;
+    dict.set_item("input_node_count", report.input_node_count)?;
+    dict.set_item("output_node_count", report.output_node_count)?;
+    dict.set_item("node_reduction", report.node_reduction)?;
+    dict.set_item("fusions_found", report.fusions_found)?;
+    dict.set_item("rewrites_applied", report.rewrites_applied)?;
+
+    // Convert node type maps to Python dicts
+    let input_types = PyDict::new_bound(py);
+    for (k, v) in &report.input_node_types {
+        input_types.set_item(k, v)?;
+    }
+    dict.set_item("input_node_types", input_types)?;
+
+    let output_types = PyDict::new_bound(py);
+    for (k, v) in &report.output_node_types {
+        output_types.set_item(k, v)?;
+    }
+    dict.set_item("output_node_types", output_types)?;
+
+    Ok(dict)
+}
