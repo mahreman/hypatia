@@ -83,8 +83,24 @@ define_language! {
         "fused_conv_bn" = FusedConvBN([Id; 12]),
         "fused_gelu_mlp" = FusedGeluMLP([Id; 5]), // (fused_gelu_mlp w1 b1 w2 b2 x)
 
+        // --- Neuromorphic Operators (ReLU→LIF Dönüşümü) ---
+        // LIF: Leaky Integrate-and-Fire neuron
+        // (lif x v_th beta timesteps) - LIF activation replacing ReLU
+        "lif" = LIF([Id; 4]),
+        // Spike encoding/decoding for rate coding
+        // (spike_encode x timesteps) - continuous → spike train
+        "spike_encode" = SpikeEncode([Id; 2]),
+        // (spike_decode spikes timesteps) - spike train → continuous
+        "spike_decode" = SpikeDecode([Id; 2]),
+        // Fused LIF+Linear: single neuromorphic core operation
+        // (lif_linear w b x v_th beta) - synaptic + LIF in one step
+        "lif_linear" = LIFLinear([Id; 5]),
+        // Full neuromorphic pipeline for a linear+ReLU layer:
+        // (neuromorphic_linear w b x v_th beta timesteps)
+        "neuromorphic_linear" = NeuromorphicLinear([Id; 6]),
+
         // --- Temel ---
-        Constant(NotNan<f64>), 
+        Constant(NotNan<f64>),
         Var(EggSymbol),
     }
 }
@@ -151,6 +167,8 @@ impl Analysis<HypatiaLang> for ConstantFoldingAnalysis {
 // ============================================================================
 pub struct HardwareAwareCost {
     pub is_inference: bool,
+    /// When true, prefer neuromorphic operators (LIF over ReLU)
+    pub target_neuromorphic: bool,
 }
 
 impl CostFunction<HypatiaLang> for HardwareAwareCost {
@@ -170,7 +188,11 @@ impl CostFunction<HypatiaLang> for HardwareAwareCost {
             HypatiaLang::MatMul(_) => (300.0, 10.0, 0.0),
             HypatiaLang::Conv2d(_) => (500.0, 50.0, 0.0),
             HypatiaLang::Linear(_) => (100.0, 10.0, 0.0), // 2 * (m * n * k) flops, (m*k + k*n + m*n) memory
-            HypatiaLang::ReLU(_) => (1.0, 1.0, 0.0), // Cheap elementwise op
+            HypatiaLang::ReLU(_) => if self.target_neuromorphic {
+                (50.0, 10.0, 0.0) // ReLU pahalı neuromorphic'te (sürekli hesaplama)
+            } else {
+                (1.0, 1.0, 0.0) // Cheap elementwise op on GPU/CPU
+            },
             HypatiaLang::BatchNorm(_) => (50.0, 20.0, 0.0),
             HypatiaLang::Add(_) | HypatiaLang::Sub(_) => (1.0, 0.5, 0.0),
             HypatiaLang::Mul(_) => (2.0, 0.5, 0.0),
@@ -202,6 +224,34 @@ impl CostFunction<HypatiaLang> for HardwareAwareCost {
             },
             // --- YENİ MALİYETLER SONU ---
 
+            // --- Neuromorphic Operatör Maliyetleri ---
+            // Maliyet hedef donanıma göre değişir
+            HypatiaLang::LIF(_) => if self.target_neuromorphic {
+                (0.5, 0.1, 0.0)  // Neuromorphic HW: native LIF, çok ucuz
+            } else {
+                (5.0, 1.0, 0.0)  // CPU/GPU: simülasyon gerekli
+            },
+            HypatiaLang::SpikeEncode(_) => if self.target_neuromorphic {
+                (0.1, 0.1, 0.0)  // HW sensör arayüzü
+            } else {
+                (2.0, 1.0, 0.0)  // CPU: rate coding hesaplaması
+            },
+            HypatiaLang::SpikeDecode(_) => if self.target_neuromorphic {
+                (0.1, 0.1, 0.0)
+            } else {
+                (2.0, 1.0, 0.0)
+            },
+            HypatiaLang::LIFLinear(_) => if self.target_neuromorphic {
+                (5.0, 1.0, 0.0)  // Single neuromorphic core
+            } else {
+                (80.0, 5.0, 0.0) // CPU: T-step simulation
+            },
+            HypatiaLang::NeuromorphicLinear(_) => if self.target_neuromorphic {
+                (8.0, 2.0, 0.0)  // Full pipeline on neuromorphic chip
+            } else {
+                (150.0, 8.0, 0.0) // CPU: encode + T-step sim + decode
+            },
+
             _ => (0.0, 0.0, 0.0),
         };
 
@@ -217,6 +267,52 @@ impl CostFunction<HypatiaLang> for HardwareAwareCost {
 // fn is_inference_mode(_id: Id, is_inference_flag: bool) -> Option<()> {
 //     if is_inference_flag { Some(()) } else { None }
 // }
+
+fn get_rules_neuromorphic() -> Vec<Rewrite<HypatiaLang, ConstantFoldingAnalysis>> {
+    vec![
+        // =================================================================
+        // Neuromorphic Rewrite Rules: ReLU → LIF Dönüşüm Kuralları
+        // =================================================================
+
+        // KURAL N1: ReLU → Neuromorphic pipeline
+        // ReLU(x) ≈ spike_decode(LIF(spike_encode(x, T), V_th, β, T), T)
+        // Bu kural, ReLU'yu tam neuromorphic pipeline'a dönüştürür
+        rewrite!("relu-to-neuromorphic";
+            "(relu ?x)"
+            =>
+            "(spike_decode (lif (spike_encode ?x T) v_th beta T) T)"),
+
+        // KURAL N2: Linear+ReLU → Fused Neuromorphic Linear
+        // relu(linear(w,b,x)) → neuromorphic_linear(w,b,x,v_th,beta,T)
+        // Bu, sinaptik hesaplama + LIF nöronunu tek işlemde birleştirir
+        rewrite!("linear-relu-to-neuromorphic";
+            "(relu (linear ?w ?b ?x))"
+            =>
+            "(neuromorphic_linear ?w ?b ?x v_th beta T)"),
+
+        // KURAL N3: Ardışık LIF katmanları - spike encode/decode eleme
+        // spike_decode → spike_encode ortadan kalkar (zaten spike alanında)
+        rewrite!("eliminate-spike-roundtrip";
+            "(spike_encode (spike_decode ?spikes ?t1) ?t2)"
+            =>
+            "?spikes"),
+
+        // KURAL N4: LIF idempotent (ReLU gibi)
+        // LIF(LIF(x)) ≈ LIF(x) (zaten spike domain'de)
+        rewrite!("lif-idempotent";
+            "(lif (lif ?x ?vt1 ?b1 ?t1) ?vt2 ?b2 ?t2)"
+            =>
+            "(lif ?x ?vt2 ?b2 ?t2)"),
+
+        // KURAL N5: Neuromorphic Linear chain (MLP)
+        // neuromorphic_linear(w2,b2, neuromorphic_linear(w1,b1,x,...), ...)
+        // İç katmanın decode→encode'u elimine edilir
+        rewrite!("neuromorphic-chain-optimize";
+            "(neuromorphic_linear ?w2 ?b2 (spike_decode (lif (spike_encode (neuromorphic_linear ?w1 ?b1 ?x ?vt1 ?bt1 ?t1) ?t2) ?vt2 ?bt2 ?t3) ?t4) ?vt3 ?bt3 ?t5)"
+            =>
+            "(neuromorphic_linear ?w2 ?b2 (neuromorphic_linear ?w1 ?b1 ?x ?vt1 ?bt1 ?t1) ?vt3 ?bt3 ?t5)"),
+    ]
+}
 
 fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantFoldingAnalysis>> {
     // Check if fusion is enabled via environment variable
@@ -388,6 +484,17 @@ fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantF
         // Note: To actually disable, conditionally add the rule above or use a separate rules vec
     }
 
+    // --- Neuromorphic kuralları ekle (HYPATIA_TARGET_NEUROMORPHIC=1 ile aktif) ---
+    let target_neuromorphic = std::env::var("HYPATIA_TARGET_NEUROMORPHIC")
+        .ok()
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    if target_neuromorphic {
+        log::info!("Neuromorphic target enabled: adding ReLU→LIF rewrite rules");
+        rules.extend(get_rules_neuromorphic());
+    }
+
     rules
 }
 
@@ -418,6 +525,28 @@ pub fn optimize_to_ast_with_info(expr_str: &str, info: &ModuleInfo) -> Result<Re
     optimize_to_ast_internal(expr_str, info)
 }
 
+/// Neuromorphic hedef için optimizasyon.
+/// ReLU→LIF dönüşümü uygulayarak neuromorphic donanıma uygun IR üretir.
+pub fn optimize_for_neuromorphic(expr_str: &str) -> Result<RecExpr<HypatiaLang>, String> {
+    // Temporarily set env var for neuromorphic targeting
+    let prev = std::env::var("HYPATIA_TARGET_NEUROMORPHIC").ok();
+    std::env::set_var("HYPATIA_TARGET_NEUROMORPHIC", "1");
+
+    let info = ModuleInfo {
+        module_type: "Neuromorphic".to_string(),
+        has_bias: false,
+        is_inference: true,
+    };
+    let result = optimize_to_ast_internal(expr_str, &info);
+
+    // Restore previous value
+    match prev {
+        Some(v) => std::env::set_var("HYPATIA_TARGET_NEUROMORPHIC", v),
+        None => std::env::remove_var("HYPATIA_TARGET_NEUROMORPHIC"),
+    }
+    result
+}
+
 // 🟢 ADIM 3: Asıl işin yapıldığı yer burasıdır.
 fn optimize_to_ast_internal(expr_str: &str, info: &ModuleInfo) -> Result<RecExpr<HypatiaLang>, String> {
     // ✅ Task 2.4: Logging başlangıcı
@@ -446,9 +575,16 @@ fn optimize_to_ast_internal(expr_str: &str, info: &ModuleInfo) -> Result<RecExpr
         let rules = get_rules(is_inference_mode_flag);
         info!("Using {} rewrite rules (inference_mode={})", rules.len(), is_inference_mode_flag);
 
+        // Neuromorphic hedef kontrolü
+        let target_neuromorphic = std::env::var("HYPATIA_TARGET_NEUROMORPHIC")
+            .ok()
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         // Gelişmiş maliyet modelini kullan
         let cost_function = HardwareAwareCost {
-            is_inference: is_inference_mode_flag
+            is_inference: is_inference_mode_flag,
+            target_neuromorphic,
         };
 
         debug!("Starting e-graph saturation (node_limit=20000, iter_limit=30, time_limit=150ms)");
@@ -567,7 +703,15 @@ fn build_symbol(node_id: Id, rec_expr: &RecExpr<HypatiaLang>) -> Symbol {
         HypatiaLang::FusedGeluMLP([_w1, _b1, _w2, _b2, x]) => build_symbol(*x, rec_expr),
 
         HypatiaLang::FusedConvBN([_w_c, _b_c, _w_bn, _b_bn, _m, _v, x, ..]) => build_symbol(*x, rec_expr),
-        
+
+        // Neuromorphic operatörleri → Symbol dönüşümü
+        // LIF: ReLU'ya benzer semantik (firing rate ≈ ReLU)
+        HypatiaLang::LIF([x, ..]) => Symbol::ReLU(Box::new(build_symbol(*x, rec_expr))),
+        HypatiaLang::SpikeEncode([x, _t]) => build_symbol(*x, rec_expr),
+        HypatiaLang::SpikeDecode([x, _t]) => build_symbol(*x, rec_expr),
+        HypatiaLang::LIFLinear([_w, _b, x, ..]) => build_symbol(*x, rec_expr),
+        HypatiaLang::NeuromorphicLinear([_w, _b, x, ..]) => Symbol::ReLU(Box::new(build_symbol(*x, rec_expr))),
+
         // TODO: Yeni eklenen `GELU`, `SiLU`, `LayerNorm`, `BatchNorm1d` vb.
         // operatörlerin `Symbol`'e dönüşümü buraya eklenmeli.
         // Şimdilik `parse_expr_to_symbol` bu operatörler için hata verecektir.
@@ -886,5 +1030,80 @@ mod tests {
         assert!(result.contains("pow") || result.contains("sqrt"),
                 "Complex LayerNorm should optimize");
         assert!(!result.is_empty(), "Should produce valid result");
+    }
+
+    // ============================================================================
+    // Neuromorphic E-graph Tests
+    // ============================================================================
+
+    fn optimize_neuromorphic(expr_str: &str) -> String {
+        match crate::egraph_optimizer::optimize_for_neuromorphic(expr_str) {
+            Ok(best_expr) => rec_to_string(&best_expr),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn test_neuromorphic_relu_to_lif() {
+        // Neuromorphic hedefle ReLU → LIF dönüşümü
+        let result = optimize_neuromorphic("(relu x)");
+        // Should contain neuromorphic operators
+        assert!(
+            result.contains("lif") || result.contains("spike") || result.contains("neuromorphic"),
+            "ReLU should be converted to neuromorphic ops, got: {}", result
+        );
+    }
+
+    #[test]
+    fn test_neuromorphic_linear_relu_fusion() {
+        // Linear+ReLU → NeuromorphicLinear
+        let result = optimize_neuromorphic("(relu (linear w b x))");
+        assert!(
+            result.contains("neuromorphic_linear"),
+            "Linear+ReLU should become neuromorphic_linear, got: {}", result
+        );
+    }
+
+    #[test]
+    fn test_neuromorphic_spike_roundtrip_elimination() {
+        // spike_encode(spike_decode(x, T), T) → x
+        let result = optimize_neuromorphic("(spike_encode (spike_decode spikes T) T)");
+        assert_eq!(result, "spikes",
+            "Spike roundtrip should be eliminated, got: {}", result);
+    }
+
+    #[test]
+    fn test_neuromorphic_lif_idempotent() {
+        // LIF(LIF(x)) → LIF(x)
+        let result = optimize_neuromorphic("(lif (lif x v1 b1 t1) v2 b2 t2)");
+        // Should simplify nested LIF
+        let lif_count = result.matches("lif").count();
+        assert!(lif_count <= 1, "Nested LIF should be simplified, got: {}", result);
+    }
+
+    #[test]
+    fn test_neuromorphic_operators_parse() {
+        // Verify all neuromorphic operators parse correctly
+        let exprs = vec![
+            "(lif x v_th beta T)",
+            "(spike_encode x T)",
+            "(spike_decode spikes T)",
+            "(lif_linear w b x v_th beta)",
+            "(neuromorphic_linear w b x v_th beta T)",
+        ];
+        for expr in exprs {
+            let result = optimize_neuromorphic(expr);
+            assert!(!result.contains("error"), "Failed to parse: {} -> {}", expr, result);
+        }
+    }
+
+    #[test]
+    fn test_non_neuromorphic_preserves_relu() {
+        // Normal (non-neuromorphic) modda ReLU korunmalı
+        let result = optimize_ast("(relu x)");
+        assert!(
+            result.contains("relu") && !result.contains("lif"),
+            "Non-neuromorphic mode should preserve ReLU, got: {}", result
+        );
     }
 }

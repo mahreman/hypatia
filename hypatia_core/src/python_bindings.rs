@@ -1457,3 +1457,206 @@ pub fn ga3d_normalize<'py>(
 pub fn gpu_info() -> String {
     crate::gpu_backend::gpu_info()
 }
+
+// ============================================================================
+// Neuromorphic Computing: ANN→SNN, LIF Neuron Simulation
+// ============================================================================
+
+/// Convert ANN weights to SNN and run neuromorphic inference.
+///
+/// Args:
+///     layer_weights: List of (weight_2d, bias_1d_or_None) tuples
+///     input: 1D input array
+///     v_threshold: Spike threshold (default 1.0)
+///     beta: Membrane decay factor (default 0.95)
+///     timesteps: Simulation timesteps (default 32)
+///
+/// Returns:
+///     output: 1D output array (decoded firing rates)
+#[pyfunction]
+#[pyo3(signature = (layer_weights, input, v_threshold=1.0, beta=0.95, timesteps=32))]
+pub fn neuromorphic_forward<'py>(
+    py: Python<'py>,
+    layer_weights: &Bound<'py, PyList>,
+    input: PyReadonlyArray1<f32>,
+    v_threshold: f32,
+    beta: f32,
+    timesteps: usize,
+) -> PyResult<Bound<'py, PyArray1<f32>>> {
+    use crate::neuromorphic::{ANNLayer, LIFParams, ResetMode, ann_to_snn};
+
+    let input_data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+
+    // Parse layer weights from Python
+    let mut layers = Vec::new();
+    for i in 0..layer_weights.len() {
+        let item = layer_weights.get_item(i)?;
+        let tuple = item.downcast::<PyTuple>()
+            .map_err(|_| HypatiaError::new_err("Each layer must be a (weight, bias) tuple"))?;
+
+        let weight: PyReadonlyArray2<f32> = tuple.get_item(0)?.extract()?;
+        let w_shape = weight.shape().to_vec();
+        let out_feat = w_shape[0];
+        let in_feat = w_shape[1];
+        let w_data: Vec<f32> = weight.as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Weight: {}", e)))?
+            .to_vec();
+
+        let bias_item = tuple.get_item(1)?;
+        let bias_data: Option<Vec<f32>> = if bias_item.is_none() {
+            None
+        } else {
+            let b: PyReadonlyArray1<f32> = bias_item.extract()?;
+            Some(b.as_slice()
+                .map_err(|e| HypatiaError::new_err(format!("Bias: {}", e)))?
+                .to_vec())
+        };
+
+        layers.push(ANNLayer {
+            weights: w_data,
+            bias: bias_data,
+            out_features: out_feat,
+            in_features: in_feat,
+        });
+    }
+
+    let params = LIFParams {
+        v_threshold,
+        beta,
+        timesteps,
+        reset_mode: ResetMode::Soft,
+    };
+
+    let snn = ann_to_snn(layers, params);
+    let output = snn.forward(input_data);
+
+    Ok(PyArray1::from_vec_bound(py, output))
+}
+
+/// Run neuromorphic inference with spike statistics.
+///
+/// Returns: (output, stats_list)
+///   where stats_list is a list of dicts with keys:
+///   layer_idx, total_spikes, total_possible, firing_rate
+#[pyfunction]
+#[pyo3(signature = (layer_weights, input, v_threshold=1.0, beta=0.95, timesteps=32))]
+pub fn neuromorphic_forward_with_stats<'py>(
+    py: Python<'py>,
+    layer_weights: &Bound<'py, PyList>,
+    input: PyReadonlyArray1<f32>,
+    v_threshold: f32,
+    beta: f32,
+    timesteps: usize,
+) -> PyResult<(Bound<'py, PyArray1<f32>>, Bound<'py, PyList>)> {
+    use crate::neuromorphic::{ANNLayer, LIFParams, ResetMode, ann_to_snn};
+
+    let input_data = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+
+    let mut layers = Vec::new();
+    for i in 0..layer_weights.len() {
+        let item = layer_weights.get_item(i)?;
+        let tuple = item.downcast::<PyTuple>()
+            .map_err(|_| HypatiaError::new_err("Each layer must be a (weight, bias) tuple"))?;
+
+        let weight: PyReadonlyArray2<f32> = tuple.get_item(0)?.extract()?;
+        let w_shape = weight.shape().to_vec();
+        let out_feat = w_shape[0];
+        let in_feat = w_shape[1];
+        let w_data: Vec<f32> = weight.as_slice()
+            .map_err(|e| HypatiaError::new_err(format!("Weight: {}", e)))?
+            .to_vec();
+
+        let bias_item = tuple.get_item(1)?;
+        let bias_data: Option<Vec<f32>> = if bias_item.is_none() {
+            None
+        } else {
+            let b: PyReadonlyArray1<f32> = bias_item.extract()?;
+            Some(b.as_slice()
+                .map_err(|e| HypatiaError::new_err(format!("Bias: {}", e)))?
+                .to_vec())
+        };
+
+        layers.push(ANNLayer {
+            weights: w_data,
+            bias: bias_data,
+            out_features: out_feat,
+            in_features: in_feat,
+        });
+    }
+
+    let params = LIFParams {
+        v_threshold,
+        beta,
+        timesteps,
+        reset_mode: ResetMode::Soft,
+    };
+
+    let snn = ann_to_snn(layers, params);
+    let (output, stats) = snn.forward_with_stats(input_data);
+
+    let output_arr = PyArray1::from_vec_bound(py, output);
+
+    let stats_list = PyList::empty_bound(py);
+    for stat in &stats {
+        let dict = PyDict::new_bound(py);
+        dict.set_item("layer_idx", stat.layer_idx)?;
+        dict.set_item("total_spikes", stat.total_spikes)?;
+        dict.set_item("total_possible", stat.total_possible)?;
+        dict.set_item("firing_rate", stat.firing_rate)?;
+        stats_list.append(dict)?;
+    }
+
+    Ok((output_arr, stats_list))
+}
+
+/// Optimize an S-expression for neuromorphic hardware target.
+/// Applies ReLU→LIF rewrite rules via e-graph equality saturation.
+///
+/// Args:
+///     expr_str: S-expression string (e.g. "(relu (linear w b x))")
+///
+/// Returns:
+///     Optimized S-expression with neuromorphic operators
+#[pyfunction]
+pub fn optimize_for_neuromorphic(expr_str: &str) -> PyResult<String> {
+    match crate::egraph_optimizer::optimize_for_neuromorphic(expr_str) {
+        Ok(expr) => Ok(crate::egraph_optimizer::rec_to_string(&expr)),
+        Err(e) => Err(HypatiaError::new_err(format!("Neuromorphic optimization failed: {}", e))),
+    }
+}
+
+/// Estimate energy consumption for neuromorphic vs conventional execution.
+///
+/// Args:
+///     in_features: Input dimension
+///     out_features: Output dimension
+///     timesteps: Number of LIF simulation timesteps
+///     avg_firing_rate: Average neuron firing rate (0.0-1.0)
+///
+/// Returns:
+///     Dict with keys: neuromorphic_nj, conventional_nj, energy_ratio
+#[pyfunction]
+#[pyo3(signature = (in_features, out_features, timesteps=32, avg_firing_rate=0.1))]
+pub fn estimate_neuromorphic_energy<'py>(
+    py: Python<'py>,
+    in_features: usize,
+    out_features: usize,
+    timesteps: usize,
+    avg_firing_rate: f64,
+) -> PyResult<Bound<'py, PyDict>> {
+    use crate::neuromorphic::NeuromorphicEnergy;
+
+    let energy_model = NeuromorphicEnergy::default();
+    let (neuro_nj, conv_nj) = energy_model.compare_energy(
+        in_features, out_features, timesteps, avg_firing_rate,
+    );
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("neuromorphic_nj", neuro_nj)?;
+    dict.set_item("conventional_nj", conv_nj)?;
+    dict.set_item("energy_ratio", neuro_nj / conv_nj)?;
+    dict.set_item("savings_pct", (1.0 - neuro_nj / conv_nj) * 100.0)?;
+    Ok(dict)
+}

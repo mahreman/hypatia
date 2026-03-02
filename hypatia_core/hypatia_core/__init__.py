@@ -35,6 +35,9 @@ from .optimizer import optimize, count_optimizations, HypatiaTrainer
 # Import Rust-native forward pass (bypasses PyTorch dispatch)
 from .native_model import NativeModel, NativeTrainer, QuantizedModel, QuantizedTrainer, TransformerModel, GpuTransformerModel
 
+# Import Neuromorphic computing (ANN→SNN, LIF neurons)
+from .neuromorphic_model import NeuromorphicModel, compile_neuromorphic
+
 # Import GPU-aware fused modules
 from .fused_modules import FusedGeluMLP, FusedAttention, FusedLayerNorm, FusedTransformerBlock
 
@@ -162,6 +165,9 @@ __all__ = [
     "GpuTransformerModel",
     "native_forward",
     "native_train_step",
+    # Neuromorphic computing
+    "NeuromorphicModel",
+    "compile_neuromorphic",
     # GPU-aware fused modules
     "FusedGeluMLP",
     "FusedAttention",
