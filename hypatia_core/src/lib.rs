@@ -18,6 +18,7 @@ mod gpu_backend; // GPU acceleration (CUDA/Metal)
 mod geometric_ops; // Geometric algebra neural network operations
 mod neuromorphic;  // Neuromorphic computing: LIF neurons, ANN→SNN conversion
 mod sparse_ops;    // Sparse Tensor IR: CSR format, sparse-dense GEMM
+mod mixed_precision; // Mixed Precision: FP16/BF16 storage with FP32 compute
 
 use pyo3::prelude::*;
 
@@ -118,6 +119,11 @@ pub fn _hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::python_bindings::sparse_linear_forward, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::compute_sparsity_threshold, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::sparsity_stats, m)?)?;
+
+    // Mixed Precision: FP16/BF16 conversion, mixed-precision GEMM
+    m.add_function(wrap_pyfunction!(crate::python_bindings::to_half_precision, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::mixed_precision_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::mixed_precision_stats, m)?)?;
 
     Ok(())
 }

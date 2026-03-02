@@ -44,6 +44,9 @@ from .fused_modules import FusedGeluMLP, FusedAttention, FusedLayerNorm, FusedTr
 # Import Sparse Tensor IR
 from .sparse import SparseLinear, sparsify_model, model_sparsity_report
 
+# Import Mixed Precision
+from .mixed_precision import MixedPrecisionLinear, convert_to_mixed_precision, model_precision_report
+
 # Feature flag for verbose FX debugging
 DEBUG_FX = os.environ.get("HYPATIA_DEBUG_FX", "0") == "1"
 
@@ -180,4 +183,8 @@ __all__ = [
     "SparseLinear",
     "sparsify_model",
     "model_sparsity_report",
+    # Mixed Precision
+    "MixedPrecisionLinear",
+    "convert_to_mixed_precision",
+    "model_precision_report",
 ]

@@ -100,6 +100,20 @@ define_language! {
         // (to_sparse w threshold)
         "to_sparse" = ToSparse([Id; 2]),
 
+        // --- Mixed Precision Operators ---
+        // Cast operators: precision conversion nodes
+        // (cast_fp16 x) - FP32 → FP16 precision cast
+        "cast_fp16" = CastFP16(Id),
+        // (cast_bf16 x) - FP32 → BF16 precision cast
+        "cast_bf16" = CastBF16(Id),
+        // (cast_fp32 x) - half → FP32 precision cast
+        "cast_fp32" = CastFP32(Id),
+        // Mixed-precision linear: half weights, FP32 accumulation
+        // (mp_linear w b x precision) - precision is a constant hint
+        "mp_linear" = MixedPrecisionLinear([Id; 4]),
+        // Fused mixed-precision linear + ReLU
+        "fused_mp_linear_relu" = FusedMPLinearReLU([Id; 4]),
+
         // --- Neuromorphic Operators (ReLU→LIF Dönüşümü) ---
         // LIF: Leaky Integrate-and-Fire neuron
         // (lif x v_th beta timesteps) - LIF activation replacing ReLU
@@ -283,6 +297,14 @@ impl CostFunction<HypatiaLang> for HardwareAwareCost {
             HypatiaLang::FusedSparseLinearReLU(_) => (50.0, 4.0, 0.0),
             // ToSparse conversion: one-time cost, high stability penalty (avoid unnecessary conversions)
             HypatiaLang::ToSparse(_) => (5.0, 3.0, 200.0),
+
+            // --- Mixed Precision Operator Costs ---
+            // Cast operations: cheap compute, but bandwidth cost for format conversion
+            HypatiaLang::CastFP16(_) | HypatiaLang::CastBF16(_) => (1.0, 2.0, 50.0),
+            HypatiaLang::CastFP32(_) => (1.0, 2.0, 0.0), // Upcasting is always safe
+            // Mixed-precision linear: same FLOPs as dense, but 2x less memory bandwidth
+            HypatiaLang::MixedPrecisionLinear(_) => (100.0, 5.0, 0.0),
+            HypatiaLang::FusedMPLinearReLU(_) => (100.0, 4.5, 0.0),
 
             _ => (0.0, 0.0, 0.0),
         };
@@ -547,6 +569,16 @@ fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantF
         rules.extend(get_rules_sparse());
     }
 
+    // --- Mixed precision rules (HYPATIA_MIXED_PRECISION=fp16|bf16) ---
+    let mixed_precision = std::env::var("HYPATIA_MIXED_PRECISION")
+        .ok()
+        .map(|v| v.to_lowercase());
+
+    if mixed_precision.is_some() {
+        log::info!("Mixed precision enabled: adding cast elimination and fusion rules");
+        rules.extend(get_rules_mixed_precision());
+    }
+
     rules
 }
 
@@ -568,6 +600,36 @@ fn get_rules_sparse() -> Vec<Rewrite<HypatiaLang, ConstantFoldingAnalysis>> {
 
         // Sparse + dense addition (residual) is valid
         // No rewrite needed — add(sparse_result, x) works as-is since output is dense
+    ]
+}
+
+/// Mixed precision rewrite rules.
+/// Cast elimination, redundant cast removal, and MP linear fusion.
+fn get_rules_mixed_precision() -> Vec<Rewrite<HypatiaLang, ConstantFoldingAnalysis>> {
+    vec![
+        // Cast elimination: cast_fp32(cast_fp16(x)) → x (roundtrip removal)
+        rewrite!("cast-fp16-fp32-elim";
+            "(cast_fp32 (cast_fp16 ?x))" => "?x"),
+        rewrite!("cast-bf16-fp32-elim";
+            "(cast_fp32 (cast_bf16 ?x))" => "?x"),
+
+        // Double cast elimination: cast_fp16(cast_fp16(x)) → cast_fp16(x)
+        rewrite!("double-cast-fp16-elim";
+            "(cast_fp16 (cast_fp16 ?x))" => "(cast_fp16 ?x)"),
+        rewrite!("double-cast-bf16-elim";
+            "(cast_bf16 (cast_bf16 ?x))" => "(cast_bf16 ?x)"),
+        rewrite!("double-cast-fp32-elim";
+            "(cast_fp32 (cast_fp32 ?x))" => "(cast_fp32 ?x)"),
+
+        // Mixed-precision linear: linear(cast_fp16(w), b, x) → mp_linear(w, b, x, fp16)
+        rewrite!("linear-fp16-fusion";
+            "(linear (cast_fp16 ?w) ?b ?x)" => "(mp_linear ?w ?b ?x fp16)"),
+        rewrite!("linear-bf16-fusion";
+            "(linear (cast_bf16 ?w) ?b ?x)" => "(mp_linear ?w ?b ?x bf16)"),
+
+        // Fused MP linear + ReLU
+        rewrite!("mp-linear-relu-fusion";
+            "(relu (mp_linear ?w ?b ?x ?p))" => "(fused_mp_linear_relu ?w ?b ?x ?p)"),
     ]
 }
 
@@ -791,6 +853,11 @@ fn build_symbol(node_id: Id, rec_expr: &RecExpr<HypatiaLang>) -> Symbol {
         HypatiaLang::SparseLinear([_w, _b, x, _s]) => build_symbol(*x, rec_expr),
         HypatiaLang::FusedSparseLinearReLU([_w, _b, x, _s]) => Symbol::ReLU(Box::new(build_symbol(*x, rec_expr))),
         HypatiaLang::ToSparse([x, _t]) => build_symbol(*x, rec_expr),
+
+        // Mixed precision operatörleri → Symbol dönüşümü
+        HypatiaLang::CastFP16(x) | HypatiaLang::CastBF16(x) | HypatiaLang::CastFP32(x) => build_symbol(*x, rec_expr),
+        HypatiaLang::MixedPrecisionLinear([_w, _b, x, _p]) => build_symbol(*x, rec_expr),
+        HypatiaLang::FusedMPLinearReLU([_w, _b, x, _p]) => Symbol::ReLU(Box::new(build_symbol(*x, rec_expr))),
 
         // TODO: Yeni eklenen `GELU`, `SiLU`, `LayerNorm`, `BatchNorm1d` vb.
         // operatörlerin `Symbol`'e dönüşümü buraya eklenmeli.

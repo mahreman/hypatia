@@ -1892,3 +1892,164 @@ pub fn sparsity_stats<'py>(
     dict.set_item("sparse_bytes_estimate", stats.sparse_bytes_estimate)?;
     Ok(dict)
 }
+
+// ============================================================================
+// Mixed Precision: FP16/BF16
+// ============================================================================
+
+/// Convert a dense weight matrix to half-precision (FP16 or BF16).
+///
+/// Args:
+///     weights: 2D numpy array [out_features, in_features]
+///     format: "fp16" or "bf16"
+///
+/// Returns:
+///     dict with keys: data (u16 array), rows, cols, format,
+///           memory_bytes, fp32_memory_bytes, compression_ratio
+#[pyfunction]
+#[pyo3(signature = (weights, format))]
+pub fn to_half_precision<'py>(
+    py: Python<'py>,
+    weights: PyReadonlyArray2<'py, f32>,
+    format: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    use crate::mixed_precision::{self, HalfPrecision};
+
+    let precision = match format.to_lowercase().as_str() {
+        "fp16" => HalfPrecision::FP16,
+        "bf16" => HalfPrecision::BF16,
+        _ => return Err(HypatiaError::new_err(
+            format!("Invalid format '{}'. Use 'fp16' or 'bf16'", format)
+        )),
+    };
+
+    let shape = weights.shape();
+    let rows = shape[0];
+    let cols = shape[1];
+    let w = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+
+    let hw = mixed_precision::to_half_weights(w, rows, cols, precision);
+
+    let dict = PyDict::new_bound(py);
+    // Store raw u16 data as numpy array for efficient Python<->Rust transfer
+    let data_u16: Vec<u16> = hw.data.clone();
+    dict.set_item("data", PyArray1::from_vec_bound(py, data_u16))?;
+    dict.set_item("rows", rows)?;
+    dict.set_item("cols", cols)?;
+    dict.set_item("format", format.to_lowercase())?;
+    dict.set_item("memory_bytes", hw.memory_bytes())?;
+    dict.set_item("fp32_memory_bytes", hw.fp32_memory_bytes())?;
+    dict.set_item("compression_ratio", hw.compression_ratio())?;
+    Ok(dict)
+}
+
+/// Mixed-precision linear forward: output = input_f32 @ half_weight.T + bias
+///
+/// Weights are stored in half-precision (u16), computation in FP32.
+///
+/// Args:
+///     input: 2D numpy array [batch, in_features] (float32)
+///     data: 1D numpy array of u16 raw half-precision weights
+///     bias: optional 1D numpy array [out_features] (float32)
+///     rows: out_features
+///     cols: in_features
+///     format: "fp16" or "bf16"
+///     relu: apply ReLU activation
+///
+/// Returns:
+///     2D numpy array [batch, out_features] (float32)
+#[pyfunction]
+#[pyo3(signature = (input, data, bias, rows, cols, format, relu))]
+pub fn mixed_precision_forward<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    data: PyReadonlyArray1<'py, u16>,
+    bias: Option<PyReadonlyArray1<'py, f32>>,
+    rows: usize,
+    cols: usize,
+    format: &str,
+    relu: bool,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    use crate::mixed_precision::{self, HalfPrecision, HalfWeights, mixed_precision_linear, mixed_precision_linear_parallel};
+
+    let precision = match format.to_lowercase().as_str() {
+        "fp16" => HalfPrecision::FP16,
+        "bf16" => HalfPrecision::BF16,
+        _ => return Err(HypatiaError::new_err(
+            format!("Invalid format '{}'. Use 'fp16' or 'bf16'", format)
+        )),
+    };
+
+    let batch = input.shape()[0];
+    let in_feat = input.shape()[1];
+
+    if in_feat != cols {
+        return Err(HypatiaError::new_err(
+            format!("Input features ({}) != weight cols ({})", in_feat, cols)
+        ));
+    }
+
+    let x = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let raw_data = data.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Data: {}", e)))?;
+
+    let hw = HalfWeights {
+        data: raw_data.to_vec(),
+        rows,
+        cols,
+        format: precision,
+    };
+
+    let bias_vec: Option<Vec<f32>> = bias.map(|b| b.as_slice().unwrap_or(&[]).to_vec());
+    let bias_ref = bias_vec.as_deref();
+
+    let output = if batch >= 4 {
+        mixed_precision_linear_parallel(x, &hw, bias_ref, batch, relu)
+    } else {
+        mixed_precision_linear(x, &hw, bias_ref, batch, relu)
+    };
+
+    Ok(PyArray2::from_vec2_bound(py, &output.chunks(rows).map(|c| c.to_vec()).collect::<Vec<_>>())
+        .map_err(|e| HypatiaError::new_err(format!("Output array: {}", e)))?)
+}
+
+/// Analyze precision loss from FP32→half conversion.
+///
+/// Args:
+///     weights: 2D numpy array (float32)
+///     format: "fp16" or "bf16"
+///
+/// Returns:
+///     dict with precision stats
+#[pyfunction]
+#[pyo3(signature = (weights, format))]
+pub fn mixed_precision_stats<'py>(
+    py: Python<'py>,
+    weights: PyReadonlyArray2<'py, f32>,
+    format: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    use crate::mixed_precision::{self, HalfPrecision};
+
+    let precision = match format.to_lowercase().as_str() {
+        "fp16" => HalfPrecision::FP16,
+        "bf16" => HalfPrecision::BF16,
+        _ => return Err(HypatiaError::new_err(
+            format!("Invalid format '{}'. Use 'fp16' or 'bf16'", format)
+        )),
+    };
+
+    let w = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+    let stats = mixed_precision::precision_stats(w, precision);
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("total_elements", stats.total_elements)?;
+    dict.set_item("max_abs_error", stats.max_abs_error)?;
+    dict.set_item("rmse", stats.rmse)?;
+    dict.set_item("overflow_count", stats.overflow_count)?;
+    dict.set_item("underflow_count", stats.underflow_count)?;
+    dict.set_item("format", format.to_lowercase())?;
+    Ok(dict)
+}
