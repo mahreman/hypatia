@@ -1459,6 +1459,82 @@ pub fn gpu_info() -> String {
 }
 
 // ============================================================================
+// Fused Attention: Multi-Head Self-Attention (Rust Native)
+// ============================================================================
+
+/// Fused multi-head self-attention forward pass.
+///
+/// Computes Q/K/V projections, scaled dot-product attention with causal mask,
+/// and output projection in a single call using optimized GEMM kernels.
+///
+/// Args:
+///     input: [total_rows, hidden] f32 tensor (total_rows = batch * seq_len)
+///     wq, wk, wv, wo: [hidden, hidden] weight matrices
+///     bq, bk, bv, bo: [hidden] bias vectors (or None)
+///     batch: number of sequences
+///     seq_len: tokens per sequence
+///     n_heads: number of attention heads
+///
+/// Returns:
+///     [total_rows, hidden] output tensor
+#[pyfunction]
+#[pyo3(signature = (input, wq, bq, wk, bk, wv, bv, wo, bo, batch, seq_len, n_heads))]
+pub fn fused_attention_forward<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    wq: PyReadonlyArray2<'py, f32>,
+    bq: Option<PyReadonlyArray1<'py, f32>>,
+    wk: PyReadonlyArray2<'py, f32>,
+    bk: Option<PyReadonlyArray1<'py, f32>>,
+    wv: PyReadonlyArray2<'py, f32>,
+    bv: Option<PyReadonlyArray1<'py, f32>>,
+    wo: PyReadonlyArray2<'py, f32>,
+    bo: Option<PyReadonlyArray1<'py, f32>>,
+    batch: usize,
+    seq_len: usize,
+    n_heads: usize,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let total_rows = input.shape()[0];
+    let hidden = input.shape()[1];
+
+    if total_rows != batch * seq_len {
+        return Err(HypatiaError::new_err(
+            format!("input rows ({}) != batch ({}) * seq_len ({})", total_rows, batch, seq_len)
+        ));
+    }
+    if hidden % n_heads != 0 {
+        return Err(HypatiaError::new_err(
+            format!("hidden ({}) must be divisible by n_heads ({})", hidden, n_heads)
+        ));
+    }
+
+    let x = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let wq_s = wq.as_slice().map_err(|e| HypatiaError::new_err(format!("Wq: {}", e)))?;
+    let wk_s = wk.as_slice().map_err(|e| HypatiaError::new_err(format!("Wk: {}", e)))?;
+    let wv_s = wv.as_slice().map_err(|e| HypatiaError::new_err(format!("Wv: {}", e)))?;
+    let wo_s = wo.as_slice().map_err(|e| HypatiaError::new_err(format!("Wo: {}", e)))?;
+
+    let bq_v: Option<Vec<f32>> = bq.map(|b| b.as_slice().unwrap().to_vec());
+    let bk_v: Option<Vec<f32>> = bk.map(|b| b.as_slice().unwrap().to_vec());
+    let bv_v: Option<Vec<f32>> = bv.map(|b| b.as_slice().unwrap().to_vec());
+    let bo_v: Option<Vec<f32>> = bo.map(|b| b.as_slice().unwrap().to_vec());
+
+    let result = crate::native_ops::multi_head_attention(
+        x,
+        wq_s, bq_v.as_deref(),
+        wk_s, bk_v.as_deref(),
+        wv_s, bv_v.as_deref(),
+        wo_s, bo_v.as_deref(),
+        batch, seq_len, hidden, n_heads,
+    );
+
+    let flat = PyArray1::from_vec_bound(py, result);
+    flat.reshape([total_rows, hidden])
+        .map_err(|e| HypatiaError::new_err(format!("{}", e)))
+}
+
+// ============================================================================
 // Neuromorphic Computing: ANN→SNN, LIF Neuron Simulation
 // ============================================================================
 

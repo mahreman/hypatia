@@ -83,6 +83,13 @@ define_language! {
         "fused_conv_bn" = FusedConvBN([Id; 12]),
         "fused_gelu_mlp" = FusedGeluMLP([Id; 5]), // (fused_gelu_mlp w1 b1 w2 b2 x)
 
+        // Fused Multi-Head Attention: single kernel for Q/K/V projection + attention + output
+        // (fused_attention wq bq wk bk wv bv wo bo x n_heads)
+        "fused_attention" = FusedAttention([Id; 10]),
+        // Fused LayerNorm + Attention (pre-norm transformer pattern)
+        // (fused_ln_attention ln_w ln_b eps wq bq wk bk wv bv wo bo x n_heads)
+        "fused_ln_attention" = FusedLNAttention([Id; 13]),
+
         // --- Neuromorphic Operators (ReLU→LIF Dönüşümü) ---
         // LIF: Leaky Integrate-and-Fire neuron
         // (lif x v_th beta timesteps) - LIF activation replacing ReLU
@@ -194,6 +201,8 @@ impl CostFunction<HypatiaLang> for HardwareAwareCost {
                 (1.0, 1.0, 0.0) // Cheap elementwise op on GPU/CPU
             },
             HypatiaLang::BatchNorm(_) => (50.0, 20.0, 0.0),
+            // Scaled dot-product attention: 2 matmuls (QK^T, scores@V) + softmax + causal mask
+            HypatiaLang::Attention(_) => (200.0, 20.0, 0.0),
             HypatiaLang::Add(_) | HypatiaLang::Sub(_) => (1.0, 0.5, 0.0),
             HypatiaLang::Mul(_) => (2.0, 0.5, 0.0),
             HypatiaLang::Div(_) => (40.0, 0.5, 100.0),
@@ -204,6 +213,12 @@ impl CostFunction<HypatiaLang> for HardwareAwareCost {
             HypatiaLang::FusedLinearReLU(_) => (100.0, 7.0, 0.0), // Single kernel, better memory locality
             HypatiaLang::FusedMLP(_) => (200.0, 12.0, 0.0), // Two linear + ReLU fused
             HypatiaLang::FusedGeluMLP(_) => (200.0, 10.0, 0.0), // Two linear + GELU fused (MKL VML vectorized)
+            // Fused attention: Q/K/V projections + scaled dot-product + output projection
+            // Saves memory bandwidth by avoiding intermediate tensor materialization
+            // Fused attention must be cheaper than unfused: 4×linear(120ea) + attention(240) = 720
+            HypatiaLang::FusedAttention(_) => (500.0, 20.0, 0.0), // 540 total < 720 unfused
+            // Fused LayerNorm + Attention: eliminates intermediate buffer between LN and attention
+            HypatiaLang::FusedLNAttention(_) => (550.0, 20.0, 0.0),
 
             // --- YENİ EKLENEN MALİYETLER (SNIPPET 5) ---
             // Modern aktivasyonlar için maliyet
@@ -425,6 +440,15 @@ fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantF
             "(fused_gelu_mlp ?w1 ?b1 ?w2 ?b2 ?x)"),
 
         rewrite!("silu-expand";    "(silu ?x)"    =>    "(mul ?x (sigmoid ?x))"),  // SiLU = x * sigmoid(x)
+
+        // 🟢 KURAL: Full Attention Fusion (Q/K/V projections + attention + output projection)
+        // Pattern: linear(wo, bo, attention(linear(wq,bq,x), linear(wk,bk,x), linear(wv,bv,x)))
+        // → fused_attention(wq, bq, wk, bk, wv, bv, wo, bo, x, n_heads)
+        // NOTE: n_heads is determined during FX reconstruction from module metadata
+        rewrite!("attention-full-fusion";
+            "(linear ?wo ?bo (attention (linear ?wq ?bq ?x) (linear ?wk ?bk ?x) (linear ?wv ?bv ?x)))"
+            =>
+            "(fused_attention ?wq ?bq ?wk ?bk ?wv ?bv ?wo ?bo ?x ?x)"),
 
         // --- Ardışık Normalization Optimizasyonu ---
         rewrite!("double-norm-elimination";
@@ -703,6 +727,8 @@ fn build_symbol(node_id: Id, rec_expr: &RecExpr<HypatiaLang>) -> Symbol {
         HypatiaLang::FusedGeluMLP([_w1, _b1, _w2, _b2, x]) => build_symbol(*x, rec_expr),
 
         HypatiaLang::FusedConvBN([_w_c, _b_c, _w_bn, _b_bn, _m, _v, x, ..]) => build_symbol(*x, rec_expr),
+        HypatiaLang::FusedAttention([_wq, _bq, _wk, _bk, _wv, _bv, _wo, _bo, x, ..]) => build_symbol(*x, rec_expr),
+        HypatiaLang::FusedLNAttention([_lnw, _lnb, _eps, _wq, _bq, _wk, _bk, _wv, _bv, _wo, _bo, x, ..]) => build_symbol(*x, rec_expr),
 
         // Neuromorphic operatörleri → Symbol dönüşümü
         // LIF: ReLU'ya benzer semantik (firing rate ≈ ReLU)

@@ -100,6 +100,9 @@ pub fn _hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::python_bindings::ga2d_normalize, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::ga3d_normalize, m)?)?;
 
+    // Fused multi-head attention (Rust native)
+    m.add_function(wrap_pyfunction!(crate::python_bindings::fused_attention_forward, m)?)?;
+
     // GPU backend info
     m.add_function(wrap_pyfunction!(crate::python_bindings::gpu_info, m)?)?;
 

@@ -591,12 +591,93 @@ def dispatch_fused_linear_relu(input, weight, bias):
     return F.relu(F.linear(input, weight, bias))
 
 
+def dispatch_fused_attention(input, wq, bq, wk, bk, wv, bv, wo, bo, n_heads):
+    """Auto-dispatch fused multi-head self-attention.
+
+    GPU -> CUDA fused attention kernel
+    CPU -> Rust native multi_head_attention (strided GEMM)
+    Fallback -> PyTorch ops
+
+    Args:
+        input: [batch*seq_len, hidden] tensor
+        wq, wk, wv, wo: [hidden, hidden] weight tensors
+        bq, bk, bv, bo: [hidden] bias tensors or None
+        n_heads: number of attention heads
+
+    Returns:
+        [batch*seq_len, hidden] output tensor
+    """
+    # GPU: try CUDA fused attention kernel
+    if input.is_cuda and _has_ext("fused_attention"):
+        ext = _get_ext("fused_attention")
+        return ext.forward(input, wq, bq, wk, bk, wv, bv, wo, bo, n_heads)
+
+    # CPU: try Rust native kernel (optimized strided GEMM)
+    if not input.is_cuda:
+        try:
+            from _hypatia_core import fused_attention_forward
+            import numpy as np
+
+            x_np = input.detach().cpu().numpy()
+            total_rows, hidden = x_np.shape
+
+            # Infer batch and seq_len from input shape
+            # Default: batch=1, seq_len=total_rows
+            batch = 1
+            seq_len = total_rows
+
+            wq_np = wq.detach().cpu().numpy()
+            wk_np = wk.detach().cpu().numpy()
+            wv_np = wv.detach().cpu().numpy()
+            wo_np = wo.detach().cpu().numpy()
+
+            bq_np = bq.detach().cpu().numpy() if bq is not None else None
+            bk_np = bk.detach().cpu().numpy() if bk is not None else None
+            bv_np = bv.detach().cpu().numpy() if bv is not None else None
+            bo_np = bo.detach().cpu().numpy() if bo is not None else None
+
+            result = fused_attention_forward(
+                x_np, wq_np, bq_np, wk_np, bk_np, wv_np, bv_np, wo_np, bo_np,
+                batch, seq_len, n_heads,
+            )
+            return torch.from_numpy(np.array(result)).to(input.device, input.dtype)
+        except (ImportError, RuntimeError):
+            pass
+
+    # Final fallback: PyTorch ops
+    total_rows = input.size(0)
+    hidden = input.size(1)
+    head_dim = hidden // n_heads
+
+    q = F.linear(input, wq, bq)  # [total_rows, hidden]
+    k = F.linear(input, wk, bk)
+    v = F.linear(input, wv, bv)
+
+    # Reshape to [batch*n_heads, seq_len, head_dim] for bmm
+    # Assume batch=1 for simplicity
+    q = q.view(total_rows, n_heads, head_dim).permute(1, 0, 2)
+    k = k.view(total_rows, n_heads, head_dim).permute(1, 0, 2)
+    v = v.view(total_rows, n_heads, head_dim).permute(1, 0, 2)
+
+    scale = 1.0 / (head_dim ** 0.5)
+    scores = torch.bmm(q, k.transpose(1, 2)) * scale
+
+    # Causal mask
+    mask = torch.ones(total_rows, total_rows, device=input.device, dtype=input.dtype).triu(1) * (-1e9)
+    scores = scores + mask.unsqueeze(0)
+    scores = F.softmax(scores, dim=-1)
+
+    attn_out = torch.bmm(scores, v)
+    attn_out = attn_out.permute(1, 0, 2).contiguous().view(total_rows, hidden)
+    return F.linear(attn_out, wo, bo)
+
+
 __all__ = [
     "FusedLinearReLU", "HypatiaFusedLinearReLU", "FusedLinearReLUFunction",
     "create_fused_linear_relu_from_tensors", "FusedMLP", "create_fused_mlp_from_tensors",
     "FusedGeluMLP", "FusedGeluMLPFunction",
     "FusedAttention", "FusedLayerNorm", "FusedTransformerBlock",
-    "dispatch_fused_gelu_mlp", "dispatch_fused_linear_relu",
+    "dispatch_fused_gelu_mlp", "dispatch_fused_linear_relu", "dispatch_fused_attention",
 ]
 
 # Eager load CUDA extensions when module is imported
