@@ -1,6 +1,9 @@
 """
 Hypatia GPU/CUDA Benchmark Script
 RTX 4070 ile test icin: python gpu_test.py
+
+Rust build gerekli DEGIL - CUDA kernelleri torch.utils.cpp_extension ile
+JIT derlenir. Sadece PyTorch CUDA gerekli.
 """
 import torch
 import torch.nn as nn
@@ -10,7 +13,44 @@ import sys
 import os
 
 # Hypatia'yi bul
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "hypatia_core"))
+base_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(base_dir, "hypatia_core"))
+
+# Mock _hypatia_core if Rust module not available (Windows without cargo build)
+try:
+    import _hypatia_core
+except ImportError:
+    # Create a minimal mock so fused_modules.py can import
+    import types
+    mock = types.ModuleType("_hypatia_core")
+    mock.compile_fx_graph = None
+    mock.optimize_ast = None
+    mock.parse_expr = None
+    mock.is_equivalent = None
+    mock.Symbol = None
+    mock.PyMultiVector2D = None
+    mock.PyMultiVector3D = None
+    mock.HypatiaError = type("HypatiaError", (Exception,), {})
+    mock.HypatiaCompileResult = None
+    mock.set_log_level = lambda *a: None
+    mock.native_forward = None
+    mock.native_train_step = None
+    mock.quantize_weights = None
+    mock.quantized_forward = None
+    mock.transformer_forward_py = None
+    mock.quantized_train_step = None
+    mock.fused_gelu_mlp_forward = None
+    mock.fused_linear_relu_forward = None
+    sys.modules["_hypatia_core"] = mock
+    print("[Note] Rust module (_hypatia_core) not available - using CUDA-only mode")
+
+# Try importing hypatia_core (may fail partially without Rust, that's OK)
+try:
+    import hypatia_core
+    print("[Hypatia] Full module loaded")
+except Exception as e:
+    print(f"[Hypatia] Partial load (no Rust): {e}")
+    # Direct import of fused_modules still works for CUDA testing
 
 print("=" * 60)
 print("  HYPATIA GPU BENCHMARK")
@@ -20,7 +60,9 @@ print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"CUDA version: {torch.version.cuda}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    props = torch.cuda.get_device_properties(0)
+    mem = getattr(props, 'total_memory', None) or getattr(props, 'total_mem', 0)
+    print(f"GPU Memory: {mem / 1e9:.1f} GB")
 else:
     print("WARNING: CUDA not available! Running CPU-only tests.")
 print()
