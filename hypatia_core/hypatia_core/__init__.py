@@ -53,6 +53,11 @@ from .visualization import (
     compare_optimizations, generate_html_report, model_summary,
 )
 
+# Import Semantic Validation
+from .semantic_validation import (
+    validate_expr, validate_structure, validate_models, SemanticValidator,
+)
+
 # Feature flag for verbose FX debugging
 DEBUG_FX = os.environ.get("HYPATIA_DEBUG_FX", "0") == "1"
 
@@ -200,4 +205,9 @@ __all__ = [
     "compare_optimizations",
     "generate_html_report",
     "model_summary",
+    # Semantic Validation
+    "validate_expr",
+    "validate_structure",
+    "validate_models",
+    "SemanticValidator",
 ]

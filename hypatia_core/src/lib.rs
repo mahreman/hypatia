@@ -20,6 +20,7 @@ mod neuromorphic;  // Neuromorphic computing: LIF neurons, ANN→SNN conversion
 mod sparse_ops;    // Sparse Tensor IR: CSR format, sparse-dense GEMM
 mod mixed_precision; // Mixed Precision: FP16/BF16 storage with FP32 compute
 mod visualization;   // Visualization: DOT graph export, optimization reports
+mod semantic_validation; // Semantic Validation: output equivalence checking
 
 use pyo3::prelude::*;
 
@@ -130,6 +131,11 @@ pub fn _hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::python_bindings::expr_to_dot, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::expr_to_ascii_tree, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::optimization_report, m)?)?;
+
+    // Semantic Validation: output equivalence checking
+    m.add_function(wrap_pyfunction!(crate::python_bindings::validate_sexpr, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::validate_optimization_py, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::validate_model_outputs, m)?)?;
 
     Ok(())
 }

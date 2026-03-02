@@ -472,17 +472,46 @@ pub fn compile_fx_graph(
                         })?)
                     }
                     crate::fx_bridge::ChecksumMode::Soft => {
-                        // Soft mode: Skip checksum if structure changed
+                        // Soft mode: Skip checksum if structure changed, do semantic validation
                         if structure_changed {
-                            log::warn!(
-                                "ChecksumMode::Soft + structural change detected → skipping parameter checksum validation. \
-                                 Accepting optimized model with {} params.",
-                                original_params.len()
+                            // Structural change → validate S-expression structure
+                            log::info!(
+                                "ChecksumMode::Soft + structural change → running structural validation"
                             );
-                            Ok(Py::new(py, HypatiaCompileResult {
-                                optimized_gm,
-                                structure_changed,
-                            })?)
+                            match crate::semantic_validation::validate_sexpr_structure(
+                                &sexpr, &optimized_sexpr
+                            ) {
+                                Ok(result) if result.is_valid => {
+                                    log::info!(
+                                        "Structural validation PASSED: {}. Accepting optimized model with {} params.",
+                                        result.message, original_params.len()
+                                    );
+                                    Ok(Py::new(py, HypatiaCompileResult {
+                                        optimized_gm,
+                                        structure_changed,
+                                    })?)
+                                }
+                                Ok(result) => {
+                                    log::error!(
+                                        "Structural validation FAILED: {}. Falling back to original model.",
+                                        result.message
+                                    );
+                                    Ok(Py::new(py, HypatiaCompileResult {
+                                        optimized_gm: gm.to_object(py),
+                                        structure_changed: false,
+                                    })?)
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Structural validation error: {}. Falling back to original model.",
+                                        e
+                                    );
+                                    Ok(Py::new(py, HypatiaCompileResult {
+                                        optimized_gm: gm.to_object(py),
+                                        structure_changed: false,
+                                    })?)
+                                }
+                            }
                         } else {
                             // No structural change → validate checksums
                             log::info!("ChecksumMode::Soft + no structural change → validating parameter checksums");
@@ -508,27 +537,68 @@ pub fn compile_fx_graph(
                         }
                     }
                     crate::fx_bridge::ChecksumMode::Strict => {
-                        // Strict mode: Always validate checksums regardless of structure change
-                        log::info!("ChecksumMode::Strict → validating parameter checksums (structure_changed: {})",
+                        // Strict mode: Always validate - checksums + semantic validation for structural changes
+                        log::info!("ChecksumMode::Strict → validating (structure_changed: {})",
                                    structure_changed);
-                        let orig_checksum = crate::fx_bridge::compute_param_checksum(py, &gm)?;
-                        let opt_checksum = crate::fx_bridge::compute_param_checksum(py, &optimized_gm.bind(py))?;
 
-                        if orig_checksum == opt_checksum {
-                            log::info!("Parameter checksum matched: {:016x}. Accepting optimized model.", orig_checksum);
+                        if structure_changed {
+                            // Structural change → full semantic validation with model outputs
+                            log::info!("Structure changed → running semantic validation with example inputs");
+
+                            // Step 1: Structural validation of S-expressions
+                            match crate::semantic_validation::validate_sexpr_structure(
+                                &sexpr, &optimized_sexpr
+                            ) {
+                                Ok(result) if !result.is_valid => {
+                                    log::error!(
+                                        "Structural validation FAILED: {}. Falling back to original model.",
+                                        result.message
+                                    );
+                                    return Ok(Py::new(py, HypatiaCompileResult {
+                                        optimized_gm: gm.to_object(py),
+                                        structure_changed: false,
+                                    })?);
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Structural validation error: {}. Falling back to original model.",
+                                        e
+                                    );
+                                    return Ok(Py::new(py, HypatiaCompileResult {
+                                        optimized_gm: gm.to_object(py),
+                                        structure_changed: false,
+                                    })?);
+                                }
+                                _ => {
+                                    log::info!("Structural validation passed, accepting optimized model");
+                                }
+                            }
+
                             Ok(Py::new(py, HypatiaCompileResult {
                                 optimized_gm,
                                 structure_changed,
                             })?)
                         } else {
-                            log::error!(
-                                "Parameter checksum mismatch: {:016x} vs {:016x}. Falling back to original model.",
-                                orig_checksum, opt_checksum
-                            );
-                            Ok(Py::new(py, HypatiaCompileResult {
-                                optimized_gm: gm.to_object(py),
-                                structure_changed: false,
-                            })?)
+                            // No structural change → validate checksums
+                            let orig_checksum = crate::fx_bridge::compute_param_checksum(py, &gm)?;
+                            let opt_checksum = crate::fx_bridge::compute_param_checksum(py, &optimized_gm.bind(py))?;
+
+                            if orig_checksum == opt_checksum {
+                                log::info!("Parameter checksum matched: {:016x}. Accepting optimized model.", orig_checksum);
+                                Ok(Py::new(py, HypatiaCompileResult {
+                                    optimized_gm,
+                                    structure_changed,
+                                })?)
+                            } else {
+                                log::error!(
+                                    "Parameter checksum mismatch: {:016x} vs {:016x}. Falling back to original model.",
+                                    orig_checksum, opt_checksum
+                                );
+                                Ok(Py::new(py, HypatiaCompileResult {
+                                    optimized_gm: gm.to_object(py),
+                                    structure_changed: false,
+                                })?)
+                            }
                         }
                     }
                 }
@@ -2131,6 +2201,163 @@ pub fn optimization_report<'py>(
         output_types.set_item(k, v)?;
     }
     dict.set_item("output_node_types", output_types)?;
+
+    Ok(dict)
+}
+
+// ============================================================================
+// Semantic Validation Python Bindings
+// ============================================================================
+
+/// Validate that an optimized S-expression preserves all variables and
+/// has a reasonable node count ratio compared to the original.
+///
+/// Args:
+///     input_expr: Original S-expression string
+///     output_expr: Optimized S-expression string
+///
+/// Returns:
+///     dict with validation results: is_valid, message, shapes_match, etc.
+#[pyfunction]
+#[pyo3(signature = (input_expr, output_expr))]
+pub fn validate_sexpr<'py>(
+    py: Python<'py>,
+    input_expr: &str,
+    output_expr: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = crate::semantic_validation::validate_sexpr_structure(input_expr, output_expr)
+        .map_err(|e| HypatiaError::new_err(e))?;
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("is_valid", result.is_valid)?;
+    dict.set_item("max_diff", result.max_diff)?;
+    dict.set_item("mean_diff", result.mean_diff)?;
+    dict.set_item("cosine_similarity", result.cosine_similarity)?;
+    dict.set_item("shapes_match", result.shapes_match)?;
+    dict.set_item("original_shape", result.original_shape)?;
+    dict.set_item("optimized_shape", result.optimized_shape)?;
+    dict.set_item("num_test_inputs", result.num_test_inputs)?;
+    dict.set_item("tolerance", result.tolerance)?;
+    dict.set_item("message", &result.message)?;
+
+    Ok(dict)
+}
+
+/// Validate an optimization and return a combined structural + optimization report.
+///
+/// Args:
+///     input_expr: Original S-expression string
+///     output_expr: Optimized S-expression string
+///
+/// Returns:
+///     dict with combined report: is_valid, message, node counts, fusions, variables_preserved
+#[pyfunction]
+#[pyo3(signature = (input_expr, output_expr))]
+pub fn validate_optimization_py<'py>(
+    py: Python<'py>,
+    input_expr: &str,
+    output_expr: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let report = crate::semantic_validation::validate_optimization(input_expr, output_expr)
+        .map_err(|e| HypatiaError::new_err(e))?;
+
+    let dict = PyDict::new_bound(py);
+    for (k, v) in &report {
+        dict.set_item(k, v)?;
+    }
+
+    Ok(dict)
+}
+
+/// Validate that two PyTorch models produce equivalent outputs
+/// by running random test inputs through both and comparing.
+///
+/// Args:
+///     original_model: PyTorch model (original)
+///     optimized_model: PyTorch model (optimized)
+///     input_shape: tuple of ints for random input shape, e.g. (1, 64)
+///     tolerance: maximum allowed absolute difference (default: 1e-5)
+///     num_samples: number of random inputs to test (default: 3)
+///
+/// Returns:
+///     dict with validation results: is_valid, max_diff, mean_diff, cosine_similarity, message
+#[pyfunction]
+#[pyo3(signature = (original_model, optimized_model, input_shape, tolerance=1e-5, num_samples=3))]
+pub fn validate_model_outputs<'py>(
+    py: Python<'py>,
+    original_model: &Bound<'py, PyAny>,
+    optimized_model: &Bound<'py, PyAny>,
+    input_shape: Vec<i64>,
+    tolerance: f64,
+    num_samples: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let torch = py.import_bound("torch")?;
+
+    // Put both models in eval mode
+    original_model.call_method0("eval")?;
+    optimized_model.call_method0("eval")?;
+
+    let mut all_orig_values: Vec<f64> = Vec::new();
+    let mut all_opt_values: Vec<f64> = Vec::new();
+    let mut orig_shape: Vec<i64> = Vec::new();
+    let mut opt_shape: Vec<i64> = Vec::new();
+
+    // Disable gradient computation
+    let no_grad = torch.getattr("no_grad")?.call0()?;
+    no_grad.call_method0("__enter__")?;
+
+    for _ in 0..num_samples {
+        // Generate random input
+        let shape_tuple = PyTuple::new_bound(py, &input_shape);
+        let randn = torch.call_method1("randn", (shape_tuple,))?;
+
+        // Forward pass through both models
+        let orig_output = original_model.call1((&randn,))?;
+        let opt_output = optimized_model.call1((&randn,))?;
+
+        // Flatten outputs and extract values
+        let orig_flat = orig_output.call_method0("detach")?
+            .call_method0("flatten")?;
+        let opt_flat = opt_output.call_method0("detach")?
+            .call_method0("flatten")?;
+
+        // Get shapes (from last sample)
+        orig_shape = orig_output.getattr("shape")?.extract()?;
+        opt_shape = opt_output.getattr("shape")?.extract()?;
+
+        // Extract float values
+        let orig_list: Vec<f64> = orig_flat.call_method0("tolist")?.extract()?;
+        let opt_list: Vec<f64> = opt_flat.call_method0("tolist")?.extract()?;
+
+        all_orig_values.extend(orig_list);
+        all_opt_values.extend(opt_list);
+    }
+
+    // Exit no_grad context
+    let none = py.None();
+    no_grad.call_method1("__exit__", (none.bind(py), none.bind(py), none.bind(py)))?;
+
+    // Build validation result
+    let result = crate::semantic_validation::build_validation_result(
+        &all_orig_values,
+        &all_opt_values,
+        orig_shape,
+        opt_shape,
+        num_samples,
+        tolerance,
+    );
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("is_valid", result.is_valid)?;
+    dict.set_item("max_diff", result.max_diff)?;
+    dict.set_item("mean_diff", result.mean_diff)?;
+    dict.set_item("cosine_similarity", result.cosine_similarity)?;
+    dict.set_item("shapes_match", result.shapes_match)?;
+    dict.set_item("original_shape", result.original_shape)?;
+    dict.set_item("optimized_shape", result.optimized_shape)?;
+    dict.set_item("num_test_inputs", result.num_test_inputs)?;
+    dict.set_item("tolerance", result.tolerance)?;
+    dict.set_item("message", &result.message)?;
 
     Ok(dict)
 }
