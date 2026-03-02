@@ -41,6 +41,9 @@ from .neuromorphic_model import NeuromorphicModel, compile_neuromorphic
 # Import GPU-aware fused modules
 from .fused_modules import FusedGeluMLP, FusedAttention, FusedLayerNorm, FusedTransformerBlock
 
+# Import Sparse Tensor IR
+from .sparse import SparseLinear, sparsify_model, model_sparsity_report
+
 # Feature flag for verbose FX debugging
 DEBUG_FX = os.environ.get("HYPATIA_DEBUG_FX", "0") == "1"
 
@@ -173,4 +176,8 @@ __all__ = [
     "FusedAttention",
     "FusedLayerNorm",
     "FusedTransformerBlock",
+    # Sparse Tensor IR
+    "SparseLinear",
+    "sparsify_model",
+    "model_sparsity_report",
 ]

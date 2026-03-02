@@ -90,6 +90,16 @@ define_language! {
         // (fused_ln_attention ln_w ln_b eps wq bq wk bk wv bv wo bo x n_heads)
         "fused_ln_attention" = FusedLNAttention([Id; 13]),
 
+        // --- Sparse Tensor Operators ---
+        // Sparse linear: CSR weight × dense input (magnitude-pruned models)
+        // (sparse_linear w b x sparsity) - sparsity is a constant hint
+        "sparse_linear" = SparseLinear([Id; 4]),
+        // Fused sparse linear + ReLU
+        "fused_sparse_linear_relu" = FusedSparseLinearReLU([Id; 4]),
+        // Dense → Sparse conversion (threshold pruning)
+        // (to_sparse w threshold)
+        "to_sparse" = ToSparse([Id; 2]),
+
         // --- Neuromorphic Operators (ReLU→LIF Dönüşümü) ---
         // LIF: Leaky Integrate-and-Fire neuron
         // (lif x v_th beta timesteps) - LIF activation replacing ReLU
@@ -266,6 +276,13 @@ impl CostFunction<HypatiaLang> for HardwareAwareCost {
             } else {
                 (150.0, 8.0, 0.0) // CPU: encode + T-step sim + decode
             },
+
+            // --- Sparse Tensor Operator Costs ---
+            // Sparse linear: ~50% FLOPs of dense at 50% sparsity, less memory bandwidth
+            HypatiaLang::SparseLinear(_) => (50.0, 5.0, 0.0),
+            HypatiaLang::FusedSparseLinearReLU(_) => (50.0, 4.0, 0.0),
+            // ToSparse conversion: one-time cost, high stability penalty (avoid unnecessary conversions)
+            HypatiaLang::ToSparse(_) => (5.0, 3.0, 200.0),
 
             _ => (0.0, 0.0, 0.0),
         };
@@ -519,7 +536,39 @@ fn get_rules(is_inference_mode_flag: bool) -> Vec<Rewrite<HypatiaLang, ConstantF
         rules.extend(get_rules_neuromorphic());
     }
 
+    // --- Sparse optimization rules (HYPATIA_ENABLE_SPARSE=1) ---
+    let enable_sparse = std::env::var("HYPATIA_ENABLE_SPARSE")
+        .ok()
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    if enable_sparse {
+        log::info!("Sparse optimization enabled: adding dense→sparse rewrite rules");
+        rules.extend(get_rules_sparse());
+    }
+
     rules
+}
+
+/// Sparse optimization rewrite rules.
+/// Converts dense linear operations to sparse when beneficial.
+fn get_rules_sparse() -> Vec<Rewrite<HypatiaLang, ConstantFoldingAnalysis>> {
+    vec![
+        // Dense linear → sparse linear (when weight is marked sparse via to_sparse)
+        rewrite!("linear-to-sparse";
+            "(linear (to_sparse ?w ?threshold) ?b ?x)"
+            =>
+            "(sparse_linear ?w ?b ?x ?threshold)"),
+
+        // Fused sparse linear + ReLU
+        rewrite!("sparse-linear-relu-fusion";
+            "(relu (sparse_linear ?w ?b ?x ?s))"
+            =>
+            "(fused_sparse_linear_relu ?w ?b ?x ?s)"),
+
+        // Sparse + dense addition (residual) is valid
+        // No rewrite needed — add(sparse_result, x) works as-is since output is dense
+    ]
 }
 
 // ============================================================================
@@ -737,6 +786,11 @@ fn build_symbol(node_id: Id, rec_expr: &RecExpr<HypatiaLang>) -> Symbol {
         HypatiaLang::SpikeDecode([x, _t]) => build_symbol(*x, rec_expr),
         HypatiaLang::LIFLinear([_w, _b, x, ..]) => build_symbol(*x, rec_expr),
         HypatiaLang::NeuromorphicLinear([_w, _b, x, ..]) => Symbol::ReLU(Box::new(build_symbol(*x, rec_expr))),
+
+        // Sparse operatörleri → Symbol dönüşümü
+        HypatiaLang::SparseLinear([_w, _b, x, _s]) => build_symbol(*x, rec_expr),
+        HypatiaLang::FusedSparseLinearReLU([_w, _b, x, _s]) => Symbol::ReLU(Box::new(build_symbol(*x, rec_expr))),
+        HypatiaLang::ToSparse([x, _t]) => build_symbol(*x, rec_expr),
 
         // TODO: Yeni eklenen `GELU`, `SiLU`, `LayerNorm`, `BatchNorm1d` vb.
         // operatörlerin `Symbol`'e dönüşümü buraya eklenmeli.

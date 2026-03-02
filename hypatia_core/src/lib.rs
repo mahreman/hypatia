@@ -17,6 +17,7 @@ mod quantize;    // INT4 block quantization for large models
 mod gpu_backend; // GPU acceleration (CUDA/Metal)
 mod geometric_ops; // Geometric algebra neural network operations
 mod neuromorphic;  // Neuromorphic computing: LIF neurons, ANN→SNN conversion
+mod sparse_ops;    // Sparse Tensor IR: CSR format, sparse-dense GEMM
 
 use pyo3::prelude::*;
 
@@ -111,6 +112,12 @@ pub fn _hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::python_bindings::neuromorphic_forward_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::optimize_for_neuromorphic, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::estimate_neuromorphic_energy, m)?)?;
+
+    // Sparse Tensor IR: CSR conversion, sparse GEMM, pruning
+    m.add_function(wrap_pyfunction!(crate::python_bindings::to_sparse_csr, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::sparse_linear_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::compute_sparsity_threshold, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::sparsity_stats, m)?)?;
 
     Ok(())
 }

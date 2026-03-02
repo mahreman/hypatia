@@ -1736,3 +1736,159 @@ pub fn estimate_neuromorphic_energy<'py>(
     dict.set_item("savings_pct", (1.0 - neuro_nj / conv_nj) * 100.0)?;
     Ok(dict)
 }
+
+// ============================================================================
+// Sparse Tensor IR
+// ============================================================================
+
+/// Convert a dense weight matrix to CSR sparse format.
+///
+/// Args:
+///     weights: 2D numpy array [out_features, in_features]
+///     threshold: minimum absolute value to keep (magnitude pruning)
+///
+/// Returns:
+///     dict with keys: row_ptrs, col_indices, values, rows, cols, nnz,
+///           sparsity, compression_ratio, memory_bytes, dense_memory_bytes
+#[pyfunction]
+#[pyo3(signature = (weights, threshold))]
+pub fn to_sparse_csr<'py>(
+    py: Python<'py>,
+    weights: PyReadonlyArray2<'py, f32>,
+    threshold: f32,
+) -> PyResult<Bound<'py, PyDict>> {
+    use crate::sparse_ops;
+
+    let shape = weights.shape();
+    let rows = shape[0];
+    let cols = shape[1];
+    let w = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+
+    let csr = sparse_ops::to_sparse_csr(w, rows, cols, threshold);
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("row_ptrs", csr.row_ptrs.iter().map(|&v| v as u64).collect::<Vec<_>>())?;
+    dict.set_item("col_indices", csr.col_indices.iter().map(|&v| v as u64).collect::<Vec<_>>())?;
+    dict.set_item("values", PyArray1::from_slice_bound(py, &csr.values))?;
+    dict.set_item("rows", rows)?;
+    dict.set_item("cols", cols)?;
+    dict.set_item("nnz", csr.nnz())?;
+    dict.set_item("sparsity", csr.sparsity())?;
+    dict.set_item("compression_ratio", csr.compression_ratio())?;
+    dict.set_item("memory_bytes", csr.memory_bytes())?;
+    dict.set_item("dense_memory_bytes", csr.dense_memory_bytes())?;
+    Ok(dict)
+}
+
+/// Sparse linear forward: output = input @ sparse_weight.T + bias
+///
+/// Args:
+///     input: 2D numpy array [batch, in_features]
+///     row_ptrs: CSR row pointers (list of ints)
+///     col_indices: CSR column indices (list of ints)
+///     values: CSR non-zero values (1D numpy array)
+///     bias: optional 1D numpy array [out_features]
+///     rows: number of output features
+///     cols: number of input features
+///     relu: apply ReLU activation
+///
+/// Returns:
+///     2D numpy array [batch, out_features]
+#[pyfunction]
+#[pyo3(signature = (input, row_ptrs, col_indices, values, bias, rows, cols, relu))]
+pub fn sparse_linear_forward<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    row_ptrs: Vec<usize>,
+    col_indices: Vec<usize>,
+    values: PyReadonlyArray1<'py, f32>,
+    bias: Option<PyReadonlyArray1<'py, f32>>,
+    rows: usize,
+    cols: usize,
+    relu: bool,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    use crate::sparse_ops::{SparseWeightCSR, sparse_linear, sparse_linear_parallel};
+
+    let batch = input.shape()[0];
+    let in_feat = input.shape()[1];
+
+    if in_feat != cols {
+        return Err(HypatiaError::new_err(
+            format!("Input features ({}) != CSR cols ({})", in_feat, cols)
+        ));
+    }
+
+    let x = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let vals = values.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Values: {}", e)))?;
+
+    let csr = SparseWeightCSR {
+        row_ptrs,
+        col_indices,
+        values: vals.to_vec(),
+        rows,
+        cols,
+    };
+
+    let bias_vec: Option<Vec<f32>> = bias.map(|b| {
+        b.as_slice().unwrap_or(&[]).to_vec()
+    });
+    let bias_ref = bias_vec.as_deref();
+
+    let output = if batch >= 4 {
+        sparse_linear_parallel(x, &csr, bias_ref, batch, relu)
+    } else {
+        sparse_linear(x, &csr, bias_ref, batch, relu)
+    };
+
+    Ok(PyArray2::from_vec2_bound(py, &output.chunks(rows).map(|c| c.to_vec()).collect::<Vec<_>>())
+        .map_err(|e| HypatiaError::new_err(format!("Output array: {}", e)))?)
+}
+
+/// Compute magnitude pruning threshold for a target sparsity.
+///
+/// Args:
+///     weights: 2D numpy array
+///     sparsity: target sparsity ratio (0.0-1.0), e.g. 0.5 = 50% zeros
+///
+/// Returns:
+///     float threshold value
+#[pyfunction]
+#[pyo3(signature = (weights, sparsity))]
+pub fn compute_sparsity_threshold(
+    weights: PyReadonlyArray2<f32>,
+    sparsity: f32,
+) -> PyResult<f32> {
+    let w = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+    Ok(crate::sparse_ops::compute_pruning_threshold(w, sparsity))
+}
+
+/// Get sparsity statistics for a weight matrix.
+///
+/// Args:
+///     weights: 2D numpy array
+///
+/// Returns:
+///     dict with sparsity stats
+#[pyfunction]
+#[pyo3(signature = (weights,))]
+pub fn sparsity_stats<'py>(
+    py: Python<'py>,
+    weights: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let w = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+    let stats = crate::sparse_ops::sparsity_stats(w);
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("total_elements", stats.total_elements)?;
+    dict.set_item("nonzero_elements", stats.nonzero_elements)?;
+    dict.set_item("zero_elements", stats.zero_elements)?;
+    dict.set_item("sparsity_ratio", stats.sparsity_ratio)?;
+    dict.set_item("dense_bytes", stats.dense_bytes)?;
+    dict.set_item("sparse_bytes_estimate", stats.sparse_bytes_estimate)?;
+    Ok(dict)
+}
