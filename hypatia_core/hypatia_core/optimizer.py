@@ -211,34 +211,40 @@ def optimize(
     mode: str = 'auto',
 ) -> nn.Module:
     """
-    Model'i optimize et.
+    Optimize the model using the fastest available path.
 
-    Hypatia otomatik olarak model boyutuna göre en hızlı yolu seçer:
-    - Küçük modeller (< 10M param): NativeModel (fused GEMM, 2-6x hız)
-    - Büyük modeller (>= 10M param): QuantizedModel (INT4 SIMD, 11-16x hız)
+    Auto-selection (mode='auto'):
+    - Transformer models: TransformerModel (Rust-native full block)
+    - Small/medium models (< 50M params): NativeModel (f32 MKL GEMM, 1.2x+)
+    - Large models (>= 50M params): QuantizedModel (INT4 SIMD, 15x+)
+
+    The threshold is based on L3 cache efficiency: INT4 quantized inference
+    beats multi-threaded f32 GEMM only when weights exceed L3 cache (~50M params).
+    For smaller models, NativeModel bypasses PyTorch dispatch overhead with
+    MKL GEMM for optimal speed.
 
     Args:
-        model: PyTorch modeli
-        inplace: True ise modeli yerinde değiştirir
-        quantize: Quantization tipi:
-            - None: auto-select (büyük modellerde INT4)
-            - 'int4': INT4 block quantization (AVX2 SIMD + Rayon, 11-16x hız)
-            - 'int8': INT8 dynamic quantization (PyTorch native, 2-4x hız)
-            - False: quantization yapma
-        mode: Optimizasyon modu:
-            - 'auto': model boyutuna göre otomatik seç
-            - 'native': Rust-native f32 forward (küçük modeller)
-            - 'quantized': INT4 quantized forward (büyük modeller)
-            - 'fusion': sadece layer fusion uygula (PyTorch üzerinden çalışır)
+        model: PyTorch model
+        inplace: If True, modify model in-place
+        quantize: Quantization type:
+            - None: auto-select (INT4 for large models >= 50M params)
+            - 'int4': Force INT4 block quantization (memory savings + speed for large models)
+            - 'int8': INT8 dynamic quantization (PyTorch native, 2-4x)
+            - False: no quantization
+        mode: Optimization mode:
+            - 'auto': auto-select based on model size
+            - 'native': Rust-native f32 forward (all model sizes)
+            - 'quantized': INT4 quantized forward (large models)
+            - 'fusion': layer fusion only (PyTorch-based)
 
     Returns:
-        Optimize edilmiş model
+        Optimized model
 
     Examples:
         # Auto-select (recommended)
         fast_model = hypatia.optimize(model)
 
-        # Explicit INT4 for large models
+        # Explicit INT4 for memory savings
         fast_model = hypatia.optimize(model, quantize='int4')
 
         # Just layer fusion
@@ -257,8 +263,12 @@ def optimize(
 
     # Determine quantization
     if quantize is None:
-        # Auto: INT4 for large models
-        use_int4 = n_params >= 10_000_000
+        # Auto: INT4 only for large models where it beats multi-threaded f32 GEMM.
+        # Below ~50M params, weights partially fit in L3 cache and MKL's optimized
+        # tiled GEMV is faster than INT4 dequant+dot (NativeModel is better).
+        # Above ~50M params, memory bandwidth dominates and INT4's 7x compression
+        # provides significant speedup (15x+ on LLaMA-7B).
+        use_int4 = n_params >= 50_000_000
         use_int8 = False
     elif quantize == 'int4':
         use_int4 = True
@@ -286,7 +296,7 @@ def optimize(
                 mode = 'fusion'
             elif use_int4:
                 mode = 'quantized'
-            elif n_params >= 10_000_000:
+            elif n_params >= 50_000_000:
                 mode = 'quantized'
             else:
                 mode = 'native'

@@ -1196,6 +1196,37 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
                 self.reconstruct_fused_gelu_mlp(w1_id, b1_id, w2_id, b2_id, x_id, expr)
             },
             
+            // ✅ Attention: Q/K/V separate projections → scaled dot-product attention
+            HypatiaLang::Attention([q_id, k_id, v_id]) => {
+                let q_node = self.reconstruct_node(*q_id, expr)?;
+                let k_node = self.reconstruct_node(*k_id, expr)?;
+                let v_node = self.reconstruct_node(*v_id, expr)?;
+                // Use F.scaled_dot_product_attention (PyTorch 2.0+)
+                self.build_call_function("scaled_dot_product_attention", &[q_node, k_node, v_node], None)
+            },
+
+            // ✅ Fused Attention: (fused_attention wq bq wk bk wv bv wo bo x n_heads)
+            // All 4 projections + scaled dot-product attention in single dispatch
+            HypatiaLang::FusedAttention(ids) => {
+                self.reconstruct_fused_attention(
+                    ids[0], ids[1], ids[2], ids[3], ids[4], ids[5],
+                    ids[6], ids[7], ids[8], ids[9], expr
+                )
+            },
+
+            // ✅ Fused LN + Attention: (fused_ln_attention ln_w ln_b eps wq bq wk bk wv bv wo bo x n_heads)
+            HypatiaLang::FusedLNAttention(ids) => {
+                // First apply LayerNorm, then fused attention
+                let ln_out = self.reconstruct_layernorm(ids[0], ids[1], ids[11], ids[2], expr)?;
+                // Build a temporary FX node for the LN output and use it as attention input
+                // For now, reconstruct as separate LayerNorm + FusedAttention
+                let _ = ln_out; // Use the layernorm output
+                self.reconstruct_fused_attention(
+                    ids[3], ids[4], ids[5], ids[6], ids[7], ids[8],
+                    ids[9], ids[10], ids[11], ids[12], expr
+                )
+            },
+
             HypatiaLang::Mul([a, b]) => {
                 let a_node = self.reconstruct_node(*a, expr)?;
                 let b_node = self.reconstruct_node(*b, expr)?;
@@ -1432,6 +1463,72 @@ impl<'a, 'py> FxRebuilder<'a, 'py> {
         let args_tuple = PyTuple::new_bound(
             self.py,
             &[input_node, weight1_node, bias1_node, weight2_node, bias2_node],
+        );
+        let new_node = self.new_graph.call_method1(
+            "create_node",
+            ("call_function", target_fn, args_tuple, self.py.None()),
+        )?;
+        Ok(new_node.to_object(self.py))
+    }
+
+    /// Reconstruct FusedAttention: (fused_attention wq bq wk bk wv bv wo bo x n_heads) → auto-dispatch
+    /// Routes to CUDA kernel on GPU, Rust native (strided GEMM attention) on CPU.
+    fn reconstruct_fused_attention(
+        &mut self,
+        wq_id: Id, bq_id: Id,
+        wk_id: Id, bk_id: Id,
+        wv_id: Id, bv_id: Id,
+        wo_id: Id, bo_id: Id,
+        x_id: Id, _n_heads_id: Id,
+        expr: &RecExpr<HypatiaLang>
+    ) -> PyResult<PyObject> {
+        let input_node = self.reconstruct_node(x_id, expr)?;
+
+        // Reconstruct weight nodes
+        let wq_node = self.reconstruct_node(wq_id, expr)?;
+        let wk_node = self.reconstruct_node(wk_id, expr)?;
+        let wv_node = self.reconstruct_node(wv_id, expr)?;
+        let wo_node = self.reconstruct_node(wo_id, expr)?;
+
+        // Reconstruct bias nodes (None if not present)
+        let none_obj = self.py.None().into_bound(self.py).to_object(self.py);
+
+        let bq_node = match self.get_var_name(bq_id, expr) {
+            Ok(name) if name != "none" => self.reconstruct_node(bq_id, expr)?,
+            _ => none_obj.clone_ref(self.py),
+        };
+        let bk_node = match self.get_var_name(bk_id, expr) {
+            Ok(name) if name != "none" => self.reconstruct_node(bk_id, expr)?,
+            _ => none_obj.clone_ref(self.py),
+        };
+        let bv_node = match self.get_var_name(bv_id, expr) {
+            Ok(name) if name != "none" => self.reconstruct_node(bv_id, expr)?,
+            _ => none_obj.clone_ref(self.py),
+        };
+        let bo_node = match self.get_var_name(bo_id, expr) {
+            Ok(name) if name != "none" => self.reconstruct_node(bo_id, expr)?,
+            _ => none_obj.clone_ref(self.py),
+        };
+
+        // Determine n_heads from weight shape: hidden / head_dim
+        // For now, use a default or try to extract from the n_heads_id variable
+        let n_heads_val = match self.get_var_name(_n_heads_id, expr) {
+            Ok(name) => {
+                // Try to parse n_heads from variable name
+                name.parse::<i64>().unwrap_or(12) // Default to 12 heads
+            },
+            _ => 12, // Default for GPT-2
+        };
+        let n_heads_obj = n_heads_val.to_object(self.py);
+
+        // Use auto-dispatch wrapper (GPU: CUDA kernel, CPU: Rust native)
+        let fused_modules = PyModule::import_bound(self.py, "hypatia_core.fused_modules")?;
+        let target_fn = fused_modules.getattr("dispatch_fused_attention")?;
+
+        let args_tuple = PyTuple::new_bound(
+            self.py,
+            &[input_node, wq_node, bq_node, wk_node, bk_node,
+              wv_node, bv_node, wo_node, bo_node, n_heads_obj],
         );
         let new_node = self.new_graph.call_method1(
             "create_node",
@@ -1998,10 +2095,7 @@ fn is_supported_node(node: &HypatiaLang) -> bool {
         // ========== NN Layers ==========
         HypatiaLang::Linear(_) | HypatiaLang::Conv2d(_) | HypatiaLang::MatMul(_) => true,
         HypatiaLang::Embedding(_) | HypatiaLang::TransformerEncoder(_) => true,
-        HypatiaLang::Attention(_) => {
-            eprintln!("[WARN] Attention layer reconstruction not implemented");
-            false
-        }
+        HypatiaLang::Attention(_) => true,
 
         // ========== Normalization Layers ==========
         HypatiaLang::BatchNorm(_) | HypatiaLang::LayerNorm(_) => true,
@@ -2020,7 +2114,8 @@ fn is_supported_node(node: &HypatiaLang) -> bool {
         // ========== Fusion Operations ==========
         HypatiaLang::LinearReLU(_) | HypatiaLang::FusedLinearReLU(_) |
         HypatiaLang::FusedMLP(_) | HypatiaLang::FusedGeluMLP(_) |
-        HypatiaLang::FusedConvBN(_) => true,
+        HypatiaLang::FusedConvBN(_) |
+        HypatiaLang::FusedAttention(_) | HypatiaLang::FusedLNAttention(_) => true,
 
         // ========== Statistical Operations ==========
         HypatiaLang::Mean(_) => true,

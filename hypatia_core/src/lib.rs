@@ -16,6 +16,7 @@ mod native_ops;  // Native fused GEMM operations
 mod quantize;    // INT4 block quantization for large models
 mod gpu_backend; // GPU acceleration (CUDA/Metal)
 mod geometric_ops; // Geometric algebra neural network operations
+mod neuromorphic;  // Neuromorphic computing: LIF neurons, ANN→SNN conversion
 
 use pyo3::prelude::*;
 
@@ -99,8 +100,17 @@ pub fn _hypatia_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::python_bindings::ga2d_normalize, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_bindings::ga3d_normalize, m)?)?;
 
+    // Fused multi-head attention (Rust native)
+    m.add_function(wrap_pyfunction!(crate::python_bindings::fused_attention_forward, m)?)?;
+
     // GPU backend info
     m.add_function(wrap_pyfunction!(crate::python_bindings::gpu_info, m)?)?;
+
+    // Neuromorphic computing: ANN→SNN conversion, LIF inference
+    m.add_function(wrap_pyfunction!(crate::python_bindings::neuromorphic_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::neuromorphic_forward_with_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::optimize_for_neuromorphic, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_bindings::estimate_neuromorphic_energy, m)?)?;
 
     Ok(())
 }
