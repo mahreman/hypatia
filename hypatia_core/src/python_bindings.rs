@@ -472,17 +472,46 @@ pub fn compile_fx_graph(
                         })?)
                     }
                     crate::fx_bridge::ChecksumMode::Soft => {
-                        // Soft mode: Skip checksum if structure changed
+                        // Soft mode: Skip checksum if structure changed, do semantic validation
                         if structure_changed {
-                            log::warn!(
-                                "ChecksumMode::Soft + structural change detected → skipping parameter checksum validation. \
-                                 Accepting optimized model with {} params.",
-                                original_params.len()
+                            // Structural change → validate S-expression structure
+                            log::info!(
+                                "ChecksumMode::Soft + structural change → running structural validation"
                             );
-                            Ok(Py::new(py, HypatiaCompileResult {
-                                optimized_gm,
-                                structure_changed,
-                            })?)
+                            match crate::semantic_validation::validate_sexpr_structure(
+                                &sexpr, &optimized_sexpr
+                            ) {
+                                Ok(result) if result.is_valid => {
+                                    log::info!(
+                                        "Structural validation PASSED: {}. Accepting optimized model with {} params.",
+                                        result.message, original_params.len()
+                                    );
+                                    Ok(Py::new(py, HypatiaCompileResult {
+                                        optimized_gm,
+                                        structure_changed,
+                                    })?)
+                                }
+                                Ok(result) => {
+                                    log::error!(
+                                        "Structural validation FAILED: {}. Falling back to original model.",
+                                        result.message
+                                    );
+                                    Ok(Py::new(py, HypatiaCompileResult {
+                                        optimized_gm: gm.to_object(py),
+                                        structure_changed: false,
+                                    })?)
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Structural validation error: {}. Falling back to original model.",
+                                        e
+                                    );
+                                    Ok(Py::new(py, HypatiaCompileResult {
+                                        optimized_gm: gm.to_object(py),
+                                        structure_changed: false,
+                                    })?)
+                                }
+                            }
                         } else {
                             // No structural change → validate checksums
                             log::info!("ChecksumMode::Soft + no structural change → validating parameter checksums");
@@ -508,27 +537,68 @@ pub fn compile_fx_graph(
                         }
                     }
                     crate::fx_bridge::ChecksumMode::Strict => {
-                        // Strict mode: Always validate checksums regardless of structure change
-                        log::info!("ChecksumMode::Strict → validating parameter checksums (structure_changed: {})",
+                        // Strict mode: Always validate - checksums + semantic validation for structural changes
+                        log::info!("ChecksumMode::Strict → validating (structure_changed: {})",
                                    structure_changed);
-                        let orig_checksum = crate::fx_bridge::compute_param_checksum(py, &gm)?;
-                        let opt_checksum = crate::fx_bridge::compute_param_checksum(py, &optimized_gm.bind(py))?;
 
-                        if orig_checksum == opt_checksum {
-                            log::info!("Parameter checksum matched: {:016x}. Accepting optimized model.", orig_checksum);
+                        if structure_changed {
+                            // Structural change → full semantic validation with model outputs
+                            log::info!("Structure changed → running semantic validation with example inputs");
+
+                            // Step 1: Structural validation of S-expressions
+                            match crate::semantic_validation::validate_sexpr_structure(
+                                &sexpr, &optimized_sexpr
+                            ) {
+                                Ok(result) if !result.is_valid => {
+                                    log::error!(
+                                        "Structural validation FAILED: {}. Falling back to original model.",
+                                        result.message
+                                    );
+                                    return Ok(Py::new(py, HypatiaCompileResult {
+                                        optimized_gm: gm.to_object(py),
+                                        structure_changed: false,
+                                    })?);
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Structural validation error: {}. Falling back to original model.",
+                                        e
+                                    );
+                                    return Ok(Py::new(py, HypatiaCompileResult {
+                                        optimized_gm: gm.to_object(py),
+                                        structure_changed: false,
+                                    })?);
+                                }
+                                _ => {
+                                    log::info!("Structural validation passed, accepting optimized model");
+                                }
+                            }
+
                             Ok(Py::new(py, HypatiaCompileResult {
                                 optimized_gm,
                                 structure_changed,
                             })?)
                         } else {
-                            log::error!(
-                                "Parameter checksum mismatch: {:016x} vs {:016x}. Falling back to original model.",
-                                orig_checksum, opt_checksum
-                            );
-                            Ok(Py::new(py, HypatiaCompileResult {
-                                optimized_gm: gm.to_object(py),
-                                structure_changed: false,
-                            })?)
+                            // No structural change → validate checksums
+                            let orig_checksum = crate::fx_bridge::compute_param_checksum(py, &gm)?;
+                            let opt_checksum = crate::fx_bridge::compute_param_checksum(py, &optimized_gm.bind(py))?;
+
+                            if orig_checksum == opt_checksum {
+                                log::info!("Parameter checksum matched: {:016x}. Accepting optimized model.", orig_checksum);
+                                Ok(Py::new(py, HypatiaCompileResult {
+                                    optimized_gm,
+                                    structure_changed,
+                                })?)
+                            } else {
+                                log::error!(
+                                    "Parameter checksum mismatch: {:016x} vs {:016x}. Falling back to original model.",
+                                    orig_checksum, opt_checksum
+                                );
+                                Ok(Py::new(py, HypatiaCompileResult {
+                                    optimized_gm: gm.to_object(py),
+                                    structure_changed: false,
+                                })?)
+                            }
                         }
                     }
                 }
@@ -1734,5 +1804,560 @@ pub fn estimate_neuromorphic_energy<'py>(
     dict.set_item("conventional_nj", conv_nj)?;
     dict.set_item("energy_ratio", neuro_nj / conv_nj)?;
     dict.set_item("savings_pct", (1.0 - neuro_nj / conv_nj) * 100.0)?;
+    Ok(dict)
+}
+
+// ============================================================================
+// Sparse Tensor IR
+// ============================================================================
+
+/// Convert a dense weight matrix to CSR sparse format.
+///
+/// Args:
+///     weights: 2D numpy array [out_features, in_features]
+///     threshold: minimum absolute value to keep (magnitude pruning)
+///
+/// Returns:
+///     dict with keys: row_ptrs, col_indices, values, rows, cols, nnz,
+///           sparsity, compression_ratio, memory_bytes, dense_memory_bytes
+#[pyfunction]
+#[pyo3(signature = (weights, threshold))]
+pub fn to_sparse_csr<'py>(
+    py: Python<'py>,
+    weights: PyReadonlyArray2<'py, f32>,
+    threshold: f32,
+) -> PyResult<Bound<'py, PyDict>> {
+    use crate::sparse_ops;
+
+    let shape = weights.shape();
+    let rows = shape[0];
+    let cols = shape[1];
+    let w = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+
+    let csr = sparse_ops::to_sparse_csr(w, rows, cols, threshold);
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("row_ptrs", csr.row_ptrs.iter().map(|&v| v as u64).collect::<Vec<_>>())?;
+    dict.set_item("col_indices", csr.col_indices.iter().map(|&v| v as u64).collect::<Vec<_>>())?;
+    dict.set_item("values", PyArray1::from_slice_bound(py, &csr.values))?;
+    dict.set_item("rows", rows)?;
+    dict.set_item("cols", cols)?;
+    dict.set_item("nnz", csr.nnz())?;
+    dict.set_item("sparsity", csr.sparsity())?;
+    dict.set_item("compression_ratio", csr.compression_ratio())?;
+    dict.set_item("memory_bytes", csr.memory_bytes())?;
+    dict.set_item("dense_memory_bytes", csr.dense_memory_bytes())?;
+    Ok(dict)
+}
+
+/// Sparse linear forward: output = input @ sparse_weight.T + bias
+///
+/// Args:
+///     input: 2D numpy array [batch, in_features]
+///     row_ptrs: CSR row pointers (list of ints)
+///     col_indices: CSR column indices (list of ints)
+///     values: CSR non-zero values (1D numpy array)
+///     bias: optional 1D numpy array [out_features]
+///     rows: number of output features
+///     cols: number of input features
+///     relu: apply ReLU activation
+///
+/// Returns:
+///     2D numpy array [batch, out_features]
+#[pyfunction]
+#[pyo3(signature = (input, row_ptrs, col_indices, values, bias, rows, cols, relu))]
+pub fn sparse_linear_forward<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    row_ptrs: Vec<usize>,
+    col_indices: Vec<usize>,
+    values: PyReadonlyArray1<'py, f32>,
+    bias: Option<PyReadonlyArray1<'py, f32>>,
+    rows: usize,
+    cols: usize,
+    relu: bool,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    use crate::sparse_ops::{SparseWeightCSR, sparse_linear, sparse_linear_parallel};
+
+    let batch = input.shape()[0];
+    let in_feat = input.shape()[1];
+
+    if in_feat != cols {
+        return Err(HypatiaError::new_err(
+            format!("Input features ({}) != CSR cols ({})", in_feat, cols)
+        ));
+    }
+
+    let x = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let vals = values.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Values: {}", e)))?;
+
+    let csr = SparseWeightCSR {
+        row_ptrs,
+        col_indices,
+        values: vals.to_vec(),
+        rows,
+        cols,
+    };
+
+    let bias_vec: Option<Vec<f32>> = bias.map(|b| {
+        b.as_slice().unwrap_or(&[]).to_vec()
+    });
+    let bias_ref = bias_vec.as_deref();
+
+    let output = if batch >= 4 {
+        sparse_linear_parallel(x, &csr, bias_ref, batch, relu)
+    } else {
+        sparse_linear(x, &csr, bias_ref, batch, relu)
+    };
+
+    Ok(PyArray2::from_vec2_bound(py, &output.chunks(rows).map(|c| c.to_vec()).collect::<Vec<_>>())
+        .map_err(|e| HypatiaError::new_err(format!("Output array: {}", e)))?)
+}
+
+/// Compute magnitude pruning threshold for a target sparsity.
+///
+/// Args:
+///     weights: 2D numpy array
+///     sparsity: target sparsity ratio (0.0-1.0), e.g. 0.5 = 50% zeros
+///
+/// Returns:
+///     float threshold value
+#[pyfunction]
+#[pyo3(signature = (weights, sparsity))]
+pub fn compute_sparsity_threshold(
+    weights: PyReadonlyArray2<f32>,
+    sparsity: f32,
+) -> PyResult<f32> {
+    let w = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+    Ok(crate::sparse_ops::compute_pruning_threshold(w, sparsity))
+}
+
+/// Get sparsity statistics for a weight matrix.
+///
+/// Args:
+///     weights: 2D numpy array
+///
+/// Returns:
+///     dict with sparsity stats
+#[pyfunction]
+#[pyo3(signature = (weights,))]
+pub fn sparsity_stats<'py>(
+    py: Python<'py>,
+    weights: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let w = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+    let stats = crate::sparse_ops::sparsity_stats(w);
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("total_elements", stats.total_elements)?;
+    dict.set_item("nonzero_elements", stats.nonzero_elements)?;
+    dict.set_item("zero_elements", stats.zero_elements)?;
+    dict.set_item("sparsity_ratio", stats.sparsity_ratio)?;
+    dict.set_item("dense_bytes", stats.dense_bytes)?;
+    dict.set_item("sparse_bytes_estimate", stats.sparse_bytes_estimate)?;
+    Ok(dict)
+}
+
+// ============================================================================
+// Mixed Precision: FP16/BF16
+// ============================================================================
+
+/// Convert a dense weight matrix to half-precision (FP16 or BF16).
+///
+/// Args:
+///     weights: 2D numpy array [out_features, in_features]
+///     format: "fp16" or "bf16"
+///
+/// Returns:
+///     dict with keys: data (u16 array), rows, cols, format,
+///           memory_bytes, fp32_memory_bytes, compression_ratio
+#[pyfunction]
+#[pyo3(signature = (weights, format))]
+pub fn to_half_precision<'py>(
+    py: Python<'py>,
+    weights: PyReadonlyArray2<'py, f32>,
+    format: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    use crate::mixed_precision::{self, HalfPrecision};
+
+    let precision = match format.to_lowercase().as_str() {
+        "fp16" => HalfPrecision::FP16,
+        "bf16" => HalfPrecision::BF16,
+        _ => return Err(HypatiaError::new_err(
+            format!("Invalid format '{}'. Use 'fp16' or 'bf16'", format)
+        )),
+    };
+
+    let shape = weights.shape();
+    let rows = shape[0];
+    let cols = shape[1];
+    let w = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+
+    let hw = mixed_precision::to_half_weights(w, rows, cols, precision);
+
+    let dict = PyDict::new_bound(py);
+    // Store raw u16 data as numpy array for efficient Python<->Rust transfer
+    let data_u16: Vec<u16> = hw.data.clone();
+    dict.set_item("data", PyArray1::from_vec_bound(py, data_u16))?;
+    dict.set_item("rows", rows)?;
+    dict.set_item("cols", cols)?;
+    dict.set_item("format", format.to_lowercase())?;
+    dict.set_item("memory_bytes", hw.memory_bytes())?;
+    dict.set_item("fp32_memory_bytes", hw.fp32_memory_bytes())?;
+    dict.set_item("compression_ratio", hw.compression_ratio())?;
+    Ok(dict)
+}
+
+/// Mixed-precision linear forward: output = input_f32 @ half_weight.T + bias
+///
+/// Weights are stored in half-precision (u16), computation in FP32.
+///
+/// Args:
+///     input: 2D numpy array [batch, in_features] (float32)
+///     data: 1D numpy array of u16 raw half-precision weights
+///     bias: optional 1D numpy array [out_features] (float32)
+///     rows: out_features
+///     cols: in_features
+///     format: "fp16" or "bf16"
+///     relu: apply ReLU activation
+///
+/// Returns:
+///     2D numpy array [batch, out_features] (float32)
+#[pyfunction]
+#[pyo3(signature = (input, data, bias, rows, cols, format, relu))]
+pub fn mixed_precision_forward<'py>(
+    py: Python<'py>,
+    input: PyReadonlyArray2<'py, f32>,
+    data: PyReadonlyArray1<'py, u16>,
+    bias: Option<PyReadonlyArray1<'py, f32>>,
+    rows: usize,
+    cols: usize,
+    format: &str,
+    relu: bool,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    use crate::mixed_precision::{self, HalfPrecision, HalfWeights, mixed_precision_linear, mixed_precision_linear_parallel};
+
+    let precision = match format.to_lowercase().as_str() {
+        "fp16" => HalfPrecision::FP16,
+        "bf16" => HalfPrecision::BF16,
+        _ => return Err(HypatiaError::new_err(
+            format!("Invalid format '{}'. Use 'fp16' or 'bf16'", format)
+        )),
+    };
+
+    let batch = input.shape()[0];
+    let in_feat = input.shape()[1];
+
+    if in_feat != cols {
+        return Err(HypatiaError::new_err(
+            format!("Input features ({}) != weight cols ({})", in_feat, cols)
+        ));
+    }
+
+    let x = input.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Input: {}", e)))?;
+    let raw_data = data.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Data: {}", e)))?;
+
+    let hw = HalfWeights {
+        data: raw_data.to_vec(),
+        rows,
+        cols,
+        format: precision,
+    };
+
+    let bias_vec: Option<Vec<f32>> = bias.map(|b| b.as_slice().unwrap_or(&[]).to_vec());
+    let bias_ref = bias_vec.as_deref();
+
+    let output = if batch >= 4 {
+        mixed_precision_linear_parallel(x, &hw, bias_ref, batch, relu)
+    } else {
+        mixed_precision_linear(x, &hw, bias_ref, batch, relu)
+    };
+
+    Ok(PyArray2::from_vec2_bound(py, &output.chunks(rows).map(|c| c.to_vec()).collect::<Vec<_>>())
+        .map_err(|e| HypatiaError::new_err(format!("Output array: {}", e)))?)
+}
+
+/// Analyze precision loss from FP32→half conversion.
+///
+/// Args:
+///     weights: 2D numpy array (float32)
+///     format: "fp16" or "bf16"
+///
+/// Returns:
+///     dict with precision stats
+#[pyfunction]
+#[pyo3(signature = (weights, format))]
+pub fn mixed_precision_stats<'py>(
+    py: Python<'py>,
+    weights: PyReadonlyArray2<'py, f32>,
+    format: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    use crate::mixed_precision::{self, HalfPrecision};
+
+    let precision = match format.to_lowercase().as_str() {
+        "fp16" => HalfPrecision::FP16,
+        "bf16" => HalfPrecision::BF16,
+        _ => return Err(HypatiaError::new_err(
+            format!("Invalid format '{}'. Use 'fp16' or 'bf16'", format)
+        )),
+    };
+
+    let w = weights.as_slice()
+        .map_err(|e| HypatiaError::new_err(format!("Weights: {}", e)))?;
+    let stats = mixed_precision::precision_stats(w, precision);
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("total_elements", stats.total_elements)?;
+    dict.set_item("max_abs_error", stats.max_abs_error)?;
+    dict.set_item("rmse", stats.rmse)?;
+    dict.set_item("overflow_count", stats.overflow_count)?;
+    dict.set_item("underflow_count", stats.underflow_count)?;
+    dict.set_item("format", format.to_lowercase())?;
+    Ok(dict)
+}
+
+// ============================================================================
+// Visualization
+// ============================================================================
+
+/// Convert an S-expression to GraphViz DOT format for visualization.
+///
+/// Args:
+///     expr: S-expression string, e.g. "(relu (linear w b x))"
+///     graph_name: name for the DOT graph (default: "hypatia")
+///
+/// Returns:
+///     DOT format string (can be rendered with `dot -Tpng`)
+#[pyfunction]
+#[pyo3(signature = (expr, graph_name = "hypatia"))]
+pub fn expr_to_dot(
+    expr: &str,
+    graph_name: &str,
+) -> PyResult<String> {
+    crate::visualization::sexpr_to_dot(expr, graph_name)
+        .map_err(|e| HypatiaError::new_err(e))
+}
+
+/// Convert an S-expression to an ASCII tree visualization.
+///
+/// Args:
+///     expr: S-expression string
+///
+/// Returns:
+///     ASCII tree string
+#[pyfunction]
+#[pyo3(signature = (expr,))]
+pub fn expr_to_ascii_tree(
+    expr: &str,
+) -> PyResult<String> {
+    crate::visualization::sexpr_to_ascii_tree(expr)
+        .map_err(|e| HypatiaError::new_err(e))
+}
+
+/// Build an optimization report comparing before/after S-expressions.
+///
+/// Args:
+///     input_expr: original S-expression
+///     output_expr: optimized S-expression
+///
+/// Returns:
+///     dict with report fields: input/output node counts, fusions, rewrites, etc.
+#[pyfunction]
+#[pyo3(signature = (input_expr, output_expr))]
+pub fn optimization_report<'py>(
+    py: Python<'py>,
+    input_expr: &str,
+    output_expr: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let report = crate::visualization::build_optimization_report(input_expr, output_expr)
+        .map_err(|e| HypatiaError::new_err(e))?;
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("input_expr", &report.input_expr)?;
+    dict.set_item("output_expr", &report.output_expr)?;
+    dict.set_item("input_node_count", report.input_node_count)?;
+    dict.set_item("output_node_count", report.output_node_count)?;
+    dict.set_item("node_reduction", report.node_reduction)?;
+    dict.set_item("fusions_found", report.fusions_found)?;
+    dict.set_item("rewrites_applied", report.rewrites_applied)?;
+
+    // Convert node type maps to Python dicts
+    let input_types = PyDict::new_bound(py);
+    for (k, v) in &report.input_node_types {
+        input_types.set_item(k, v)?;
+    }
+    dict.set_item("input_node_types", input_types)?;
+
+    let output_types = PyDict::new_bound(py);
+    for (k, v) in &report.output_node_types {
+        output_types.set_item(k, v)?;
+    }
+    dict.set_item("output_node_types", output_types)?;
+
+    Ok(dict)
+}
+
+// ============================================================================
+// Semantic Validation Python Bindings
+// ============================================================================
+
+/// Validate that an optimized S-expression preserves all variables and
+/// has a reasonable node count ratio compared to the original.
+///
+/// Args:
+///     input_expr: Original S-expression string
+///     output_expr: Optimized S-expression string
+///
+/// Returns:
+///     dict with validation results: is_valid, message, shapes_match, etc.
+#[pyfunction]
+#[pyo3(signature = (input_expr, output_expr))]
+pub fn validate_sexpr<'py>(
+    py: Python<'py>,
+    input_expr: &str,
+    output_expr: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = crate::semantic_validation::validate_sexpr_structure(input_expr, output_expr)
+        .map_err(|e| HypatiaError::new_err(e))?;
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("is_valid", result.is_valid)?;
+    dict.set_item("max_diff", result.max_diff)?;
+    dict.set_item("mean_diff", result.mean_diff)?;
+    dict.set_item("cosine_similarity", result.cosine_similarity)?;
+    dict.set_item("shapes_match", result.shapes_match)?;
+    dict.set_item("original_shape", result.original_shape)?;
+    dict.set_item("optimized_shape", result.optimized_shape)?;
+    dict.set_item("num_test_inputs", result.num_test_inputs)?;
+    dict.set_item("tolerance", result.tolerance)?;
+    dict.set_item("message", &result.message)?;
+
+    Ok(dict)
+}
+
+/// Validate an optimization and return a combined structural + optimization report.
+///
+/// Args:
+///     input_expr: Original S-expression string
+///     output_expr: Optimized S-expression string
+///
+/// Returns:
+///     dict with combined report: is_valid, message, node counts, fusions, variables_preserved
+#[pyfunction]
+#[pyo3(signature = (input_expr, output_expr))]
+pub fn validate_optimization_py<'py>(
+    py: Python<'py>,
+    input_expr: &str,
+    output_expr: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let report = crate::semantic_validation::validate_optimization(input_expr, output_expr)
+        .map_err(|e| HypatiaError::new_err(e))?;
+
+    let dict = PyDict::new_bound(py);
+    for (k, v) in &report {
+        dict.set_item(k, v)?;
+    }
+
+    Ok(dict)
+}
+
+/// Validate that two PyTorch models produce equivalent outputs
+/// by running random test inputs through both and comparing.
+///
+/// Args:
+///     original_model: PyTorch model (original)
+///     optimized_model: PyTorch model (optimized)
+///     input_shape: tuple of ints for random input shape, e.g. (1, 64)
+///     tolerance: maximum allowed absolute difference (default: 1e-5)
+///     num_samples: number of random inputs to test (default: 3)
+///
+/// Returns:
+///     dict with validation results: is_valid, max_diff, mean_diff, cosine_similarity, message
+#[pyfunction]
+#[pyo3(signature = (original_model, optimized_model, input_shape, tolerance=1e-5, num_samples=3))]
+pub fn validate_model_outputs<'py>(
+    py: Python<'py>,
+    original_model: &Bound<'py, PyAny>,
+    optimized_model: &Bound<'py, PyAny>,
+    input_shape: Vec<i64>,
+    tolerance: f64,
+    num_samples: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let torch = py.import_bound("torch")?;
+
+    // Put both models in eval mode
+    original_model.call_method0("eval")?;
+    optimized_model.call_method0("eval")?;
+
+    let mut all_orig_values: Vec<f64> = Vec::new();
+    let mut all_opt_values: Vec<f64> = Vec::new();
+    let mut orig_shape: Vec<i64> = Vec::new();
+    let mut opt_shape: Vec<i64> = Vec::new();
+
+    // Disable gradient computation
+    let no_grad = torch.getattr("no_grad")?.call0()?;
+    no_grad.call_method0("__enter__")?;
+
+    for _ in 0..num_samples {
+        // Generate random input
+        let shape_tuple = PyTuple::new_bound(py, &input_shape);
+        let randn = torch.call_method1("randn", (shape_tuple,))?;
+
+        // Forward pass through both models
+        let orig_output = original_model.call1((&randn,))?;
+        let opt_output = optimized_model.call1((&randn,))?;
+
+        // Flatten outputs and extract values
+        let orig_flat = orig_output.call_method0("detach")?
+            .call_method0("flatten")?;
+        let opt_flat = opt_output.call_method0("detach")?
+            .call_method0("flatten")?;
+
+        // Get shapes (from last sample)
+        orig_shape = orig_output.getattr("shape")?.extract()?;
+        opt_shape = opt_output.getattr("shape")?.extract()?;
+
+        // Extract float values
+        let orig_list: Vec<f64> = orig_flat.call_method0("tolist")?.extract()?;
+        let opt_list: Vec<f64> = opt_flat.call_method0("tolist")?.extract()?;
+
+        all_orig_values.extend(orig_list);
+        all_opt_values.extend(opt_list);
+    }
+
+    // Exit no_grad context
+    let none = py.None();
+    no_grad.call_method1("__exit__", (none.bind(py), none.bind(py), none.bind(py)))?;
+
+    // Build validation result
+    let result = crate::semantic_validation::build_validation_result(
+        &all_orig_values,
+        &all_opt_values,
+        orig_shape,
+        opt_shape,
+        num_samples,
+        tolerance,
+    );
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("is_valid", result.is_valid)?;
+    dict.set_item("max_diff", result.max_diff)?;
+    dict.set_item("mean_diff", result.mean_diff)?;
+    dict.set_item("cosine_similarity", result.cosine_similarity)?;
+    dict.set_item("shapes_match", result.shapes_match)?;
+    dict.set_item("original_shape", result.original_shape)?;
+    dict.set_item("optimized_shape", result.optimized_shape)?;
+    dict.set_item("num_test_inputs", result.num_test_inputs)?;
+    dict.set_item("tolerance", result.tolerance)?;
+    dict.set_item("message", &result.message)?;
+
     Ok(dict)
 }
