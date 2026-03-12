@@ -146,7 +146,7 @@ def get_model(
                 example_inputs = [torch.randint(0, input_shape[0], (1, input_shape[0]), dtype=torch.long)] if len(input_shape) == 1 else [torch.randn(1, *input_shape, dtype=precision)]
                 model = hypatia_core.compile_fx_graph(graph_module, example_inputs)
             else:
-                print(f"  > [HYPATIA PLACEHOLDER] 'torch.compile' kullanılıyor...")
+                print(f"  > [HYPATIA] Fallback: 'torch.compile' kullanılıyor...")
                 model = torch.compile(graph_module)
         except Exception as e:
             print(f"  > UYARI: Optimizasyon başarısız oldu, baseline kullanılacak. Hata: {e}")
@@ -196,7 +196,7 @@ def optimize_model_from_base(
             example_inputs = [torch.randint(0, input_shape[0], (1, input_shape[0]), dtype=torch.long)] if len(input_shape) == 1 else [torch.randn(1, *input_shape, dtype=precision)]
             optimized_model = hypatia_core.compile_fx_graph(graph_module, example_inputs)
         else:
-            print(f"  > [HYPATIA PLACEHOLDER] 'torch.compile' kullanılıyor...")
+            print(f"  > [HYPATIA] Fallback: 'torch.compile' kullanılıyor...")
             optimized_model = torch.compile(graph_module)
     except Exception as e:
         print(f"  > UYARI: Optimizasyon başarısız oldu, baseline kullanılacak. Hata: {e}")
