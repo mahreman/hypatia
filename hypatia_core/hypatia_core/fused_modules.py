@@ -95,10 +95,10 @@ class FusedLinearReLUFunction(torch.autograd.Function):
                 weight: torch.Tensor,
                 bias: Optional[torch.Tensor]) -> torch.Tensor:
         """
-        Eğer CUDA kernel mevcutsa:
-          y = ReLU( input @ weight.T + bias ) tek kernel ile hesaplanır.
-        Aksi halde:
-          F.linear + F.relu fallback'ine düşer.
+        If CUDA kernel is available:
+          y = ReLU(input @ weight.T + bias) computed in a single kernel.
+        Otherwise:
+          Falls back to F.linear + F.relu.
         """
         use_cuda_kernel = (
             input.is_cuda
@@ -108,10 +108,10 @@ class FusedLinearReLUFunction(torch.autograd.Function):
         )
 
         if use_cuda_kernel:
-            # C++/CUDA kernel çağrısı
+            # C++/CUDA kernel call
             y = _FUSED_LINEAR_RELU_EXT.forward(input, weight, bias)
         else:
-            # Graph-level fusion fallback (kernel fusion yok)
+            # Graph-level fusion fallback (no kernel fusion)
             y = F.relu(F.linear(input, weight, bias))
 
         ctx.save_for_backward(input, weight, bias if bias is not None else None, y)
@@ -678,7 +678,11 @@ __all__ = [
     "FusedGeluMLP", "FusedGeluMLPFunction",
     "FusedAttention", "FusedLayerNorm", "FusedTransformerBlock",
     "dispatch_fused_gelu_mlp", "dispatch_fused_linear_relu", "dispatch_fused_attention",
+    "CUDA_EXTENSION_AVAILABLE",
 ]
 
 # Eager load CUDA extensions when module is imported
 _load_fused_linear_relu_ext()
+
+# Legacy alias for backward compatibility with tests
+CUDA_EXTENSION_AVAILABLE = _HAS_CUDA_KERNEL

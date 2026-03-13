@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=7.0
+pytest-subtests
+maturin>=1.0,<2.0
+transformers>=4.30.0
+matplotlib>=3.5.0

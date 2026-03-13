@@ -281,7 +281,7 @@ def optimize_model_from_base(
             # ✅ ADIM 1: Düzeltilmiş imza (2 argüman)
             optimized_model_obj = hypatia_core.compile_fx_graph(graph_module, example_inputs_cpu)
         else:
-            print(f"  > [HYPATIA PLACEHOLDER] 'torch.compile' kullanılıyor...")
+            print(f"  > [HYPATIA] Fallback: 'torch.compile' kullanılıyor...")
             optimized_model_obj = torch.compile(graph_module)
             
     except Exception as e:

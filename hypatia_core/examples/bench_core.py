@@ -286,7 +286,7 @@ def optimize_model_from_base(
                 module_info_map # <-- ✅ GÜNCELLENDİ
             )
         else:
-            print(f"  > [HYPATIA PLACEHOLDER] 'torch.compile' kullanılıyor...")
+            print(f"  > [HYPATIA] Fallback: torch.compile kullanılıyor...")
             optimized_model_obj = torch.compile(graph_module)
             
     except Exception as e:
