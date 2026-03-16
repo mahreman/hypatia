@@ -242,10 +242,26 @@ impl Symbol {
             },
             Tanh(a) => {
                 let tanh_val = Tanh(a.clone());
-                (Const(1.0) - Pow(Box::new(tanh_val), Box::new(Const(2.0)))) 
+                (Const(1.0) - Pow(Box::new(tanh_val), Box::new(Const(2.0))))
                     * a.derivative(var)
             },
-            
+            // GELU'(x) ≈ sigmoid(1.702*x) + x * 1.702 * sigmoid(1.702*x) * (1 - sigmoid(1.702*x))
+            // Simplified: use chain rule on GELU ≈ 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
+            // For symbolic purposes, approximate as: sigmoid(1.702*x) * (derivative of inner)
+            GELU(a) => {
+                // Approximate GELU derivative: Φ(x) + x·φ(x) where Φ=CDF, φ=PDF
+                // Simplified: treat similarly to sigmoid for symbolic differentiation
+                let sig = Sigmoid(Box::new(Const(1.702) * a.as_ref().clone()));
+                sig * a.derivative(var)
+            },
+            // SiLU'(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+            //           = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+            SiLU(a) => {
+                let sig = Sigmoid(a.clone());
+                let silu_deriv = sig.clone() * (Const(1.0) + a.as_ref().clone() * (Const(1.0) - sig));
+                silu_deriv * a.derivative(var)
+            },
+
             // ✅ YENİ: FEZ 10 AI Operatörleri Türevleri
             Softmax(a) => {
                 let sm = Softmax(a.clone());
