@@ -84,6 +84,15 @@ class NativeModel(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run forward pass through Rust-native GEMM pipeline.
+
+        Args:
+            x: Input tensor (any shape with last dim = in_features).
+               Automatically converted to float32 contiguous.
+
+        Returns:
+            Output tensor with same batch dims, last dim = out_features.
+        """
         x_np = x.detach().float().contiguous().numpy()
         out_np = native_forward(x_np, self._np_layers)
         return torch.from_numpy(out_np)
@@ -167,16 +176,26 @@ class QuantizedModel(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run forward pass through INT4 quantized SIMD pipeline.
+
+        Args:
+            x: Input tensor (float32). Converted to contiguous numpy internally.
+
+        Returns:
+            Output tensor (float32) with INT4 dequant+dot precision.
+        """
         x_np = x.detach().float().contiguous().numpy()
         out_np = quantized_forward(x_np, self._quantized_layers)
         return torch.from_numpy(out_np)
 
     @property
     def memory_saved_mb(self) -> float:
+        """Memory saved by INT4 quantization vs FP32 (in megabytes)."""
         return (self._f32_bytes - self._q4_bytes) / 1024 / 1024
 
     @property
     def compression_ratio(self) -> float:
+        """FP32-to-INT4 compression ratio (e.g., 7.1 means 7.1x smaller)."""
         return self._compression
 
     def __repr__(self):

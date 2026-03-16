@@ -3,6 +3,7 @@ Hypatia - Hardware-Aware Symbolic Compiler for PyTorch
 """
 
 # Import from Rust binary module (underscore prefix to avoid circular import)
+_RUST_AVAILABLE = False
 try:
     from _hypatia_core import (
         compile_fx_graph,
@@ -16,11 +17,23 @@ try:
         HypatiaCompileResult,
         set_log_level,
     )
+    _RUST_AVAILABLE = True
 except ImportError as e:
     import sys
-    print(f"❌ Failed to import Rust binary: {e}", file=sys.stderr)
-    print(f"   Make sure you ran: maturin develop --release", file=sys.stderr)
-    raise
+    print(f"[Hypatia] WARNING: Rust binary not available: {e}", file=sys.stderr)
+    print(f"   Run: maturin develop --release", file=sys.stderr)
+    print(f"   CUDA fused modules and GPU features still work without Rust core.", file=sys.stderr)
+    # Provide stubs so other imports don't break
+    compile_fx_graph = None
+    optimize_ast = None
+    parse_expr = None
+    is_equivalent = None
+    Symbol = None
+    PyMultiVector2D = None
+    PyMultiVector3D = None
+    HypatiaError = Exception
+    HypatiaCompileResult = None
+    set_log_level = lambda *a, **kw: None
 
 import torch
 import warnings
@@ -58,18 +71,42 @@ from .semantic_validation import (
     validate_expr, validate_structure, validate_models, SemanticValidator,
 )
 
+# Import Profiler (FLOPs estimation, hardware detection, benchmarking)
+from .profiler import (
+    estimate_flops, detect_hardware, profile_model, compare_flops,
+    benchmark_inference, roofline_analysis,
+    ModelProfile, LayerProfile, HardwareInfo, FlopsComparison,
+)
+
+# Import Auto-tuner
+from .autotuner import auto_tune, quick_tune, benchmark_tune, TuneConfig
+
+# Import Benchmark Dashboard
+from .dashboard import BenchmarkDashboard, generate_benchmark_dashboard
+
 # Feature flag for verbose FX debugging
 DEBUG_FX = os.environ.get("HYPATIA_DEBUG_FX", "0") == "1"
 
+# E-graph + torch.compile chain control
+# Set HYPATIA_CHAIN_COMPILE=0 to disable torch.compile after e-graph
+CHAIN_COMPILE = os.environ.get("HYPATIA_CHAIN_COMPILE", "1") != "0"
+
 def hypatia_backend(gm, example_inputs):
     """Hypatia compiler backend for torch.compile()
+
+    Pipeline:
+      1. E-graph structural optimization (fusion rewrites via Rust)
+      2. torch.compile kernel optimization (Triton kernel fusion, if GPU)
+
+    This chains symbolic optimization (e-graph) with kernel-level optimization
+    (torch.compile/Triton), getting benefits from both levels.
 
     Args:
         gm: torch.fx.GraphModule - The compiled graph module
         example_inputs: List of example tensors
 
     Returns:
-        Optimized GraphModule
+        Optimized GraphModule (possibly torch.compile'd for GPU kernel fusion)
     """
     print(f"[Hypatia] Compiling graph with {len(list(gm.graph.nodes))} nodes")
 
@@ -96,26 +133,75 @@ def hypatia_backend(gm, example_inputs):
         }
 
     try:
-        # Call Rust compilation with 3 arguments:
-        # (gm, example_inputs, module_info_map)
-        # Parameters are resolved via example_inputs
+        # Phase 1: E-graph structural optimization (Rust)
         result = compile_fx_graph(gm, example_inputs, module_info_map)
 
-        # result is HypatiaCompileResult with optimized_gm and structure_changed
         if result.structure_changed:
-            print("[Hypatia] ✅ Optimization successful! (graph structure changed - rewrites applied)")
+            print("[Hypatia] Phase 1: E-graph structural optimization applied (rewrites found)")
         else:
-            print("[Hypatia] ✅ Compilation completed (graph structure preserved)")
+            print("[Hypatia] Phase 1: E-graph analysis complete (graph preserved)")
 
-        return result.optimized_gm
+        optimized_gm = result.optimized_gm
+
+        # Phase 2: torch.compile kernel optimization (Triton, GPU only)
+        # This wraps the e-graph-optimized graph with torch.compile for
+        # additional kernel-level fusion (epilogue fusion, memory coalescing)
+        if CHAIN_COMPILE and _is_gpu_model(optimized_gm, example_inputs):
+            try:
+                compiled_gm = torch.compile(
+                    optimized_gm,
+                    backend="inductor",
+                    mode="max-autotune",
+                    dynamic=False,
+                )
+                # Warm up the compiled model to trigger Triton compilation
+                with torch.no_grad():
+                    compiled_gm(*example_inputs)
+                print("[Hypatia] Phase 2: torch.compile kernel fusion applied (Triton)")
+                return compiled_gm
+            except Exception as e:
+                if DEBUG_FX:
+                    print(f"[Hypatia] Phase 2 skipped (torch.compile error: {e})")
+
+        return optimized_gm
 
     except Exception as e:
-        warnings.warn(
-            f"Hypatia compilation failed: {e}. Falling back to original model.",
-            category=RuntimeWarning
+        node_count = len(list(gm.graph.nodes))
+        device_info = "CPU"
+        for inp in example_inputs:
+            if hasattr(inp, 'device'):
+                device_info = str(inp.device)
+                break
+
+        error_msg = (
+            f"Hypatia compilation failed on {node_count}-node graph ({device_info}): {e}\n"
+            f"  Falling back to original (unoptimized) model.\n"
+            f"  Troubleshooting:\n"
+            f"    - Set HYPATIA_DEBUG_FX=1 for detailed node-level tracing\n"
+            f"    - Check model compatibility: torch.fx.symbolic_trace(model)\n"
+            f"    - Verify Rust core: python -c \"from _hypatia_core import compile_fx_graph\""
         )
-        print(f"[Hypatia] ❌ Compilation error: {e}")
+        warnings.warn(error_msg, category=RuntimeWarning)
+        if DEBUG_FX:
+            import traceback
+            traceback.print_exc()
         return gm
+
+
+def _is_gpu_model(gm, example_inputs):
+    """Check if model/inputs are on GPU (worth applying torch.compile)."""
+    # Check example inputs
+    for inp in example_inputs:
+        if hasattr(inp, 'is_cuda') and inp.is_cuda:
+            return True
+    # Check model parameters
+    try:
+        for p in gm.parameters():
+            if p.is_cuda:
+                return True
+    except Exception:
+        pass
+    return False
 
 # Global flag to track backend registration
 _HYPATIA_BACKEND_REGISTERED = False
@@ -142,16 +228,17 @@ def register_backend():
         torch._dynamo.register_backend(name="hypatia", compiler_fn=hypatia_backend)
         _HYPATIA_BACKEND_REGISTERED = True
 
-        print("✅ Hypatia backend registered successfully")
+        print("[Hypatia] Backend registered successfully")
         print("   Usage: torch.compile(model, backend='hypatia')")
-        print(f"   ✓ Backend confirmed in: {torch._dynamo.list_backends()}")
+        print(f"   Backend confirmed in: {torch._dynamo.list_backends()}")
 
     except Exception as e:
         warnings.warn(f"Failed to register Hypatia backend: {e}", category=RuntimeWarning)
         raise
 
-# Auto-register on import
-register_backend()
+# Auto-register on import (only if Rust core is available)
+if _RUST_AVAILABLE:
+    register_backend()
 
 __version__ = "1.0.0"
 __all__ = [
@@ -210,4 +297,23 @@ __all__ = [
     "validate_structure",
     "validate_models",
     "SemanticValidator",
+    # Profiler
+    "estimate_flops",
+    "detect_hardware",
+    "profile_model",
+    "compare_flops",
+    "benchmark_inference",
+    "roofline_analysis",
+    "ModelProfile",
+    "LayerProfile",
+    "HardwareInfo",
+    "FlopsComparison",
+    # Auto-tuner
+    "auto_tune",
+    "quick_tune",
+    "benchmark_tune",
+    "TuneConfig",
+    # Benchmark Dashboard
+    "BenchmarkDashboard",
+    "generate_benchmark_dashboard",
 ]
