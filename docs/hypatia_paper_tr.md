@@ -280,6 +280,53 @@ Hypatia'nin katkisini izole etmek icin, ayni GPU uzerinde (RTX 4070 Laptop) `tor
 
 3. **Fark buyuk modellerde daralir**: Kucuk MLP (4.19x) -> Buyuk MLP (2.23x) -> Transformer (0.86x). Model karmasikligi arttikca ve daha fazla standart-disi kaynastirma firsati ortaya ciktikca, E-graph yaklasimi rekabetci hale gelir.
 
+### 6.2.1 Bulut GPU Dogrulamasi (Google Colab T4)
+
+Masaustu GPU'larin otesinde tasinabilirlik dogrulamasi icin, karsilastirmayi **Google Colab T4 GPU** uzerinde tekrarladik (SM 7.5 Turing, 40 SM, 15 GB VRAM, 320 GB/s bant genisligi, ~8.1 TFLOPS FP32). Rust cekirdegi Colab uzerinde kaynaktan derlendi (`maturin build --release`).
+
+**Guvenilir karsilastirmalar (cikti dogrulanmis):**
+
+| Model | Parametre | Inductor (max-autotune) | Hypatia | Hyp/Ind | Kosinüs Benzerlik | Dogrulanmis |
+|-------|----------|------------------------|---------|---------|-------------------|-------------|
+| Derin MLP (1024→2048→4096→2048→1024→512) | 31.5M | 1.42 ms | 1.33 ms | **0.94x** | 1.000000 | ✅ |
+| Kucuk Transformer Blok (d=512, 8 bas) | 3.2M | ~5.1 ms | ~3.4 ms | **~0.67x** | — | ✅ (tekli blok) |
+
+**Guvenilmez karsilastirmalar (graf kirilmalari tespit edildi):**
+
+| Model | Parametre | Raporlanan Hyp/Ind | Kosinüs Benzerlik | Sorun |
+|-------|----------|-------------------|-------------------|-------|
+| GPT-2 Small (12 katman, d=768) | 28.4M | 1.62x | 0.176 | ❌ E-graph yeniden yazmalari yanlis cikti uretiyor |
+| Genis Transformer (6 katman, d=1024) | 75.6M | 0.01x | 0.136 | ❌ Graf kirilmasi — kismi hesaplama |
+| BERT-Base Encoder (12 katman, d=768) | 85.1M | 0.01x | 0.018 | ❌ Graf kirilmasi — kismi hesaplama |
+
+**Analiz**: T4 sonuclari masaustu bulgularini dogruluyor — Hypatia tek-blok mimarilerde gercek hizlanma sagliyor (Derin MLP: 0.94x, Transformer Blok: ~0.67x). Ancak cok-katmanli Transformer modelleri, `torch._dynamo`'nun pybind11 islemlerini (`hypatia_fused_gelu_mlp`) izleyememesinden kaynaklanan **graf kirilmalarindan** muzdarip; bu durum kismi hesaplama ve yanlis ciktilara neden olur.
+
+### 6.2.2 Cikti Dogruluk Dogrulamasi
+
+Bulut karsilastirmalari sirasinda kritik bir kesif: **anomal hizlanma sayilari, gercek optimizasyon yerine yanlis hesaplamayi gosterebilir.** Sistematik bir dogruluk dogrulama protokolu gelistirdik:
+
+**Protokol:**
+1. Modeli vanilya modda calistir (derleme yok) → referans cikti
+2. Modeli `torch.compile(backend='hypatia')` ile calistir → derlenenmis cikti
+3. Karsilastir: maksimum mutlak fark, ortalama mutlak fark, kosinüs benzerligi, goreceli hata
+
+**Bulgular:**
+
+| Model | Maks Fark | Ort Fark | Kosinüs Benzerlik | Sonuc |
+|-------|-----------|----------|-------------------|-------|
+| Derin MLP (31.5M) | 0.000000 | 0.000000 | 1.000000 | ✅ Mukemmel eslesme |
+| GPT-2 Small (28.4M) | 60,300,180 | 152,494 | 0.176 | ❌ Tamamen yanlis |
+| Genis Transformer (75.6M) | 6,577 | 24.76 | 0.136 | ❌ Tamamen yanlis |
+| BERT-Base Encoder (85.1M) | 2,710 | 6.37 | 0.018 | ❌ Tamamen yanlis |
+
+**Kök neden analizi:**
+
+1. **Graf kirilmalari (Genis Transformer, BERT-Base)**: `torch._dynamo` uyarisi: *"Dynamo does not know how to trace the builtin hypatia_fused_gelu_mlp.pybind11..."*. Derleme sessizce kismi yurutmeye duser, yalnizca bir alt kume katmani hesaplar.
+
+2. **Yanlis E-graph yeniden yazmalari (GPT-2)**: E-graph basariyla yeniden yazma kaliplari bulur, ancak birlestirilmis islemler cok-katmanli pre-norm Transformer mimarileri icin sayisal olarak yanlis sonuclar uretir. `fused_gelu_mlp` kalıbi tekli FFN bloklari icin dogru calisir ancak LayerNorm etkilesimleri bagimlılıklar olusturdugu 12 Transformer katmani boyunca zincirlendiginde basarisiz olur.
+
+**Ders**: Cikti dogrulugunu dogrulamayan herhangi bir derleyici karsilastirmasi temelden guvenilmezdir. Gecikme olcumlerinin yaninda her zaman kosinüs benzerlik kontrollerinin dahil edilmesini onerilmekteyiz.
+
 ### 6.3 Ablasyon Calismasi: Yeniden Yazma Kurallarinin Etkisi
 
 "37 kuraldan hangileri en cok katki sagliyor?" sorusunu yanıtlamak icin, kural grubu etkisini E-graph cikartma istatistikleri uzerinden analiz ediyoruz:
@@ -352,7 +399,11 @@ Hypatia'nin katkisini izole etmek icin, ayni GPU uzerinde (RTX 4070 Laptop) `tor
 
 4. **BF16 Anomalisi**: Kucuk batch boyutlarinda BF16, donusum yuku nedeniyle FP16'dan yavastir. **Duzeltildi**: Oto-ayarlayici artik varsayilan olarak FP16 secer, BF16 yalnizca batch_elements >= 4096 icin.
 
-5. **Platform Destegi**: Yalnizca Windows/CUDA'da test edilmis. macOS/ARM, AMD ROCm test edilmemis.
+5. **Platform Destegi**: Windows/CUDA ve Google Colab (Linux/CUDA T4) uzerinde test edilmis. macOS/ARM, AMD ROCm test edilmemis.
+
+6. **Cok-Katmanli Modellerde Graf Kirilmalari**: Ozel pybind11 islemleri (orn. `hypatia_fused_gelu_mlp`) `torch._dynamo` tarafindan izlenemez, cok-katmanli Transformer modellerinde graf kirilmalarina neden olur. Derleme sessizce kismi yurutmeye duser ve yanlis ciktilar uretir. GPT-2, BERT-Base ve benzer derin mimarileri etkiler. **Duzeltme plani**: Ozel islemleri `torch.library` veya `torch.compiler.allow_in_graph` ile Dynamo-izlenebilir hale getirmek.
+
+7. **Derin Mimariler icin E-Graph Yeniden Yazma Dogrulugu**: `fused_gelu_mlp` yeniden yazmasi izole FFN bloklari icin sayisal olarak dogru sonuclar uretir ancak LayerNorm etkilesimlerinin katmanlar-arasi bagimliliklar olusturdugu cok-katmanli pre-norm Transformer'lar icin basarisiz olur. **Duzeltme plani**: LayerNorm-duyarli yeniden yazma koruma kosullari ve katman-basina dogruluk dogrulamasi eklemek.
 
 ---
 

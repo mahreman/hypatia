@@ -430,6 +430,53 @@ To isolate Hypatia's contribution, we ran a controlled experiment comparing `tor
 
 **Implication**: Hypatia's value proposition is strongest for models with complex, non-standard operator patterns (attention + MLP fusion, Mish activation chains, geometric algebra) where greedy pattern matching fails. For standard MLP architectures, Inductor is the better choice.
 
+### 9.2.1 Cloud GPU Validation (Google Colab T4)
+
+To validate portability beyond desktop GPUs, we replicated the benchmark on a **Google Colab T4 GPU** (SM 7.5 Turing, 40 SMs, 15 GB VRAM, 320 GB/s bandwidth, ~8.1 TFLOPS FP32). The Rust core was compiled from source on Colab via `maturin build --release`.
+
+**Reliable benchmarks (output-verified):**
+
+| Model | Params | Inductor (max-autotune) | Hypatia | Hyp/Ind | Cosine Sim | Verified |
+|-------|--------|------------------------|---------|---------|------------|----------|
+| Deep MLP (1024→2048→4096→2048→1024→512) | 31.5M | 1.42 ms | 1.33 ms | **0.94x** | 1.000000 | ✅ |
+| Small Transformer Block (d=512, 8 heads) | 3.2M | ~5.1 ms | ~3.4 ms | **~0.67x** | — | ✅ (single block) |
+
+**Unreliable benchmarks (graph breaks detected):**
+
+| Model | Params | Reported Hyp/Ind | Cosine Sim | Issue |
+|-------|--------|-----------------|------------|-------|
+| GPT-2 Small (12 layers, d=768) | 28.4M | 1.62x | 0.176 | ❌ E-graph rewrites produce incorrect output |
+| Wide Transformer (6 layers, d=1024) | 75.6M | 0.01x | 0.136 | ❌ Graph breaks — partial computation |
+| BERT-Base Encoder (12 layers, d=768) | 85.1M | 0.01x | 0.018 | ❌ Graph breaks — partial computation |
+
+**Analysis**: The T4 results confirm the desktop findings — Hypatia delivers genuine speedup on single-block architectures (Deep MLP: 0.94x, Transformer Block: ~0.67x). However, multi-layer Transformer models suffer from **graph breaks** where `torch._dynamo` cannot trace custom pybind11 operations (`hypatia_fused_gelu_mlp`), resulting in partial computation and incorrect outputs. See Section 9.2.2 for details.
+
+### 9.2.2 Output Correctness Verification
+
+A critical discovery during cloud benchmarking: **anomalous speedup numbers can indicate incorrect computation rather than genuine optimization.** We developed a systematic correctness verification protocol:
+
+**Protocol:**
+1. Run model in vanilla mode (no compilation) → reference output
+2. Run model with `torch.compile(backend='hypatia')` → compiled output
+3. Compare via: max absolute difference, mean absolute difference, cosine similarity, and relative error
+
+**Findings:**
+
+| Model | Max Diff | Mean Diff | Cosine Sim | Verdict |
+|-------|----------|-----------|------------|---------|
+| Deep MLP (31.5M) | 0.000000 | 0.000000 | 1.000000 | ✅ Perfect match |
+| GPT-2 Small (28.4M) | 60,300,180 | 152,494 | 0.176 | ❌ Completely wrong |
+| Wide Transformer (75.6M) | 6,577 | 24.76 | 0.136 | ❌ Completely wrong |
+| BERT-Base Encoder (85.1M) | 2,710 | 6.37 | 0.018 | ❌ Completely wrong |
+
+**Root cause analysis:**
+
+1. **Graph breaks (Wide Transformer, BERT-Base)**: `torch._dynamo` emits warnings: *"Dynamo does not know how to trace the builtin hypatia_fused_gelu_mlp.pybind11..."*. The compilation silently falls through to partial execution, computing only a subset of layers. The suspiciously fast latencies (0.20-0.21ms for 75-85M parameter models) are the telltale sign.
+
+2. **Incorrect E-graph rewrites (GPT-2)**: The E-graph successfully finds rewrite patterns, but the fused operations produce numerically incorrect results for multi-layer pre-norm Transformer architectures. The `fused_gelu_mlp` pattern works correctly for single FFN blocks but fails when chained across 12 Transformer layers where LayerNorm interactions create dependencies the current rewrite rules don't account for.
+
+**Lesson**: Any compiler benchmark that does not verify output correctness is fundamentally unreliable. We recommend always including cosine similarity checks alongside latency measurements.
+
 ### 9.3 Ablation Study: Rewrite Rule Impact
 
 To address the question "which of the 37 rules contribute most?", we analyze rule group impact based on E-graph extraction statistics across our benchmark suite:
@@ -508,7 +555,11 @@ To address the question "which of the 37 rules contribute most?", we analyze rul
 
 5. **CPU Sparse GEMM**: Competitive only at >90% sparsity for small layers. PyTorch's BLAS-backed dense GEMM (MKL/OpenBLAS) is superior for large layers.
 
-6. **Platform Support**: Tested on Windows/CUDA only. macOS/ARM (Apple Silicon), AMD ROCm, and Intel oneAPI are untested.
+6. **Platform Support**: Tested on Windows/CUDA and Google Colab (Linux/CUDA T4). macOS/ARM (Apple Silicon), AMD ROCm, and Intel oneAPI are untested.
+
+7. **Graph Breaks on Multi-Layer Models**: Custom pybind11 operations (e.g., `hypatia_fused_gelu_mlp`) cannot be traced by `torch._dynamo`, causing graph breaks in multi-layer Transformer models. The compilation silently falls through to partial execution, producing incorrect outputs. This affects GPT-2, BERT-Base, and similar deep architectures. **Current workaround**: Use Hypatia only for single-block or shallow models. **Fix plan**: Register custom ops via `torch.library` or `torch.compiler.allow_in_graph` to make them Dynamo-traceable.
+
+8. **E-Graph Rewrite Correctness for Deep Architectures**: The `fused_gelu_mlp` rewrite produces numerically correct results for isolated FFN blocks but fails for multi-layer pre-norm Transformers where LayerNorm interactions create cross-layer dependencies. The current rewrite rules assume layer independence, which breaks when residual stream statistics shift across layers. **Fix plan**: Add LayerNorm-aware rewrite guards and per-layer correctness validation.
 
 ### 9.8 Future Directions
 

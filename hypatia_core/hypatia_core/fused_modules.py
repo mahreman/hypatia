@@ -176,6 +176,9 @@ class FusedLinearReLU(nn.Module):
         _load_fused_linear_relu_ext()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Dynamo tracing: use pure PyTorch ops to avoid graph breaks
+        if _is_dynamo_tracing():
+            return F.relu(self.fc(x))
         if x.is_cuda and _HAS_CUDA_KERNEL:
             return FusedLinearReLUFunction.apply(x, self.fc.weight, self.fc.bias)
         else:
@@ -387,6 +390,10 @@ class FusedGeluMLP(nn.Module):
         _load_cuda_ext("fused_gelu_mlp", "fused_gelu_mlp.cpp", "fused_gelu_mlp_kernel.cu")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Dynamo tracing: use pure PyTorch ops to avoid graph breaks
+        if _is_dynamo_tracing():
+            h = F.gelu(self.fc1(x))
+            return self.fc2(h)
         if x.is_cuda and _has_ext("fused_gelu_mlp"):
             return FusedGeluMLPFunction.apply(
                 x, self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias)
@@ -423,6 +430,9 @@ class FusedAttention(nn.Module):
         _load_cuda_ext("fused_attention", "fused_attention.cpp", "fused_attention_kernel.cu")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Dynamo tracing: use pure PyTorch ops to avoid graph breaks
+        if _is_dynamo_tracing():
+            return self._forward_cpu(x)
         if x.is_cuda and _has_ext("fused_attention"):
             ext = _get_ext("fused_attention")
             return ext.forward(
@@ -508,6 +518,9 @@ class FusedLayerNorm(nn.Module):
         _load_cuda_ext("fused_layernorm", "fused_layernorm.cpp", "fused_layernorm_kernel.cu")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Dynamo tracing: use pure PyTorch ops to avoid graph breaks
+        if _is_dynamo_tracing():
+            return F.layer_norm(x, [self.normalized_shape], self.weight, self.bias, self.eps)
         if x.is_cuda and _has_ext("fused_layernorm"):
             ext = _get_ext("fused_layernorm")
             return ext.forward(x, self.weight, self.bias, self.eps)
@@ -559,8 +572,31 @@ class FusedTransformerBlock(nn.Module):
 # These are the target functions used by fx_bridge.rs Phase 3.
 # They auto-detect device and dispatch to CUDA kernels or Rust native ops.
 
+def _is_dynamo_tracing():
+    """Check if torch._dynamo is currently tracing (e.g. during Phase 2 torch.compile).
+
+    When Dynamo is tracing, we must use pure PyTorch ops so the graph
+    can be captured without graph breaks.  Custom pybind11 / PyO3 calls
+    are opaque to Dynamo and cause silent partial compilation.
+    """
+    try:
+        return torch.compiler.is_compiling()  # PyTorch 2.1+
+    except AttributeError:
+        pass
+    try:
+        return torch._dynamo.is_compiling()  # PyTorch 2.0
+    except AttributeError:
+        return False
+
+
 def dispatch_fused_gelu_mlp(input, w1, b1, w2, b2):
     """Auto-dispatch fused GELU MLP: GPU -> CUDA kernel, CPU -> Rust native."""
+    # When Dynamo is tracing (Phase 2), use pure PyTorch ops to avoid graph breaks.
+    # Inductor can still fuse Linear+GELU+Linear into efficient Triton kernels.
+    if _is_dynamo_tracing():
+        h = F.linear(input, w1, b1)
+        h = F.gelu(h)
+        return F.linear(h, w2, b2)
     if input.is_cuda and _has_ext("fused_gelu_mlp"):
         ext = _get_ext("fused_gelu_mlp")
         return ext.forward(input, w1, b1, w2, b2)
@@ -578,6 +614,9 @@ def dispatch_fused_gelu_mlp(input, w1, b1, w2, b2):
 
 def dispatch_fused_linear_relu(input, weight, bias):
     """Auto-dispatch fused Linear+ReLU: GPU -> CUDA kernel, CPU -> Rust native."""
+    # When Dynamo is tracing (Phase 2), use pure PyTorch ops to avoid graph breaks.
+    if _is_dynamo_tracing():
+        return F.relu(F.linear(input, weight, bias))
     if input.is_cuda and _has_ext("fused_linear_relu"):
         ext = _get_ext("fused_linear_relu")
         return ext.forward(input, weight, bias)
@@ -607,6 +646,26 @@ def dispatch_fused_attention(input, wq, bq, wk, bk, wv, bv, wo, bo, n_heads):
     Returns:
         [batch*seq_len, hidden] output tensor
     """
+    # When Dynamo is tracing (Phase 2), use pure PyTorch ops to avoid graph breaks.
+    if _is_dynamo_tracing():
+        total_rows = input.size(0)
+        hidden = input.size(1)
+        head_dim = hidden // n_heads
+        q = F.linear(input, wq, bq)
+        k = F.linear(input, wk, bk)
+        v = F.linear(input, wv, bv)
+        q = q.view(total_rows, n_heads, head_dim).permute(1, 0, 2)
+        k = k.view(total_rows, n_heads, head_dim).permute(1, 0, 2)
+        v = v.view(total_rows, n_heads, head_dim).permute(1, 0, 2)
+        scale = 1.0 / (head_dim ** 0.5)
+        scores = torch.bmm(q, k.transpose(1, 2)) * scale
+        mask = torch.ones(total_rows, total_rows, device=input.device, dtype=input.dtype).triu(1) * (-1e9)
+        scores = scores + mask.unsqueeze(0)
+        scores = F.softmax(scores, dim=-1)
+        attn_out = torch.bmm(scores, v)
+        attn_out = attn_out.permute(1, 0, 2).contiguous().view(total_rows, hidden)
+        return F.linear(attn_out, wo, bo)
+
     # GPU: try CUDA fused attention kernel
     if input.is_cuda and _has_ext("fused_attention"):
         ext = _get_ext("fused_attention")

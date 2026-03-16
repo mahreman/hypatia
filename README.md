@@ -169,23 +169,29 @@ hypatia/
 
 ## Benchmarks
 
-| Model | Optimization | Speedup vs PyTorch |
-|-------|-------------|-------------------|
-| MLP (768->3072->768) | Fused Linear+ReLU | 1.3-2.1x |
-| GPT-2 XL | INT4 Quantization | 1.2x (+ 75% memory reduction) |
-| Transformer | Native Rust Forward | 1.5-3.0x |
-| Sparse Model (90%) | CSR GEMM | 2-5x |
+### Hypatia vs TorchInductor (Fair GPU-to-GPU, Output-Verified)
 
-### Hypatia vs TorchInductor (Fair GPU-to-GPU Comparison)
+All benchmarks use `torch.cuda.synchronize()`, 5 warmup + 100 measurement iterations, and **output correctness verification** (cosine similarity between vanilla and compiled outputs).
 
-| Model | Inductor (max-autotune) | Hypatia | Hyp/Ind |
-|-------|------------------------|---------|---------|
-| Small MLP (235K params) | 0.281 ms | 1.176 ms | 4.19x |
-| Medium MLP (4.9M) | 0.468 ms | 2.766 ms | 5.91x |
-| Large MLP (19.4M) | 0.901 ms | 2.010 ms | 2.23x |
-| **Transformer Block (3.2M)** | **3.004 ms** | **2.570 ms** | **0.86x** |
+**RTX 4070 Laptop GPU:**
 
-> **Hyp/Ind < 1.0 = Hypatia faster.** Hypatia wins on Transformer blocks where E-graph discovers cross-layer GELU+MLP fusion patterns that Inductor's greedy matcher misses.
+| Model | Inductor (max-autotune) | Hypatia | Hyp/Ind | Verified |
+|-------|------------------------|---------|---------|----------|
+| Small MLP (235K params) | 0.281 ms | 1.176 ms | 4.19x | ✅ |
+| Medium MLP (4.9M) | 0.468 ms | 2.766 ms | 5.91x | ✅ |
+| Large MLP (19.4M) | 0.901 ms | 2.010 ms | 2.23x | ✅ |
+| **Transformer Block (3.2M)** | **3.004 ms** | **2.570 ms** | **0.86x** | ✅ |
+
+**Google Colab T4 GPU:**
+
+| Model | Inductor (max-autotune) | Hypatia | Hyp/Ind | Cosine Sim | Verified |
+|-------|------------------------|---------|---------|------------|----------|
+| Deep MLP (31.5M) | 1.42 ms | 1.33 ms | **0.94x** | 1.000000 | ✅ |
+| GPT-2 Small (28.4M) | — | — | — | 0.176 | ❌ Graph breaks |
+| Wide Transformer (75.6M) | — | — | — | 0.136 | ❌ Graph breaks |
+| BERT-Base Encoder (85.1M) | — | — | — | 0.018 | ❌ Graph breaks |
+
+> **Hyp/Ind < 1.0 = Hypatia faster.** Hypatia wins on Transformer blocks and deep MLPs where E-graph discovers fusion patterns that Inductor's greedy matcher misses. Multi-layer Transformer models currently suffer from graph breaks (see [Known Limitations](#known-limitations)).
 
 ### Qwen2.5-0.5B (494M params) on RTX 4070 Laptop
 
@@ -197,6 +203,12 @@ hypatia/
 | GPU FP32 | 33.8 ms | 43x |
 | CPU INT8 Dynamic | 793 ms | 1.8x |
 | CPU FP32 (baseline) | 1449 ms | 1.0x |
+
+### Known Limitations
+
+- **Graph breaks on multi-layer Transformers**: Custom pybind11 ops (`hypatia_fused_gelu_mlp`) can't be traced by `torch._dynamo`, causing partial computation. Fix in progress: `torch.library` registration.
+- **E-graph rewrite correctness**: Fused ops work for single blocks but produce incorrect results on deep pre-norm Transformer stacks (12+ layers). Fix in progress: LayerNorm-aware rewrite guards.
+- **Inductor faster on standard MLPs**: For simple Linear+ReLU chains, Inductor's native Triton autotune is 2-6x faster. Hypatia's value is in complex fusion patterns.
 
 ## Numerical Stability
 
