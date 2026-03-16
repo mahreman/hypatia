@@ -38,6 +38,7 @@ import torch.nn as nn
 import numpy as np
 import time
 
+_NEURO_AVAILABLE = False
 try:
     from _hypatia_core import (
         neuromorphic_forward,
@@ -45,11 +46,12 @@ try:
         optimize_for_neuromorphic,
         estimate_neuromorphic_energy,
     )
+    _NEURO_AVAILABLE = True
 except ImportError:
-    raise ImportError(
-        "Neuromorphic bindings not available. "
-        "Rebuild with: cd hypatia_core && maturin develop --release"
-    )
+    neuromorphic_forward = None
+    neuromorphic_forward_with_stats = None
+    optimize_for_neuromorphic = None
+    estimate_neuromorphic_energy = None
 
 
 class NeuromorphicModel:
@@ -133,6 +135,11 @@ class NeuromorphicModel:
 
     def _forward_single(self, x_np):
         """Single-sample forward through Rust."""
+        if not _NEURO_AVAILABLE:
+            raise RuntimeError(
+                "Neuromorphic Rust bindings not available. "
+                "Rebuild with: cd hypatia_core && maturin develop --release"
+            )
         layer_weights = [(w, b) for w, b in self.layer_data]
         result = neuromorphic_forward(
             layer_weights,
@@ -159,6 +166,11 @@ class NeuromorphicModel:
         else:
             x_np = np.asarray(x, dtype=np.float32)
 
+        if not _NEURO_AVAILABLE:
+            raise RuntimeError(
+                "Neuromorphic Rust bindings not available. "
+                "Rebuild with: cd hypatia_core && maturin develop --release"
+            )
         layer_weights = [(w, b) for w, b in self.layer_data]
         output, stats = neuromorphic_forward_with_stats(
             layer_weights,
