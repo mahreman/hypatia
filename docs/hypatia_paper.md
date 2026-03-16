@@ -392,15 +392,65 @@ The dashboard uses a dark theme with CSS animations and requires no JavaScript f
 
 ---
 
-## 9. Limitations and Future Work
+## 9. Honest Assessment: What Hypatia Is and Is Not
 
-### 9.1 Current Limitations
+### 9.1 Fair Comparison with Existing Systems
+
+**The 164x speedup is CPU-to-GPU, not Hypatia-specific.** Moving any model from CPU FP32 to GPU FP16 yields similar improvements. The meaningful comparisons are:
+
+| Comparison | What it measures | Hypatia advantage |
+|-----------|-----------------|-------------------|
+| GPU FP16 vs GPU FP16+compile | Triton kernel fusion benefit | 3.5x (31.4 -> 8.9ms) |
+| Hypatia backend vs Inductor backend | E-graph fusion discovery | To be measured (Section 9.2) |
+| Vanilla PyTorch GPU vs Hypatia fused attention | Rust kernel vs PyTorch dispatch | 1.6-16.6x (size dependent) |
+| FP32 vs Hypatia INT4 | Quantization compression | 5.3-6.4x memory, ~1.5x speed (single block) |
+
+The GPU FP16 + torch.compile result (8.9ms) uses Hypatia as Phase 1 (E-graph) then chains to Inductor's Triton codegen as Phase 2. To isolate Hypatia's contribution, we need to compare against Inductor alone. This is an area requiring further investigation.
+
+### 9.2 Where Hypatia Wins (and Doesn't)
+
+**Hypatia wins when:**
+- E-graph discovers fusion patterns that Inductor's greedy matcher misses (e.g., cross-layer Mish MLP fusion, multi-step attention fusion)
+- Small models where Rust native kernels eliminate PyTorch dispatch overhead (16.6x for small attention)
+- Memory-constrained edge deployment where INT4 quantization is critical
+- Rapid prototyping: zero code changes via torch.compile backend
+
+**Hypatia loses when:**
+- Model graphs exceed ~1000 nodes (E-graph memory explosion)
+- Dynamic shapes are required (LLM serving with variable seq_len)
+- Training (backprop graphs not supported)
+- Inductor's autotune has already found optimal Triton kernels for standard patterns
+
+### 9.3 Comparison with TVM, XLA, TorchInductor
+
+| Dimension | Hypatia | TorchInductor | TVM | XLA |
+|-----------|---------|---------------|-----|-----|
+| Fusion discovery | Equality saturation (complete within rules) | Greedy pattern match | Template library | Greedy HLO rules |
+| Rewrite rules | 37 | ~hundreds | ~hundreds | ~thousands |
+| Integration effort | Zero (torch.compile) | Zero (default) | Model export | TF/JAX native |
+| Dynamic shapes | No | Yes | Limited | Yes |
+| Training support | No | Yes | Limited | Yes |
+| GPU codegen | Via Triton chain | Native Triton | Own codegen | Own codegen |
+| Edge deployment | Strong (INT4/Rust) | Limited | Strong | Limited |
+| Maintenance team | 1 person | Meta (100+) | Apache community | Google (50+) |
+
+**37 rules vs hundreds/thousands**: This is a genuine limitation. Hypatia's rule set covers the most impactful fusions (Linear+Activation, Attention, MLP blocks) but lacks the breadth of mature compilers. An ablation study of rule impact is needed to prioritize expansion.
+
+### 9.4 Current Limitations (Detailed)
 
 1. **E-Graph Memory Scaling**: For very large graphs (>1000 nodes), E-graph memory consumption grows significantly. The current node limit is set at 10,000 E-nodes with a 30-iteration saturation limit. Testing on LLaMA-7B-scale models would require investigation of incremental saturation strategies.
+   - **Mitigation plan**: Graph partitioning (per-layer or per-block saturation), guided saturation with priority queues, memory-bounded exploration.
 
-2. **CPU Sparse GEMM**: The CSR sparse GEMM implementation is competitive only at >90% sparsity for small layers. For large layers, PyTorch's BLAS-backed dense GEMM (MKL/OpenBLAS) is superior. GPU sparse GEMM (cuSPARSE) integration is planned.
+2. **Dynamic Shapes**: The E-graph optimization assumes static shapes. Models with variable sequence lengths or batch sizes (standard in LLM serving via vLLM/TGI) require re-optimization. This limits Hypatia to edge AI (fixed inputs) or offline batch processing.
+   - **Mitigation plan**: Shape-specialized cache with JIT reoptimization, symbolic shape variables in the E-graph.
 
-3. **Mixed Precision CPU Overhead**: On CPU, the FP16/BF16 dequantization overhead exceeds the bandwidth savings. The primary benefit is memory reduction; actual speedup requires GPU Tensor Cores.
+3. **Inference Only**: No support for backward pass graph optimization. Training workloads are out of scope.
+
+4. **BF16 Anomaly**: The auto-tuner previously defaulted to BF16 when available, but BF16 is slower than FP16 for small batch sizes due to conversion overhead. **Fixed**: Auto-tuner now selects FP16 by default, BF16 only for batch_elements >= 4096.
+
+5. **CPU Sparse GEMM**: Competitive only at >90% sparsity for small layers. PyTorch's BLAS-backed dense GEMM (MKL/OpenBLAS) is superior for large layers.
+
+6. **Platform Support**: Tested on Windows/CUDA only. macOS/ARM (Apple Silicon), AMD ROCm, and Intel oneAPI are untested.
 
 4. **Dynamic Shapes**: The current E-graph optimization assumes static shapes. Models with dynamic sequence lengths or batch sizes require re-optimization.
 

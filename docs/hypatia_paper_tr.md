@@ -246,15 +246,59 @@ Nicemlenmis optimizasyonlar icin:
 
 ---
 
-## 6. Sinirliliklar ve Gelecek Calisma
+## 6. Durustce Degerlendirme: Hypatia Ne Yapar, Ne Yapmaz
 
-1. **E-Graph Bellek Olceklenmesi**: Cok buyuk grafiklerde (>1000 dugum) bellek tuketimi onemli olcude artar. Artan doygunluk stratejilerinin arastirilmasi gerekmektedir.
+### 6.1 Adil Karsilastirma
 
-2. **CPU Seyrek GEMM**: CSR seyrek GEMM, yalnizca kucuk katmanlarda >%90 seyreklikte rekabetcidir. GPU seyrek GEMM (cuSPARSE) entegrasyonu planlanmaktadir.
+**164x hizlanma CPU'dan GPU'ya gecis sonucudur, Hypatia'ya ozgu degildir.** Herhangi bir modeli CPU FP32'den GPU FP16'ya tasimak benzer iyilesmeler saglar. Anlamli karsilastirmalar:
 
-3. **Dinamik Sekiller**: Mevcut E-graph optimizasyonu statik sekilleri varsayar. Dinamik dizi uzunluklari veya batch boyutlarina sahip modeller yeniden optimizasyon gerektirir.
+| Karsilastirma | Olctukleri | Hypatia avantaji |
+|--------------|-----------|-----------------|
+| GPU FP16 vs GPU FP16+compile | Triton cekirdek kaynastirma | 3.5x (31.4 -> 8.9ms) |
+| Hypatia vs Inductor arka ucu | E-graph kaynastirma kesfetme | Olculecek |
+| PyTorch GPU vs Hypatia fused attention | Rust cekirdek vs dispatch yuku | 1.6-16.6x (boyuta bagli) |
+| FP32 vs Hypatia INT4 | Nicemleme sikistirma | 5.3-6.4x bellek, ~1.5x hiz |
 
-4. **Gelecek Yonelimler**: Triton ozel cekirdekleri, dagitik derleme, nicemleme farkindali egitim (QAT), Apple Silicon / ARM destegi.
+### 6.2 Hypatia Nerede Kazanir (ve Kaybeder)
+
+**Kazanir:**
+- E-graph, Inductor'un acgozlu eslestirmesinin kacirdigi kaynastirma kaliplarini kesfettiginde
+- Rust yerel cekirdeklerin PyTorch dispatch yukunu ortadan kaldirdigi kucuk modellerde (16.6x)
+- INT4 nicemlemenin kritik oldugu bellek kisitli edge konuslandirmada
+- Sifir kod degisikligi ile hizli prototipleme
+
+**Kaybeder:**
+- Model grafikleri ~1000 dugumu astiginda (E-graph bellek patlamasi)
+- Dinamik sekiller gerektiginde (degisken seq_len ile LLM servisi)
+- Egitim (geri yayilim grafikleri desteklenmiyor)
+- Inductor'un otomatik ayarlamasi standart kalipler icin optimal Triton cekirdekleri bulmus oldugunda
+
+### 6.3 TVM, XLA, TorchInductor ile Karsilastirma
+
+| Boyut | Hypatia | TorchInductor | TVM | XLA |
+|-------|---------|---------------|-----|-----|
+| Kaynastirma kesfetme | Esitlik doygunlugu (kurallar icinde tam) | Acgozlu kalip esleme | Sablon kutuphanesi | Acgozlu HLO kurallari |
+| Yeniden yazma kurali | 37 | ~yuzlerce | ~yuzlerce | ~binlerce |
+| Entegrasyon calismasi | Sifir (torch.compile) | Sifir (varsayilan) | Model aktarimi | TF/JAX yerel |
+| Dinamik sekiller | Hayir | Evet | Sinirli | Evet |
+| Egitim destegi | Hayir | Evet | Sinirli | Evet |
+| Bakim ekibi | 1 kisi | Meta (100+) | Apache toplulugu | Google (50+) |
+
+**37 kural vs yuzlerce/binlerce**: Bu gercek bir sinirlilik. Hypatia'nin kural seti en etkili kaynastirmalari kapsar ancak olgun derleyicilerin genisliginden yoksundur.
+
+### 6.4 Mevcut Sinirliliklar (Detayli)
+
+1. **E-Graph Bellek Olceklenmesi**: >1000 dugumde bellek tuketimi onemli olcude artar.
+   - *Onlem plani*: Graf bolmeleme (katman/blok basina doygunluk), oncelik kuyruklu yonlendirilmis doygunluk.
+
+2. **Dinamik Sekiller**: Statik sekil varsayimi, degisken dizi/batch boyutlarinda yeniden optimizasyon gerektirir. vLLM/TGI gibi LLM servis motorlarinda kullanilabilirlik sinirlidir.
+   - *Onlem plani*: Sekile ozgu onbellek + JIT yeniden optimizasyon yolu.
+
+3. **Yalnizca Cikarim**: Geri yayilim grafi optimizasyonu desteklenmez.
+
+4. **BF16 Anomalisi**: Kucuk batch boyutlarinda BF16, donusum yuku nedeniyle FP16'dan yavastir. **Duzeltildi**: Oto-ayarlayici artik varsayilan olarak FP16 secer, BF16 yalnizca batch_elements >= 4096 icin.
+
+5. **Platform Destegi**: Yalnizca Windows/CUDA'da test edilmis. macOS/ARM, AMD ROCm test edilmemis.
 
 ---
 
