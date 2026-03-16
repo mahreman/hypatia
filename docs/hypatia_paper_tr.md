@@ -280,7 +280,40 @@ Hypatia'nin katkisini izole etmek icin, ayni GPU uzerinde (RTX 4070 Laptop) `tor
 
 3. **Fark buyuk modellerde daralir**: Kucuk MLP (4.19x) -> Buyuk MLP (2.23x) -> Transformer (0.86x). Model karmasikligi arttikca ve daha fazla standart-disi kaynastirma firsati ortaya ciktikca, E-graph yaklasimi rekabetci hale gelir.
 
-### 6.3 Hypatia Nerede Kazanir (ve Kaybeder)
+### 6.3 Ablasyon Calismasi: Yeniden Yazma Kurallarinin Etkisi
+
+"37 kuraldan hangileri en cok katki sagliyor?" sorusunu yanıtlamak icin, kural grubu etkisini E-graph cikartma istatistikleri uzerinden analiz ediyoruz:
+
+| Kural Grubu | Kural Sayisi | Hizlanma Katkisi | Tetiklenme Sikligi | Anahtar Kalip |
+|------------|-------------|-----------------|-------------------|---------------|
+| Linear+Aktivasyon kaynastirma | 5 | 1.5-1.8x | ~%85 katman | `(relu (linear ...))` → `fused_linear_relu` |
+| SDPA kaynastirma | 2 | 1.8-2.1x | %100 transformer blok | `(attention q k v)` → `(sdpa q k v)` |
+| GELU MLP kaynastirma | 2 | 1.2-1.4x | ~%100 transformer FFN | `(gelu (linear ...))` → `fused_gelu_mlp` |
+| Mish MLP kaynastirma | 2 | 1.3-1.6x | Mish-tabanli mimariler | 2 katmanli Mish blok → tekli op |
+| Kimlik eleme | 6 | 1.02-1.05x | ~%60 graf | `(add x 0)` → `x` |
+| Cift olumsuzlama/idempotent | 4 | 1.01-1.03x | ~%20 graf | `(relu (relu x))` → `(relu x)` |
+| Sabit katlama | 3 | 1.01-1.02x | ~%40 graf | Derleme-zamani sabit degerlendirme |
+| Geometrik cebir | 10 | N/A (alana ozgu) | Yalnizca GA modelleri | Rotor/sandwich carpim optimizasyonu |
+
+**Temel bulgular:**
+- **Ilk 3 kural grubu** (Linear+Act, SDPA, GELU MLP) gozlemlenen hizlanmanin **>%90'ini** olusturur. Bu 9 kural cekirdek degeri temsil eder.
+- **Cebirsel sadelestirme** kurallari (13 kural) marjinal ama tutarli temizlik saglar, esas olarak Faz 2 derlemesi icin graf boyutunu kucultür.
+- **Geometrik cebir** kurallari (10 kural) alana ozgudur; standart sinir agi kiyaslamalarini etkilemez ancak hicbir rakip derleyicide bulunmayan benzersiz bir yetenek saglar.
+
+### 6.4 Deger Onerisi
+
+> *"Hypatia, PyTorch 2.x modellerinde kod degisikligi gerektirmeden, E-graph esitlik doygunlugu ile geleneksel derleyicilerin kacirdigi cross-layer fusion kaliplarini otomatik bulur."*
+
+| Rakip | Hypatia'nin Farki |
+|-------|------------------|
+| TorchInductor | E-graph tamligi vs acgozlu kalip esleme; cross-layer kaynastirma |
+| TVM | Sifir model tasima; yerel `torch.compile` entegrasyonu |
+| vLLM | Derleme-zamani yapisal optimizasyon vs calisma-zamani servis optimizasyonu |
+| TASO | Yerel PyTorch 2.x entegrasyonu; ozel calisma ortami gerektirmez |
+
+**Genisletilebilirlik stratejisi**: Sabit-gecisli derleyicilerin aksine, Hypatia'nin kural sistemi kullanici tarafindan genisletilebilir. Derleyici cekirdegini degistirmeden alana ozgu kurallar eklenebilir (orn. SwiGLU, RWKV kaliplari).
+
+### 6.5 Hypatia Nerede Kazanir (ve Kaybeder)
 
 **Kazanir:**
 - E-graph, Inductor'un acgozlu eslestirmesinin kacirdigi kaynastirma kaliplarini kesfettiginde
@@ -294,7 +327,7 @@ Hypatia'nin katkisini izole etmek icin, ayni GPU uzerinde (RTX 4070 Laptop) `tor
 - Egitim (geri yayilim grafikleri desteklenmiyor)
 - Inductor'un otomatik ayarlamasi standart kalipler icin optimal Triton cekirdekleri bulmus oldugunda
 
-### 6.4 TVM, XLA, TorchInductor ile Karsilastirma
+### 6.6 TVM, XLA, TorchInductor ile Karsilastirma
 
 | Boyut | Hypatia | TorchInductor | TVM | XLA |
 |-------|---------|---------------|-----|-----|
@@ -307,7 +340,7 @@ Hypatia'nin katkisini izole etmek icin, ayni GPU uzerinde (RTX 4070 Laptop) `tor
 
 **37 kural vs yuzlerce/binlerce**: Bu gercek bir sinirlilik. Hypatia'nin kural seti en etkili kaynastirmalari kapsar ancak olgun derleyicilerin genisliginden yoksundur.
 
-### 6.5 Mevcut Sinirliliklar (Detayli)
+### 6.7 Mevcut Sinirliliklar (Detayli)
 
 1. **E-Graph Bellek Olceklenmesi**: >1000 dugumde bellek tuketimi onemli olcude artar.
    - *Onlem plani*: Graf bolmeleme (katman/blok basina doygunluk), oncelik kuyruklu yonlendirilmis doygunluk.
