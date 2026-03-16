@@ -177,7 +177,7 @@ class FusedLinearReLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Dynamo tracing: use pure PyTorch ops to avoid graph breaks
-        if _is_dynamo_tracing():
+        if _dynamo_is_compiling():
             return F.relu(self.fc(x))
         if x.is_cuda and _HAS_CUDA_KERNEL:
             return FusedLinearReLUFunction.apply(x, self.fc.weight, self.fc.bias)
@@ -391,7 +391,7 @@ class FusedGeluMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Dynamo tracing: use pure PyTorch ops to avoid graph breaks
-        if _is_dynamo_tracing():
+        if _dynamo_is_compiling():
             h = F.gelu(self.fc1(x))
             return self.fc2(h)
         if x.is_cuda and _has_ext("fused_gelu_mlp"):
@@ -431,7 +431,7 @@ class FusedAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Dynamo tracing: use pure PyTorch ops to avoid graph breaks
-        if _is_dynamo_tracing():
+        if _dynamo_is_compiling():
             return self._forward_cpu(x)
         if x.is_cuda and _has_ext("fused_attention"):
             ext = _get_ext("fused_attention")
@@ -519,7 +519,7 @@ class FusedLayerNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Dynamo tracing: use pure PyTorch ops to avoid graph breaks
-        if _is_dynamo_tracing():
+        if _dynamo_is_compiling():
             return F.layer_norm(x, [self.normalized_shape], self.weight, self.bias, self.eps)
         if x.is_cuda and _has_ext("fused_layernorm"):
             ext = _get_ext("fused_layernorm")
@@ -572,20 +572,17 @@ class FusedTransformerBlock(nn.Module):
 # These are the target functions used by fx_bridge.rs Phase 3.
 # They auto-detect device and dispatch to CUDA kernels or Rust native ops.
 
-def _is_dynamo_tracing():
-    """Check if torch._dynamo is currently tracing (e.g. during Phase 2 torch.compile).
-
-    When Dynamo is tracing, we must use pure PyTorch ops so the graph
-    can be captured without graph breaks.  Custom pybind11 / PyO3 calls
-    are opaque to Dynamo and cause silent partial compilation.
-    """
-    try:
-        return torch.compiler.is_compiling()  # PyTorch 2.1+
-    except AttributeError:
-        pass
-    try:
-        return torch._dynamo.is_compiling()  # PyTorch 2.0
-    except AttributeError:
+# Resolve the Dynamo-tracing guard at import time, not at call time.
+# IMPORTANT: torch.compiler.is_compiling() must be called DIRECTLY
+# (not wrapped in try/except) for Dynamo to recognise it as a
+# compile-time constant.  A try/except wrapper causes Dynamo to
+# graph-break because it cannot inline opaque exception handling.
+_dynamo_is_compiling = getattr(torch.compiler, "is_compiling", None)
+if _dynamo_is_compiling is None:
+    _dynamo_is_compiling = getattr(torch._dynamo, "is_compiling", None)
+if _dynamo_is_compiling is None:
+    # Ancient PyTorch – never inside Dynamo
+    def _dynamo_is_compiling():
         return False
 
 
@@ -593,7 +590,7 @@ def dispatch_fused_gelu_mlp(input, w1, b1, w2, b2):
     """Auto-dispatch fused GELU MLP: GPU -> CUDA kernel, CPU -> Rust native."""
     # When Dynamo is tracing (Phase 2), use pure PyTorch ops to avoid graph breaks.
     # Inductor can still fuse Linear+GELU+Linear into efficient Triton kernels.
-    if _is_dynamo_tracing():
+    if _dynamo_is_compiling():
         h = F.linear(input, w1, b1)
         h = F.gelu(h)
         return F.linear(h, w2, b2)
@@ -615,7 +612,7 @@ def dispatch_fused_gelu_mlp(input, w1, b1, w2, b2):
 def dispatch_fused_linear_relu(input, weight, bias):
     """Auto-dispatch fused Linear+ReLU: GPU -> CUDA kernel, CPU -> Rust native."""
     # When Dynamo is tracing (Phase 2), use pure PyTorch ops to avoid graph breaks.
-    if _is_dynamo_tracing():
+    if _dynamo_is_compiling():
         return F.relu(F.linear(input, weight, bias))
     if input.is_cuda and _has_ext("fused_linear_relu"):
         ext = _get_ext("fused_linear_relu")
@@ -647,7 +644,7 @@ def dispatch_fused_attention(input, wq, bq, wk, bk, wv, bv, wo, bo, n_heads):
         [batch*seq_len, hidden] output tensor
     """
     # When Dynamo is tracing (Phase 2), use pure PyTorch ops to avoid graph breaks.
-    if _is_dynamo_tracing():
+    if _dynamo_is_compiling():
         total_rows = input.size(0)
         hidden = input.size(1)
         head_dim = hidden // n_heads

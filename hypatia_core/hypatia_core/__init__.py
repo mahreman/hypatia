@@ -161,18 +161,20 @@ def hypatia_backend(gm, example_inputs):
                     print(f"[Hypatia] WARNING: E-graph output diverged (cosine_sim={cos_sim:.4f})")
                     print(f"[Hypatia] Falling back to original graph for correctness")
                     optimized_gm = gm
-                elif DEBUG_FX:
-                    print(f"[Hypatia] Phase 1 correctness check passed (cosine_sim={cos_sim:.6f})")
+                else:
+                    print(f"[Hypatia] Phase 1 correctness OK (cosine_sim={cos_sim:.6f})")
             except Exception as e:
-                if DEBUG_FX:
-                    print(f"[Hypatia] Phase 1 correctness check skipped: {e}")
+                print(f"[Hypatia] Phase 1 correctness check skipped: {e}")
+                # If we can't verify, fall back to original graph for safety
+                optimized_gm = gm
         else:
-            # IMPORTANT: When no rewrites are found, use the ORIGINAL graph.
-            # The Rust FX bridge round-trip (FX → S-expr → E-graph → S-expr → FX)
-            # can introduce subtle reconstruction errors (parameter ordering,
-            # node naming) that cause numerical divergence in deep models.
+            # No rewrites found — return original graph as-is.
+            # Skip Phase 2: the outer torch.compile already handed us an FX graph;
+            # re-compiling it with Inductor (double compilation) introduces
+            # numerical divergence in deep models and provides no benefit when
+            # E-graph found nothing to optimize.
             print("[Hypatia] Phase 1: E-graph analysis complete (graph preserved)")
-            optimized_gm = gm
+            return gm
 
         # Phase 2: torch.compile kernel optimization (Triton, GPU only)
         # This wraps the e-graph-optimized graph with torch.compile for
