@@ -28,6 +28,8 @@ pub enum Symbol {
     ReLUGrad(Box<Symbol>),
     Sigmoid(Box<Symbol>),
     Tanh(Box<Symbol>),
+    GELU(Box<Symbol>),
+    SiLU(Box<Symbol>),
 
     // ============ ✅ YENİ: FEZ 10 AI / İSTATİSTİK OPERATÖRLERİ ============
     Softmax(Box<Symbol>),
@@ -104,6 +106,8 @@ impl Display for Symbol {
             ReLUGrad(a) => write!(f, "(relu_grad {})", a),
             Sigmoid(a) => write!(f, "(sigmoid {})", a),
             Tanh(a) => write!(f, "(tanh {})", a),
+            GELU(a) => write!(f, "(gelu {})", a),
+            SiLU(a) => write!(f, "(silu {})", a),
             Softmax(a) => write!(f, "(softmax {})", a),
             Mean(a) => write!(f, "(mean {})", a),
             Variance(a) => write!(f, "(var {})", a),
@@ -238,10 +242,26 @@ impl Symbol {
             },
             Tanh(a) => {
                 let tanh_val = Tanh(a.clone());
-                (Const(1.0) - Pow(Box::new(tanh_val), Box::new(Const(2.0)))) 
+                (Const(1.0) - Pow(Box::new(tanh_val), Box::new(Const(2.0))))
                     * a.derivative(var)
             },
-            
+            // GELU'(x) ≈ sigmoid(1.702*x) + x * 1.702 * sigmoid(1.702*x) * (1 - sigmoid(1.702*x))
+            // Simplified: use chain rule on GELU ≈ 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
+            // For symbolic purposes, approximate as: sigmoid(1.702*x) * (derivative of inner)
+            GELU(a) => {
+                // Approximate GELU derivative: Φ(x) + x·φ(x) where Φ=CDF, φ=PDF
+                // Simplified: treat similarly to sigmoid for symbolic differentiation
+                let sig = Sigmoid(Box::new(Const(1.702) * a.as_ref().clone()));
+                sig * a.derivative(var)
+            },
+            // SiLU'(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+            //           = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+            SiLU(a) => {
+                let sig = Sigmoid(a.clone());
+                let silu_deriv = sig.clone() * (Const(1.0) + a.as_ref().clone() * (Const(1.0) - sig));
+                silu_deriv * a.derivative(var)
+            },
+
             // ✅ YENİ: FEZ 10 AI Operatörleri Türevleri
             Softmax(a) => {
                 let sm = Softmax(a.clone());
@@ -295,6 +315,8 @@ impl Symbol {
             ReLUGrad(a) => ReLUGrad(Box::new(a.simplify())),
             Sigmoid(a) => Sigmoid(Box::new(a.simplify())),
             Tanh(a) => Tanh(Box::new(a.simplify())),
+            GELU(a) => GELU(Box::new(a.simplify())),
+            SiLU(a) => SiLU(Box::new(a.simplify())),
             Softmax(a) => Softmax(Box::new(a.simplify())),
             Mean(a) => Mean(Box::new(a.simplify())),
             Variance(a) => Variance(Box::new(a.simplify())),
@@ -389,6 +411,10 @@ impl Symbol {
             ReLUGrad(a) => { if let Const(c) = a.as_ref() { Const(if *c >= 0.0 { 1.0 } else { 0.0 }) } else { s } },
             Sigmoid(a) => { if let Const(c) = a.as_ref() { Const(1.0 / (1.0 + (-c).exp())) } else { s } },
             Tanh(a) => { if let Const(c) = a.as_ref() { Const(c.tanh()) } else { s } },
+            // GELU(x) ≈ x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+            GELU(a) => { if let Const(c) = a.as_ref() { Const(0.5 * c * (1.0 + (0.7978845608 * (c + 0.044715 * c.powi(3))).tanh())) } else { s } },
+            // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+            SiLU(a) => { if let Const(c) = a.as_ref() { Const(c / (1.0 + (-c).exp())) } else { s } },
 
             Softmax(a) => { if let Const(_c) = a.as_ref() { Const(1.0) } else { s } },
             Mean(a) => { if let Const(c) = a.as_ref() { Const(*c) } else { s } },
@@ -427,6 +453,8 @@ impl Symbol {
             ReLUGrad(a) => ReLUGrad(Box::new(a.subs(env))),
             Sigmoid(a) => Sigmoid(Box::new(a.subs(env))),
             Tanh(a) => Tanh(Box::new(a.subs(env))),
+            GELU(a) => GELU(Box::new(a.subs(env))),
+            SiLU(a) => SiLU(Box::new(a.subs(env))),
             Softmax(a) => Softmax(Box::new(a.subs(env))),
             Mean(a) => Mean(Box::new(a.subs(env))),
             Variance(a) => Variance(Box::new(a.subs(env))),
@@ -523,7 +551,9 @@ impl Symbol {
             ReLUGrad(a) => Ok(if a.eval(env)? >= 0.0 { 1.0 } else { 0.0 }),
             Sigmoid(a) => { let v = a.eval(env)?; Ok(1.0 / (1.0 + (-v).exp())) }
             Tanh(a) => Ok(a.eval(env)?.tanh()),
-            
+            GELU(a) => { let v = a.eval(env)?; Ok(0.5 * v * (1.0 + (0.7978845608 * (v + 0.044715 * v.powi(3))).tanh())) },
+            SiLU(a) => { let v = a.eval(env)?; Ok(v / (1.0 + (-v).exp())) },
+
             Softmax(_a) => Ok(1.0),
             Mean(a) => a.eval(env),
             Variance(_a) => Ok(0.0),
@@ -572,7 +602,7 @@ impl Symbol {
                 a.contains_var(var) || b.contains_var(var)
             }
             Neg(a) | Exp(a) | Log(a) | Sqrt(a) | ReLU(a) | ReLUGrad(a) | Sigmoid(a) | Tanh(a)
-            | Softmax(a) | Mean(a) | Variance(a)
+            | GELU(a) | SiLU(a) | Softmax(a) | Mean(a) | Variance(a)
             => {
                 a.contains_var(var)
             }

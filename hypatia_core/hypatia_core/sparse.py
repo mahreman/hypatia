@@ -12,12 +12,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from _hypatia_core import (
-    to_sparse_csr,
-    sparse_linear_forward,
-    compute_sparsity_threshold,
-    sparsity_stats,
-)
+_SPARSE_RUST_AVAILABLE = False
+try:
+    from _hypatia_core import (
+        to_sparse_csr,
+        sparse_linear_forward,
+        compute_sparsity_threshold,
+        sparsity_stats,
+    )
+    _SPARSE_RUST_AVAILABLE = True
+except ImportError:
+    to_sparse_csr = None
+    sparse_linear_forward = None
+    compute_sparsity_threshold = None
+    sparsity_stats = None
 
 
 class SparseLinear(nn.Module):
