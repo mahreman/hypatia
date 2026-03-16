@@ -143,11 +143,28 @@ def detect_hardware() -> HardwareInfo:
                     "RTX 4070 Laptop": 2175, "RTX 4060": 2370,
                     "RTX 3090": 1695, "RTX 3080": 1710, "RTX 3070": 1725,
                     "A100": 1410, "H100": 1830, "V100": 1380,
+                    "T4": 1590, "T4G": 1590,
+                    "A10": 1695, "A10G": 1695, "A30": 1440,
+                    "L4": 2040, "L40": 2490,
+                    "RTX A6000": 1800, "RTX A5000": 1695,
+                    "RTX 3060": 1780, "RTX 3050": 1780,
+                    "RTX 2080": 1710, "RTX 2070": 1620, "RTX 2060": 1680,
+                    "GTX 1080": 1733, "GTX 1070": 1683,
+                    "P100": 1328, "K80": 875,
                 }
                 for key, clk in _known_clocks.items():
                     if key.lower() in info.gpu_name.lower():
                         info.gpu_clock_mhz = clk
                         break
+
+            # Fallback: estimate clock from compute capability if still unknown
+            if info.gpu_clock_mhz == 0:
+                _cc_clock_estimates = {
+                    (9, 0): 1800, (8, 9): 2400, (8, 6): 1800,
+                    (8, 0): 1400, (7, 5): 1500, (7, 0): 1350,
+                    (6, 1): 1400, (6, 0): 1328, (5, 2): 1000,
+                }
+                info.gpu_clock_mhz = _cc_clock_estimates.get(cc, 1500)
 
             # Tensor core generation
             if cc >= (9, 0):
@@ -188,11 +205,31 @@ def detect_hardware() -> HardwareInfo:
                 "RTX 4070 Laptop": 256, "RTX 4060": 272,
                 "RTX 3090": 936, "RTX 3080": 760, "RTX 3070": 448,
                 "A100": 2039, "H100": 3350, "V100": 900,
+                "T4": 320, "T4G": 320,
+                "A10": 600, "A10G": 600, "A30": 933,
+                "L4": 300, "L40": 864,
+                "RTX A6000": 768, "RTX A5000": 768,
+                "RTX 3060": 360, "RTX 3050": 224,
+                "RTX 2080": 448, "RTX 2070": 448, "RTX 2060": 336,
+                "GTX 1080": 320, "GTX 1070": 256,
+                "P100": 732, "K80": 480,
             }
             for key, bw in _known_bandwidths.items():
                 if key.lower() in info.gpu_name.lower():
                     info.memory_bandwidth_gbs = bw
                     break
+
+            # Fallback bandwidth estimate from VRAM size if not in known list
+            if info.memory_bandwidth_gbs == 0 and info.gpu_memory_gb > 0:
+                # Rough estimate: GDDR6 ~14Gbps, HBM2 ~1.2TB/s for 80GB
+                if info.gpu_memory_gb >= 40:
+                    info.memory_bandwidth_gbs = 1500  # HBM2/HBM3 class
+                elif info.gpu_memory_gb >= 16:
+                    info.memory_bandwidth_gbs = 400   # GDDR6/HBM2 mid-range
+                elif info.gpu_memory_gb >= 8:
+                    info.memory_bandwidth_gbs = 300   # GDDR6
+                else:
+                    info.memory_bandwidth_gbs = 200   # GDDR5/6
 
         except Exception:
             pass
