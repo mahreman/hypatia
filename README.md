@@ -1,6 +1,11 @@
 # Hypatia
 
-A hardware-agnostic symbolic compiler for PyTorch, built on **Geometric Algebra** and **E-graph equality saturation**. Hypatia optimizes deep learning models at the graph level — fusing operations, quantizing weights, and dispatching to native kernels — all through a unified mathematical framework.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mahreman/hypatia/blob/main/notebooks/hypatia_colab_demo.ipynb)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+
+A hardware-aware symbolic compiler for PyTorch, built on **Geometric Algebra** and **E-graph equality saturation**. Hypatia optimizes deep learning models at the graph level — fusing operations, quantizing weights, and dispatching to native kernels — all through a unified mathematical framework.
 
 ## Vision
 
@@ -171,6 +176,17 @@ hypatia/
 | Transformer | Native Rust Forward | 1.5-3.0x |
 | Sparse Model (90%) | CSR GEMM | 2-5x |
 
+### Hypatia vs TorchInductor (Fair GPU-to-GPU Comparison)
+
+| Model | Inductor (max-autotune) | Hypatia | Hyp/Ind |
+|-------|------------------------|---------|---------|
+| Small MLP (235K params) | 0.281 ms | 1.176 ms | 4.19x |
+| Medium MLP (4.9M) | 0.468 ms | 2.766 ms | 5.91x |
+| Large MLP (19.4M) | 0.901 ms | 2.010 ms | 2.23x |
+| **Transformer Block (3.2M)** | **3.004 ms** | **2.570 ms** | **0.86x** |
+
+> **Hyp/Ind < 1.0 = Hypatia faster.** Hypatia wins on Transformer blocks where E-graph discovers cross-layer GELU+MLP fusion patterns that Inductor's greedy matcher misses.
+
 ### Qwen2.5-0.5B (494M params) on RTX 4070 Laptop
 
 | Strategy | Latency | vs CPU FP32 |
@@ -216,11 +232,13 @@ generate_benchmark_dashboard(
 
 ## Documentation
 
+- **[Colab Demo](https://colab.research.google.com/github/mahreman/hypatia/blob/main/notebooks/hypatia_colab_demo.ipynb)** — Interactive notebook, run in browser
+- [Academic Paper (EN)](docs/hypatia_paper.md) — Full technical paper with benchmarks
+- [Academic Paper (TR)](docs/hypatia_paper_tr.md) — Turkce akademik makale
+- [User Guide](hypatia_core/docs/USER_GUIDE.md) — Installation, usage, configuration
 - [Manifesto](MANIFESTO.md) — Project philosophy and vision
 - [Roadmap](ROADMAP) — Development phases and milestones
-- [Future Work](FUTURE_WORK.md) — Planned features and TODOs
 - [Contributing](CONTRIBUTING.md) — How to contribute
-- [Academic Report](docs/academic_report.md) — Technical details and benchmarks
 
 ## License
 

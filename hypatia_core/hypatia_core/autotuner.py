@@ -220,13 +220,28 @@ def quick_tune(
         log.append("Mode: fusion (< 1M params, dispatch overhead negligible)")
 
     # --- Precision selection ---
+    # Note: BF16 has higher conversion overhead than FP16, which makes it
+    # slower for small batch sizes and short sequences. We prefer FP16 by
+    # default and only use BF16 for large batches where its wider dynamic
+    # range prevents overflow during accumulation.
     if has_gpu and has_tc:
-        if hw.supports_bf16:
+        # Estimate if batch is "large enough" for BF16 to be beneficial
+        batch_elements = 1
+        if input_shape:
+            for d in input_shape:
+                batch_elements *= d
+        large_batch = batch_elements >= 4096  # ~batch>=4 with seq>=128
+
+        if hw.supports_fp16:
+            if large_batch and hw.supports_bf16:
+                config.mixed_precision = "bf16"
+                log.append("Precision: BF16 (large batch + tensor cores + better dynamic range)")
+            else:
+                config.mixed_precision = "fp16"
+                log.append("Precision: FP16 (tensor cores, preferred for small batch)")
+        elif hw.supports_bf16:
             config.mixed_precision = "bf16"
-            log.append("Precision: BF16 (tensor cores + better dynamic range)")
-        elif hw.supports_fp16:
-            config.mixed_precision = "fp16"
-            log.append("Precision: FP16 (tensor cores enabled)")
+            log.append("Precision: BF16 (tensor cores, FP16 not available)")
     elif has_gpu and hw.supports_fp16:
         config.mixed_precision = "fp16"
         log.append("Precision: FP16 (GPU without tensor cores)")
