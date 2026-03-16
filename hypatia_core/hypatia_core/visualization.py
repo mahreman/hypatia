@@ -18,12 +18,18 @@ from typing import Optional, Dict, List, Union
 import torch
 import torch.nn as nn
 
-from _hypatia_core import (
-    expr_to_dot,
-    expr_to_ascii_tree,
-    optimization_report,
-    optimize_ast,
-)
+try:
+    from _hypatia_core import (
+        expr_to_dot,
+        expr_to_ascii_tree,
+        optimization_report,
+        optimize_ast,
+    )
+except ImportError:
+    expr_to_dot = None
+    expr_to_ascii_tree = None
+    optimization_report = None
+    optimize_ast = None
 
 
 # ============================================================================
@@ -399,20 +405,52 @@ def _node_types_table(before: Dict[str, int], after: Dict[str, int]) -> str:
 # ============================================================================
 
 
-def model_summary(model: nn.Module, input_shape: Optional[tuple] = None) -> str:
-    """Generate a text summary of model architecture.
+def model_summary(
+    model: nn.Module,
+    input_shape: Optional[tuple] = None,
+    show_flops: bool = True,
+) -> str:
+    """Generate a text summary of model architecture with optional FLOPs analysis.
 
     Args:
         model: PyTorch model
-        input_shape: optional input shape (for parameter count)
+        input_shape: Input tensor shape (e.g., (1, 3, 224, 224)).
+                     Required for FLOPs estimation.
+        show_flops: If True and input_shape provided, include per-layer FLOPs.
 
     Returns:
-        Formatted summary string
+        Formatted summary string with architecture, parameters, and FLOPs.
+
+    Examples:
+        summary = model_summary(model, input_shape=(1, 3, 224, 224))
+        summary = model_summary(model)  # Without FLOPs
     """
+    # Get FLOPs profile if input_shape provided
+    profile = None
+    if input_shape and show_flops:
+        try:
+            from .profiler import estimate_flops
+            profile = estimate_flops(model, input_shape)
+        except Exception:
+            pass
+
+    # Build per-layer FLOPs lookup
+    layer_flops = {}
+    if profile:
+        for lp in profile.layers:
+            layer_flops[lp.name] = lp
+
     lines = []
-    lines.append("=" * 70)
+    lines.append("=" * 90)
     lines.append(f"  {model.__class__.__name__} Architecture")
-    lines.append("=" * 70)
+    lines.append("=" * 90)
+
+    if profile:
+        header = f"  {'Layer':<28} {'Type':<22} {'Shape':<18} {'Params':>10} {'FLOPs':>14} {'%':>6}"
+    else:
+        header = f"  {'Layer':<28} {'Type':<22} {'Shape':<18} {'Params':>10}"
+    lines.append(header)
+    lines.append(f"  {'-' * (len(header) - 2)}")
 
     total_params = 0
     trainable_params = 0
@@ -430,22 +468,41 @@ def model_summary(model: nn.Module, input_shape: Optional[tuple] = None) -> str:
         # Module type
         mod_type = module.__class__.__name__
 
-        # Special info
+        # Shape info
         info = ""
         if hasattr(module, "in_features"):
-            info = f"({module.in_features} -> {module.out_features})"
+            info = f"{module.in_features}->{module.out_features}"
         elif hasattr(module, "in_channels"):
-            info = f"({module.in_channels} -> {module.out_channels})"
+            k = getattr(module, 'kernel_size', '')
+            info = f"{module.in_channels}->{module.out_channels}"
+            if k:
+                info += f" k{k}"
 
         param_str = f"{n_params:,}" if n_params > 0 else "-"
-        lines.append(f"  {name:30s} {mod_type:25s} {info:20s} {param_str:>12s}")
 
-    lines.append("-" * 70)
+        if profile:
+            lp = layer_flops.get(name)
+            if lp and lp.flops > 0:
+                pct = (lp.flops / profile.total_flops * 100) if profile.total_flops > 0 else 0
+                lines.append(
+                    f"  {name:<28} {mod_type:<22} {info:<18} {param_str:>10} {lp.flops_str:>14} {pct:>5.1f}%"
+                )
+            else:
+                lines.append(f"  {name:<28} {mod_type:<22} {info:<18} {param_str:>10} {'-':>14} {'-':>6}")
+        else:
+            lines.append(f"  {name:<28} {mod_type:<22} {info:<18} {param_str:>10}")
+
+    lines.append("-" * 90)
     lines.append(f"  Total parameters:     {total_params:>12,}")
     lines.append(f"  Trainable parameters: {trainable_params:>12,}")
     lines.append(f"  FP32 memory:          {total_params * 4 / 1024 / 1024:>10.2f} MB")
     lines.append(f"  FP16 memory:          {total_params * 2 / 1024 / 1024:>10.2f} MB")
-    lines.append("=" * 70)
+
+    if profile:
+        lines.append(f"  Total FLOPs:          {profile.total_flops_str:>14}")
+        lines.append(f"  Arithmetic Intensity: {profile.arithmetic_intensity:>10.1f} FLOPs/byte")
+
+    lines.append("=" * 90)
 
     result = "\n".join(lines)
     print(result)
