@@ -138,10 +138,41 @@ def hypatia_backend(gm, example_inputs):
 
         if result.structure_changed:
             print("[Hypatia] Phase 1: E-graph structural optimization applied (rewrites found)")
-        else:
-            print("[Hypatia] Phase 1: E-graph analysis complete (graph preserved)")
+            optimized_gm = result.optimized_gm
 
-        optimized_gm = result.optimized_gm
+            # Quick correctness check: verify E-graph output matches original
+            # E-graph rewrites can produce incorrect results for complex
+            # multi-layer architectures (e.g., pre-norm Transformers with
+            # LayerNorm dependencies across layers).
+            try:
+                with torch.no_grad():
+                    y_orig = gm(*example_inputs)
+                    y_opt = optimized_gm(*example_inputs)
+
+                # Flatten and compute cosine similarity
+                y_orig_flat = y_orig.flatten().float() if isinstance(y_orig, torch.Tensor) else y_orig[0].flatten().float()
+                y_opt_flat = y_opt.flatten().float() if isinstance(y_opt, torch.Tensor) else y_opt[0].flatten().float()
+
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    y_orig_flat, y_opt_flat, dim=0
+                ).item()
+
+                if cos_sim < 0.99:
+                    print(f"[Hypatia] WARNING: E-graph output diverged (cosine_sim={cos_sim:.4f})")
+                    print(f"[Hypatia] Falling back to original graph for correctness")
+                    optimized_gm = gm
+                elif DEBUG_FX:
+                    print(f"[Hypatia] Phase 1 correctness check passed (cosine_sim={cos_sim:.6f})")
+            except Exception as e:
+                if DEBUG_FX:
+                    print(f"[Hypatia] Phase 1 correctness check skipped: {e}")
+        else:
+            # IMPORTANT: When no rewrites are found, use the ORIGINAL graph.
+            # The Rust FX bridge round-trip (FX → S-expr → E-graph → S-expr → FX)
+            # can introduce subtle reconstruction errors (parameter ordering,
+            # node naming) that cause numerical divergence in deep models.
+            print("[Hypatia] Phase 1: E-graph analysis complete (graph preserved)")
+            optimized_gm = gm
 
         # Phase 2: torch.compile kernel optimization (Triton, GPU only)
         # This wraps the e-graph-optimized graph with torch.compile for
