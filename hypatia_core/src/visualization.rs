@@ -193,6 +193,9 @@ fn node_type_name(node: &HypatiaLang) -> String {
         // Neuromorphic
         LIF(_) => "LIF", SpikeEncode(_) => "SpikeEncode", SpikeDecode(_) => "SpikeDecode",
         LIFLinear(_) => "LIFLinear", NeuromorphicLinear(_) => "NeuromorphicLinear",
+        // v3 additions
+        FusedSiluMLP(_) => "FusedSiluMLP", Mish(_) => "Mish",
+        FusedMishMLP(_) => "FusedMishMLP", SDPA(_) => "SDPA",
         // Terminals
         Constant(_) => "Constant", Var(_) => "Var",
     }.to_string()
