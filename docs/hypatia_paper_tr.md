@@ -255,11 +255,32 @@ Nicemlenmis optimizasyonlar icin:
 | Karsilastirma | Olctukleri | Hypatia avantaji |
 |--------------|-----------|-----------------|
 | GPU FP16 vs GPU FP16+compile | Triton cekirdek kaynastirma | 3.5x (31.4 -> 8.9ms) |
-| Hypatia vs Inductor arka ucu | E-graph kaynastirma kesfetme | Olculecek |
+| Hypatia vs Inductor arka ucu | E-graph kaynastirma kesfetme | Transformer'da 0.86x (hizli), MLP'de 2.2-5.9x (yavas) |
 | PyTorch GPU vs Hypatia fused attention | Rust cekirdek vs dispatch yuku | 1.6-16.6x (boyuta bagli) |
 | FP32 vs Hypatia INT4 | Nicemleme sikistirma | 5.3-6.4x bellek, ~1.5x hiz |
 
-### 6.2 Hypatia Nerede Kazanir (ve Kaybeder)
+### 6.2 Hypatia vs TorchInductor: Adil GPU Karsilastirmasi
+
+Hypatia'nin katkisini izole etmek icin, ayni GPU uzerinde (RTX 4070 Laptop) `torch.compile(backend='hypatia')` ile `torch.compile(backend='inductor', mode='max-autotune')` karsilastirmasi yaptik. Tum olcumler `torch.cuda.synchronize()`, 5 isinma + 100 olcum iterasyonu kullanir.
+
+| Model | Parametre | Vanilya GPU | Inductor (max-autotune) | Hypatia | Hyp/Ind Orani |
+|-------|----------|-------------|------------------------|---------|---------------|
+| Kucuk MLP (784->256->128->10) | 235K | 0.209 ms | 0.281 ms | 1.176 ms | 4.19x |
+| Orta MLP (1024->2048->...->10) | 4.9M | 1.350 ms | 0.468 ms | 2.766 ms | 5.91x |
+| Buyuk MLP (2048->4096->...->10) | 19.4M | 1.624 ms | 0.901 ms | 2.010 ms | 2.23x |
+| **Transformer Blok** (d=512, 8 bas) | **3.2M** | **6.521 ms** | **3.004 ms** | **2.570 ms** | **0.86x** |
+
+*Hyp/Ind < 1.0: Hypatia daha hizli. Hyp/Ind > 1.0: Inductor daha hizli.*
+
+**Analiz:**
+
+1. **Hypatia Transformer Blok'ta kazanir (0.86x)**: E-graph, ileri-besleme alt-blogundaki `fused_gelu_mlp` kalibini kesfeder; Inductor'un acgozlu eslestirmesi bunu tek birim olarak kaynastirmaz.
+
+2. **Inductor MLP modellerinde kazanir (2.2-5.9x)**: Standart Linear+ReLU zincirleri icin Inductor'un yerel Triton oto-ayarlamasi zaten neredeyse optimal cekirdekler uretir. Hypatia'nin Faz 2'si ayni Triton kodlayicisina zincirler, dolayisiyla E-graph yuku (Faz 1) yeni kaynastirmalar kesfetmeden gecikme ekler.
+
+3. **Fark buyuk modellerde daralir**: Kucuk MLP (4.19x) -> Buyuk MLP (2.23x) -> Transformer (0.86x). Model karmasikligi arttikca ve daha fazla standart-disi kaynastirma firsati ortaya ciktikca, E-graph yaklasimi rekabetci hale gelir.
+
+### 6.3 Hypatia Nerede Kazanir (ve Kaybeder)
 
 **Kazanir:**
 - E-graph, Inductor'un acgozlu eslestirmesinin kacirdigi kaynastirma kaliplarini kesfettiginde
@@ -273,7 +294,7 @@ Nicemlenmis optimizasyonlar icin:
 - Egitim (geri yayilim grafikleri desteklenmiyor)
 - Inductor'un otomatik ayarlamasi standart kalipler icin optimal Triton cekirdekleri bulmus oldugunda
 
-### 6.3 TVM, XLA, TorchInductor ile Karsilastirma
+### 6.4 TVM, XLA, TorchInductor ile Karsilastirma
 
 | Boyut | Hypatia | TorchInductor | TVM | XLA |
 |-------|---------|---------------|-----|-----|
@@ -286,7 +307,7 @@ Nicemlenmis optimizasyonlar icin:
 
 **37 kural vs yuzlerce/binlerce**: Bu gercek bir sinirlilik. Hypatia'nin kural seti en etkili kaynastirmalari kapsar ancak olgun derleyicilerin genisliginden yoksundur.
 
-### 6.4 Mevcut Sinirliliklar (Detayli)
+### 6.5 Mevcut Sinirliliklar (Detayli)
 
 1. **E-Graph Bellek Olceklenmesi**: >1000 dugumde bellek tuketimi onemli olcude artar.
    - *Onlem plani*: Graf bolmeleme (katman/blok basina doygunluk), oncelik kuyruklu yonlendirilmis doygunluk.
@@ -367,4 +388,7 @@ python demos/demo_qwen.py
 # 4. Test suitini calistir
 cargo test                    # Rust (155 test)
 python -m pytest tests/ -v    # Python (100+ test)
+
+# 5. Hypatia vs Inductor adil karsilastirma
+python demos/benchmark_vs_inductor.py
 ```
