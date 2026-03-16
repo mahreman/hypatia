@@ -12,11 +12,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from _hypatia_core import (
-    to_half_precision,
-    mixed_precision_forward,
-    mixed_precision_stats,
-)
+_MP_RUST_AVAILABLE = False
+try:
+    from _hypatia_core import (
+        to_half_precision,
+        mixed_precision_forward,
+        mixed_precision_stats,
+    )
+    _MP_RUST_AVAILABLE = True
+except ImportError:
+    to_half_precision = None
+    mixed_precision_forward = None
+    mixed_precision_stats = None
 
 
 class MixedPrecisionLinear(nn.Module):

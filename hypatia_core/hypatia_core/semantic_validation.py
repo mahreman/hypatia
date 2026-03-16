@@ -13,12 +13,20 @@ from typing import Optional, Dict, List, Tuple, Union
 import torch
 import torch.nn as nn
 
-from _hypatia_core import (
-    validate_sexpr,
-    validate_optimization_py,
-    validate_model_outputs,
-    optimize_ast,
-)
+_SV_RUST_AVAILABLE = False
+try:
+    from _hypatia_core import (
+        validate_sexpr,
+        validate_optimization_py,
+        validate_model_outputs,
+        optimize_ast,
+    )
+    _SV_RUST_AVAILABLE = True
+except ImportError:
+    validate_sexpr = None
+    validate_optimization_py = None
+    validate_model_outputs = None
+    optimize_ast = None
 
 
 # ============================================================================
